@@ -231,7 +231,8 @@ pub(crate) fn fast_path() -> Option<Result<FastPath, String>> {
     }
     let decide = || {
         resolve(
-            |key| std::env::var(key).ok(),
+            // Through `webenv`: on the page these are the env object or the query string.
+            |key| crate::webenv::var(key),
             &declared_identities(),
             |user| crate::local_state::probe_lease_path(user).map_or(Ok(true), |p| take_lease(&p)),
         )
@@ -246,9 +247,7 @@ pub(crate) fn fast_path() -> Option<Result<FastPath, String>> {
 
 /// The character the roster's fast path seats: `$WOW_CHAR`, else [`fast_path`]'s.
 pub(crate) fn fast_path_character() -> Option<String> {
-    std::env::var("WOW_CHAR")
-        .ok()
-        .or_else(|| fast_path()?.ok()?.character)
+    crate::webenv::var("WOW_CHAR").or_else(|| fast_path()?.ok()?.character)
 }
 
 /// [`fast_path`]'s decision, with the environment, the declaration and the lease passed in;

@@ -4,7 +4,7 @@
 #
 #   scripts/web-build.sh            # WebGPU backend (the world needs it: storage buffers)
 #   WEB_BACKEND=webgl2 scripts/web-build.sh   # WebGL2: every browser, glue screens only
-#   WEB_PROFILE=ship scripts/web-build.sh    # compare fat LTO against the release default
+#   WEB_PROFILE=release scripts/web-build.sh # fat LTO, one codegen unit: slow to link, for measuring
 #   WEB_DEBUG=1 scripts/web-build.sh          # keep the wasm name section (symbolic stack traces)
 #
 # Then serve web/dist with wenilla-host:
@@ -16,10 +16,10 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 DIST=web/dist
 BACKEND="${WEB_BACKEND:-webgpu}"
-PROFILE="${WEB_PROFILE:-release}"
+PROFILE="${WEB_PROFILE:-play}"
 case "${PROFILE}" in
-  release|ship) ;;
-  *) echo "WEB_PROFILE must be release or ship" >&2; exit 1 ;;
+  play|release) ;;
+  *) echo "WEB_PROFILE must be play or release" >&2; exit 1 ;;
 esac
 WASM="target/wasm32-unknown-unknown/${PROFILE}/wenilla.wasm"
 export WASI_SDK="${WASI_SDK:-$(pwd)/tools/wasi-sdk}"
