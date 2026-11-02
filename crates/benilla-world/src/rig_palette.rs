@@ -151,7 +151,7 @@ fn rows_make_mut<'a>(
     copy_us: &mut f32,
 ) -> &'a mut Vec<[f32; 4]> {
     if Arc::strong_count(rows) > 1 || Arc::weak_count(rows) > 0 {
-        let t = std::time::Instant::now();
+        let t = bevy::platform::time::Instant::now();
         let live = 3 * watermark_bones as usize;
         // Reuse the buffer retired two publishes ago once the render world lets go; its stale
         // tail is never uploaded, and `alloc` zeroes a range before use.
@@ -807,7 +807,7 @@ fn upload_rig_palettes(
         origin: Some(data.origin_generation),
         origin_mirror: Some(data.origin_mirror_generation),
     };
-    let cost_t0 = rig_cost_enabled().then(std::time::Instant::now);
+    let cost_t0 = rig_cost_enabled().then(bevy::platform::time::Instant::now);
     let mut cost_calls = 0u32;
     let mut cost_bytes = 0u64;
     // Coalesce first: each `write_buffer` call costs far more than its bytes.

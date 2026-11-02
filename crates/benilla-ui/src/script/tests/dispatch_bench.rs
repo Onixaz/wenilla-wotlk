@@ -3,7 +3,7 @@
 //!
 //! Run: `cargo test --release -p benilla-ui --lib -- --ignored --nocapture dispatch_bench`.
 
-use std::time::Instant;
+use web_time::Instant;
 
 use super::common::script;
 

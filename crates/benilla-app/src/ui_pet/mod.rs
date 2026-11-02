@@ -3,7 +3,8 @@
 //! data (vmangos `CharmInfo::InitPetActionBar`), not a layout: a possessed or charmed unit fills
 //! the same ten words differently, so nothing here assumes them.
 
-use std::time::Instant;
+// std's `Instant` panics on wasm32; this flows into `crate::cooldowns`, which takes bevy's.
+use bevy::platform::time::Instant;
 
 use bevy::prelude::*;
 

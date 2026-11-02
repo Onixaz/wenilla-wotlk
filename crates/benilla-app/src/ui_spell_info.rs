@@ -349,7 +349,7 @@ impl CastNowInputs<'_, '_> {
             &self.pending,
             &self.queued_melee,
             casting.map(|c| c.spell_id),
-            std::time::Instant::now(),
+            bevy::platform::time::Instant::now(),
         )
         .map(|i| i.spell_id());
         cast.attacking = engaged;

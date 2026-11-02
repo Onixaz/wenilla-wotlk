@@ -2,13 +2,23 @@
 //! from the `Data` folder by the client's [`ArchiveLayout`]. A read resolves a name to the
 //! highest-priority archive holding it, so a patch wins; base archives carry no `(listfile)`, so
 //! resolution is by name hash.
+//!
+//! **On `wasm32`** there is no filesystem: `Chain` is the web host's base URL (`crate::web`, the
+//! Data URL scheme) and every method is a fetch. The public API is the same on both targets.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::collections::HashSet;
 use std::path::Path;
 
-use anyhow::{anyhow, bail, Context, Result};
+#[cfg(target_arch = "wasm32")]
+use anyhow::anyhow;
+#[cfg(not(target_arch = "wasm32"))]
+use anyhow::{anyhow, bail};
+use anyhow::{Context, Result};
+#[cfg(not(target_arch = "wasm32"))]
 use benilla_mpq::Archive;
 
+#[cfg(not(target_arch = "wasm32"))]
 /// How the client composes its patch chain from the `Data` folder. Paths are relative to `Data`,
 /// `/`-separated, matched case-insensitively; [`LOCALE`] is the client's locale code.
 struct ArchiveLayout {
@@ -24,6 +34,7 @@ struct ArchiveLayout {
     unsupported: &'static [&'static str],
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// One base archive of an [`ArchiveLayout`].
 struct BaseArchive {
     path: &'static str,
@@ -31,9 +42,11 @@ struct BaseArchive {
     required: bool,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// The locale placeholder in an [`ArchiveLayout`] path.
 const LOCALE: &str = "{locale}";
 
+#[cfg(not(target_arch = "wasm32"))]
 const fn optional(path: &'static str) -> BaseArchive {
     BaseArchive {
         path,
@@ -41,6 +54,7 @@ const fn optional(path: &'static str) -> BaseArchive {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 const fn required(path: &'static str) -> BaseArchive {
     BaseArchive {
         path,
@@ -48,6 +62,7 @@ const fn required(path: &'static str) -> BaseArchive {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// The client's layout when `Data\common.MPQ` exists (without it the client falls back to the 1.x
 /// names, which no 3.3.5a install ships). The mounter walks the table from priority 63 down, so the
 /// table reads highest first; this list is it reversed, the entries for that mode only. `common`,
@@ -80,11 +95,32 @@ pub struct ChainEntry {
 }
 
 /// A priority-ordered patch chain of MPQ archives (`Send + Sync`; reads are `&self` and lock-free).
+#[cfg(not(target_arch = "wasm32"))]
 pub struct Chain {
     /// Ascending priority: later archives win.
     archives: Vec<Archive>,
 }
 
+/// The web build's `Chain`: no archives, just the web host's `/data` base URL every method fetches
+/// against (see the module header). `read` carries no cache — a sync XHR pays a round trip (or a
+/// browser-cache hit) every call, and the Bevy `AssetServer` above (`benilla-assets`) is what
+/// dedups by path, same as it would for a native disk read.
+///
+/// **`contains` does carry one: the whole chain's name index**, fetched once from `/data/__index`
+/// on the first ask. Measured on world entry (2026-08-31): the UI's texture probes asked
+/// `contains` **2,145 times** in one entry — the same dozen chat-border and dialog icons over and
+/// over, per region per resolve — and each ask was a synchronous `HEAD`, which the browser does
+/// not serve from a `GET`-warmed cache. At 100 ms RTT that was ~125 s of a frozen tab, after every
+/// other read had been prefetched. One 4.9 MB name list, parsed once, answers all of them from
+/// memory; the `HEAD` stays only as the fallback for a host whose index route fails.
+#[cfg(target_arch = "wasm32")]
+pub struct Chain {
+    base: String,
+    /// `None` inside = the index could not be fetched/parsed; `contains` falls back to `HEAD`.
+    index: std::sync::OnceLock<Option<std::collections::HashSet<String>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 /// Whether `path` matches `pattern` as the reference's `FindFirstFileW` glob does: any case, `?` exactly one character other than a separator, so `patch-10.MPQ`
 /// never matches `patch-?.MPQ`.
 fn glob_match(pattern: &str, path: &str) -> bool {
@@ -95,6 +131,7 @@ fn glob_match(pattern: &str, path: &str) -> bool {
             .all(|(p, c)| (p == b'?' && c != b'/') || p.eq_ignore_ascii_case(&c))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// The reference's mount order over a `Data` listing, ascending priority: `layout`'s base
 /// archives, its named patches, then every patch-glob match by case-folded `\`-separated path
 /// (the reference sorts descending with `strnicmp` and walks backwards). `files` are
@@ -132,6 +169,7 @@ fn mount_order(layout: &ArchiveLayout, files: &[String], locale: &str) -> Result
     Ok(order)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// The locale folder a layout reads from: the one subfolder of `Data` holding every required
 /// archive that names the locale. The reference reads its `locale` CVar; benilla has no locale
 /// selection yet, so more than one candidate is an error.
@@ -153,6 +191,7 @@ fn locale_of(layout: &ArchiveLayout, files: &[String], dirs: &[String]) -> Resul
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// The names in `dir` of the entries that are files (`want_files`) or folders, sorted, as
 /// `read_dir` order is arbitrary and case-variant ties must resolve deterministically.
 fn list(dir: &Path, want_files: bool) -> Result<Vec<String>> {
@@ -177,11 +216,23 @@ fn list(dir: &Path, want_files: bool) -> Result<Vec<String>> {
 
 /// The locale folder of a `Data` directory ([`locale_of`]): the subfolder `Chain::open` mounts the
 /// locale archives from, which is also the loose-file alternate (`Data\<locale>\`).
+#[cfg(not(target_arch = "wasm32"))]
 pub fn data_locale(path: &Path) -> Result<String> {
     let (files, dirs) = data_listing(path)?;
     locale_of(&LAYOUT, &files, &dirs)
 }
 
+/// On the page the locale is the web host's: it answers `GET /data/__locale` from its own `Data`
+/// folder through the same [`data_locale`] the native client asks.
+#[cfg(target_arch = "wasm32")]
+pub fn data_locale(_path: &Path) -> Result<String> {
+    let bytes = crate::web::fetch_sync(&format!("{}/__locale", crate::web::data_base()))
+        .map_err(|e| anyhow!("fetching the data locale: {e}"))?;
+    let locale = String::from_utf8(bytes).context("the data locale is not UTF-8")?;
+    Ok(locale.trim().to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 /// A `Data` directory's files, its subfolders' as `dir/file`, and its subfolders.
 fn data_listing(path: &Path) -> Result<(Vec<String>, Vec<String>)> {
     let mut files = list(path, true)?;
@@ -196,6 +247,7 @@ fn data_listing(path: &Path) -> Result<(Vec<String>, Vec<String>)> {
     Ok((files, dirs))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Chain {
     /// Open a `Data` directory's archives in the client's [`mount_order`], or a single `.MPQ` file.
     ///
@@ -311,7 +363,125 @@ impl Chain {
     }
 }
 
-#[cfg(test)]
+#[cfg(target_arch = "wasm32")]
+impl Chain {
+    /// Open the chain against the web host at `crate::web::data_base()`. `path` is accepted only
+    /// to keep the signature identical to the native target's (call sites pass `wow_data()`, which
+    /// on wasm is always `/data` — see `install::wow_data`) — it names nothing real on the web,
+    /// where every chain file lives behind one HTTP origin, not a directory.
+    ///
+    /// Unlike the native path, this never fails: there is no directory to fail to list or archive
+    /// to fail to open at open time. A web host that is down or missing a file only surfaces on
+    /// the first `read`/`contains` call, same as a native disk read surfaces a missing file lazily
+    /// too (it's just that native's redundant-archive check happens to run eagerly here).
+    pub fn open(_path: &Path) -> Result<Self> {
+        Ok(Self {
+            base: crate::web::data_base(),
+            index: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// The chain file's Data URL scheme address — the client half of the Lane A ↔ Lane H contract.
+    fn url_for(&self, name: &str) -> String {
+        format!("{}/{}", self.base, crate::web::encode_name(name))
+    }
+
+    /// The index's key for a name: MPQ hashing's equivalence — case-insensitive, `/` ≡ `\`.
+    fn index_key(name: &str) -> String {
+        name.replace('/', "\\").to_ascii_lowercase()
+    }
+
+    /// The chain's name index, fetched and parsed on first use (see the struct doc). `None` when
+    /// the host has no working `/data/__index`, in which case every caller falls back to the
+    /// per-name request it made before the index existed.
+    fn index(&self) -> Option<&std::collections::HashSet<String>> {
+        self.index
+            .get_or_init(|| {
+                let bytes = crate::web::fetch_sync(&format!("{}/__index", self.base)).ok()?;
+                let names: Vec<String> = serde_json::from_slice(&bytes).ok()?;
+                Some(names.iter().map(|n| Self::index_key(n)).collect())
+            })
+            .as_ref()
+    }
+
+    /// Whether the web host has `name` — from the name index when it loaded, else a `HEAD`
+    /// request (no body).
+    pub fn contains(&self, name: &str) -> bool {
+        match self.index() {
+            Some(set) => set.contains(&Self::index_key(name)),
+            None => crate::web::exists_sync(&self.url_for(name)),
+        }
+    }
+
+    /// No archive *files* exist on the web target — everything is served from the one web-host
+    /// origin, so there is nothing more specific than `contains` to report.
+    pub fn find_file_archive(&self, _name: &str) -> Option<&Path> {
+        None
+    }
+
+    /// Read a file by internal path (accepts `/` or `\`) via a blocking `GET` — see
+    /// `crate::web::fetch_sync` for why this is synchronous. The error wording on a missing file
+    /// matches the native path's (`"file not in patch chain: {name}"`) so a caller that matches on
+    /// that text — there are some — behaves the same on both targets.
+    pub fn read(&self, name: &str) -> Result<Vec<u8>> {
+        crate::web::trace(name); // boot-manifest capture; no-op unless the page armed it
+                                 // A name the index says is absent is a 404 round trip saved — the same answer, and the
+                                 // sprite-candidate walk (`Foo.blp`, then `Foo.tga`) asks for absent names by design.
+        if self
+            .index()
+            .is_some_and(|set| !set.contains(&Self::index_key(name)))
+        {
+            return Err(anyhow!("file not in patch chain: {name}"));
+        }
+        crate::web::fetch_sync(&self.url_for(name)).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow!("file not in patch chain: {name}")
+            } else {
+                anyhow!("fetching {name} from web host: {e}")
+            }
+        })
+    }
+
+    /// The URL a [`Chain::read`] of `name` would `GET`, or `None` when the name index already
+    /// says the chain has no such file — the same answer `read` gives, without the round trip.
+    ///
+    /// This exists so a caller that must not block the frame can run the fetch **itself**,
+    /// asynchronously, instead of going through `read`'s synchronous `XMLHttpRequest`: the chain
+    /// lock is held only to build this string and is released before the request starts, so
+    /// nothing holds it across an await. `sound::web_load` is the caller — see its header for the
+    /// 206 ms doorway that motivated it.
+    pub fn url_for_name(&self, name: &str) -> Option<String> {
+        crate::web::trace(name); // boot-manifest capture, exactly as `read` does
+        if self
+            .index()
+            .is_some_and(|set| !set.contains(&Self::index_key(name)))
+        {
+            return None;
+        }
+        Some(self.url_for(name))
+    }
+
+    /// `&mut` alias of [`Chain::read`] — see the native impl for why this exists.
+    pub fn read_file(&mut self, name: &str) -> Result<Vec<u8>> {
+        self.read(name)
+    }
+
+    /// List the chain's named files via `GET /data/__index` (the Data URL scheme's third route) —
+    /// a JSON array of names. Sizes aren't part of that route (dev/extract tooling is the only
+    /// consumer and doesn't run on the web target), so every entry reports `size: 0`.
+    pub fn list(&self) -> Result<Vec<ChainEntry>> {
+        let bytes = crate::web::fetch_sync(&format!("{}/__index", self.base))
+            .map_err(|e| anyhow!("fetching chain index: {e}"))?;
+        let names: Vec<String> =
+            serde_json::from_slice(&bytes).context("parsing chain index JSON")?;
+        Ok(names
+            .into_iter()
+            .map(|name| ChainEntry { name, size: 0 })
+            .collect())
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 

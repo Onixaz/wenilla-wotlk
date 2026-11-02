@@ -148,7 +148,7 @@ pub(super) fn feed_ui_input(
         static HIT_COST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let metering =
             *HIT_COST.get_or_init(|| std::env::var("WOW_HIT_COST").as_deref() == Ok("1"));
-        let t0 = metering.then(std::time::Instant::now);
+        let t0 = metering.then(bevy::platform::time::Instant::now);
         // The world frame is mouse-enabled, so an addon's handlers can hover it, but its hit is
         // the world's: camera look, world clicks and hover targeting stay live over it.
         hover.0 = script
@@ -161,8 +161,8 @@ pub(super) fn feed_ui_input(
             static LAST: AtomicU64 = AtomicU64::new(0);
             ACC_US.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
             let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
-            let now_s = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            let now_s = web_time::SystemTime::now()
+                .duration_since(web_time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             if LAST.swap(now_s, Ordering::Relaxed) != now_s && calls > 1 {

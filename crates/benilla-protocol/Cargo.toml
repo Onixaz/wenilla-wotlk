@@ -13,6 +13,9 @@ anyhow.workspace = true
 clap.workspace = true
 benilla-srp = { path = "../benilla-srp" }
 flate2 = "1.0"
+# The transport seam's reads are `async` so the browser body can suspend on the JS event loop; the
+# native sequencer drives the very same futures to completion with `block_on` on its own thread.
+futures-lite = "2.6.1"
 sha1.workspace = true
 # Derives `SessionEventKind`, `SessionEvent`'s fieldless twin that the handler table keys on.
 strum = { version = "0.26", features = ["derive"] }
@@ -21,3 +24,23 @@ strum = { version = "0.26", features = ["derive"] }
 # The SRP probe example re-derives the handshake by hand, to vary what `benilla-srp` fixes.
 num-bigint = "0.4.6"
 rand = "0.8.6"
+
+# The browser body of the transport seam (`src/transport/web.rs`) — the page's WebSocket, the timer
+# that bounds a read, and the `SendWrapper` that lets the write half live in a Bevy resource.
+# wasm-bindgen is pinned exact: a newer crate against the installed 0.2.122 CLI emits broken glue.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time = "1"
+js-sys = "0.3.99"
+send_wrapper = "0.6"
+wasm-bindgen = "=0.2.122"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3.99", features = [
+    "BinaryType",
+    "CloseEvent",
+    "ErrorEvent",
+    "Event",
+    "Location",
+    "MessageEvent",
+    "WebSocket",
+    "Window",
+] }

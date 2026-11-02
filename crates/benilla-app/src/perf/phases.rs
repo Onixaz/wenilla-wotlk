@@ -17,7 +17,7 @@
 //!
 //! `WOW_FRAME_PHASES=0` prints every frame.
 
-use std::time::Instant;
+use bevy::platform::time::Instant;
 
 use bevy::app::{First, Last, MainScheduleOrder, PostUpdate, PreUpdate, Update};
 use bevy::ecs::schedule::ScheduleLabel;

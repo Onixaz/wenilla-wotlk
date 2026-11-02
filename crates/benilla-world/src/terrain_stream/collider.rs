@@ -2,7 +2,8 @@
 //! ([`build_collider_task`]) and [`finish_colliders`] attaches the results under a per-frame
 //! budget, since a streamed burst finishes together and each attach is main-thread work.
 
-use std::time::{Duration, Instant};
+use bevy::platform::time::Instant;
+use std::time::Duration;
 
 use avian3d::prelude::{Collider, CollisionLayers, RigidBody};
 use benilla_assets::coords::wow_to_bevy;
@@ -11,6 +12,9 @@ use bevy::ecs::system::SystemState;
 use bevy::prelude::*;
 use bevy::tasks::futures_lite::future;
 use bevy::tasks::{block_on, AsyncComputeTaskPool, Task};
+
+#[cfg(any(target_arch = "wasm32", test))]
+mod web_budget;
 
 /// Wall clock per frame for attaching finished colliders (one costs ~0.004 ms plus ~1.8e-5 ms per
 /// triangle); the rest wait, and the streamer loads far enough ahead that none is reachable yet.
@@ -65,6 +69,8 @@ pub(super) fn finish_colliders(
     world: &mut World,
     state: &mut SystemState<Query<'static, 'static, (Entity, &mut PendingCollider)>>,
 ) {
+    #[cfg(target_arch = "wasm32")]
+    web_budget::begin_frame();
     // Pass 1: poll every in-flight build; a completed task hands its shape to `built`. The ready
     // list is capped far above what a frame can attach (a cold zone load queues tens of
     // thousands); the rest stay queued for the next frame.
@@ -263,6 +269,9 @@ pub(super) fn impassable_wall_data(
 
 /// Builds a static trimesh [`Collider`] on the async compute pool, for [`finish_colliders`].
 pub fn build_collider_task(verts: Vec<Vec3>, tris: Vec<[u32; 3]>) -> Task<Collider> {
+    #[cfg(target_arch = "wasm32")]
+    return web_budget::build(verts, tris);
+    #[cfg(not(target_arch = "wasm32"))]
     AsyncComputeTaskPool::get().spawn(async move { Collider::trimesh(verts, tris) })
 }
 

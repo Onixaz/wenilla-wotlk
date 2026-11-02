@@ -2,7 +2,8 @@
 //! `cargo test --release -p benilla-app --lib ui_tooltip::bench -- --ignored --nocapture`.
 //! `BENCH_N` sets how many spells the feed has pushed (2000 by default).
 
-use std::time::{Duration, Instant};
+use bevy::platform::time::Instant;
+use std::time::Duration;
 
 use benilla_protocol::ObjectFields;
 use benilla_ui::script::UiScript;

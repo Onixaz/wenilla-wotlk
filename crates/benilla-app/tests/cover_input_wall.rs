@@ -37,6 +37,14 @@ const VERDICTS: &[(&str, Verdict)] = &[
     ("physical_cursor_position", Swallowed),
     // ── Deliberately open under the cover ───────────────────────────────────────────────────
     (
+        "EventLoopProxyWrapper",
+        Open(
+            "the browser's JS bridge wakes the event loop through it (`webbridge`); a wake is not \
+             player input, and the bridge's commands go through the bindings the cover gates",
+        ),
+    ),
+    ("WinitUserEvent", Open("the payload of the bridge's wake above, read by nothing else")),
+    (
         "WindowCloseRequested",
         Open("closing the window during a load must work — it is the OS asking, not the player"),
     ),

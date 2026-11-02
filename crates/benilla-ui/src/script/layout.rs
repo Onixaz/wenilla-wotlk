@@ -530,7 +530,7 @@ fn layout_verify_enabled() -> bool {
 #[derive(Default)]
 struct PreambleProf {
     on: bool,
-    last: Option<std::time::Instant>,
+    last: Option<web_time::Instant>,
     /// The GameTooltip auto-size pre-pass (`layout_tooltips`).
     tooltip: u128,
     /// `OnSizeChanged`'s "before" snapshot.
@@ -557,7 +557,7 @@ impl PreambleProf {
     fn new(on: bool) -> Self {
         Self {
             on,
-            last: on.then(std::time::Instant::now),
+            last: on.then(web_time::Instant::now),
             ..Default::default()
         }
     }
@@ -567,7 +567,7 @@ impl PreambleProf {
         if !self.on {
             return 0;
         }
-        let now = std::time::Instant::now();
+        let now = web_time::Instant::now();
         self.last
             .replace(now)
             .map_or(0, |t| now.duration_since(t).as_micros())
@@ -890,7 +890,7 @@ impl UiScript {
         let mut n_regions_swept = 0u64;
         for round in 0..round_cap {
             *layout_rounds += 1;
-            let t_round = prof.then(std::time::Instant::now);
+            let t_round = prof.then(web_time::Instant::now);
             let mut changed = false;
 
             // Seed the screen root and every read rect this pass does not recompute.
@@ -948,7 +948,7 @@ impl UiScript {
             if let Some(t) = t_round {
                 t_frames += t.elapsed();
             }
-            let t_reg = prof.then(std::time::Instant::now);
+            let t_reg = prof.then(web_time::Instant::now);
             let mut scratch = LayoutInput::default();
             for &ri in &sweep_regions {
                 let RegionRow {

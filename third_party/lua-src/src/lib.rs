@@ -197,6 +197,56 @@ impl Build {
                 config.flag("-mllvm").flag("-wasm-enable-sjlj");
                 libs.push("setjmp".to_string());
             }
+            // Browser build (benilla web): plain C Lua for `wasm32-unknown-unknown`. There is no
+            // libc on that target, so the sources are compiled against the wasi-sdk sysroot as
+            // `wasm32-wasip1` objects (same ABI; the only difference is a handful of
+            // `wasi_snapshot_preview1` imports the page stubs out). `setjmp`/`longjmp` — Lua's
+            // error path — is LLVM's Wasm SJLJ lowering on top of the wasm exception-handling
+            // proposal, with the runtime half in wasi-libc's `libsetjmp.a`. `WASI_SDK` names
+            // the SDK root (default: `<repo>/tools/wasi-sdk`, where `scripts/web-setup.sh`
+            // unpacks it).
+            _ if target == "wasm32-unknown-unknown" => {
+                let sdk = env::var("WASI_SDK")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| manifest_dir.join("../../tools/wasi-sdk"));
+                let sysroot = sdk.join("share/wasi-sysroot");
+                let sys_lib = sysroot.join("lib/wasm32-wasip1");
+                if !sys_lib.join("libsetjmp.a").exists() {
+                    Err(format!(
+                        "wasi-sdk not found at {} (set WASI_SDK); need share/wasi-sysroot/lib/wasm32-wasip1/libsetjmp.a",
+                        sdk.display()
+                    ))?;
+                }
+                config
+                    .compiler(sdk.join("bin/clang"))
+                    .target("wasm32-wasip1")
+                    .flag(format!("--sysroot={}", sysroot.display()))
+                    .flag("-mllvm").flag("-wasm-enable-sjlj")
+                    .flag("-fno-exceptions")
+                    // C's float→int conversion is UB out of range; on wasm the plain opcode TRAPS
+                    // (x86 wraps). Lua does that cast on every `%d`/`tointeger`, and a 1.12 addon
+                    // formatting a big float must not take the whole VM down — use the saturating
+                    // opcodes instead.
+                    .flag("-mnontrapping-fptoint")
+                    // `%d` formats through `long long`, matching the 64-bit `lua_Integer` that
+                    // `luaconf.h` defines for wasm32 (see third_party/mlua-sys/BENILLA.md).
+                    .define("LUA_USELONGLONG", None);
+                // The link needs libsetjmp + libc + compiler-rt from the sysroot; `Artifacts`
+                // carries one search dir, so they are copied beside liblua.
+                fs::create_dir_all(&lib_dir)?;
+                for f in &["libsetjmp.a", "libc.a"] {
+                    fs::copy(sys_lib.join(f), lib_dir.join(f))?;
+                }
+                let rt = fs::read_dir(sdk.join("lib/clang"))?
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path().join("lib/wasm32-unknown-wasip1/libclang_rt.builtins.a"))
+                    .find(|p| p.exists())
+                    .ok_or("wasi-sdk: libclang_rt.builtins.a for wasm32-unknown-wasip1 not found")?;
+                fs::copy(&rt, lib_dir.join("libclang_rt.builtins.a"))?;
+                libs.push("setjmp".to_string());
+                libs.push("c".to_string());
+                libs.push("clang_rt.builtins".to_string());
+            }
             _ => Err(format!("don't know how to build Lua for {target}"))?,
         }
 

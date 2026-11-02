@@ -165,7 +165,9 @@ pub(crate) struct ChatEvent {
     pub channel_number: u32,
     pub channel_base: String,
     pub notice: String,
-    /// The speaker's guid on a wire line, 0 otherwise: 3.3.5a's arg12.
+    /// The speaker's guid on a wire line, 0 otherwise: 3.3.5a's arg12. The web bridge
+    /// (`crate::webbridge`) relays it too, so a page feature can find the speaker among the
+    /// streamed units.
     pub sender_guid: u64,
     /// Our slot's state for this channel as the notice arrived (`None`: no slot), set before
     /// [`super::feed::deliver`] changes it: the reference's notice arms read `slot+0x9c` for the

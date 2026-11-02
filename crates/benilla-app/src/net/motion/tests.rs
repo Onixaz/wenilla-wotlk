@@ -1,7 +1,8 @@
 //! Tests for the motion kernels: the spline sampler, dead-reckoning, jump ballistics, the relay
 //! chain, facing and gameobject placement.
 
-use std::time::{Duration, Instant};
+use bevy::platform::time::Instant;
+use std::time::Duration;
 
 use benilla_protocol::{JumpInfo, MonsterMoveFacing, MoveSpeeds};
 use bevy::prelude::Quat;

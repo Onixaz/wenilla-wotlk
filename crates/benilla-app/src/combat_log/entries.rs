@@ -457,8 +457,8 @@ pub(crate) fn on_world_entry(
         return;
     }
     let at_ms = time.map_or(0, |t| t.elapsed().as_millis() as u64);
-    let epoch_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let epoch_secs = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
     *clock = CombatLogClock { epoch_secs, at_ms };
     pending.0.clear();

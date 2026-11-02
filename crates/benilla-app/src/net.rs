@@ -6,8 +6,9 @@
 //! It runs in [`WorldStage::Net`], before `Input`, so a server teleport snaps, streams and covers
 //! in one frame. Coordinates cross from WoW into Bevy space here (`wow_to_bevy`).
 
+use bevy::platform::time::Instant;
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use benilla_protocol::{
     messages::WhoRequest, EntityKind, JumpInfo, MoveMode, MoveSpeeds, ObjectFields, SessionEvent,
@@ -71,6 +72,23 @@ impl Plugin for NetPlugin {
         if !self.connect {
             app.insert_resource(NetOffline);
         }
+        // The web's write half. It runs *before* the event drain so a command the app issued last
+        // frame is on the wire by the time this frame's inbound state lands on it.
+        #[cfg(target_arch = "wasm32")]
+        app.insert_resource(WebWriter {
+            writer: None,
+            writer_rx: handles.writer_rx,
+            cmd_rx: handles.commands_rx,
+            park: handles.writer_park,
+            next_ping: None,
+            warned: 0,
+        })
+        .add_systems(
+            Update,
+            web_writer_pump
+                .in_set(WorldStage::Net)
+                .before(apply_net_updates),
+        );
         // In the net stage: the lighting resolve runs after it and reads this frame's clock.
         app.add_systems(
             Update,
@@ -169,6 +187,52 @@ impl Plugin for NetPlugin {
                     .after(enter_world_on_self_create),
             )
             .add_systems(Update, population_pulse.in_set(WorldStage::Net));
+    }
+}
+
+/// The web build's write half: what `io::writer_loop` owns natively, the world writer, the swap
+/// channel, the command queue and the keepalive, since a page has no write thread.
+/// [`web_writer_pump`] runs the native loop's three steps once a frame through the same
+/// `io::apply_swap`, `io::write_command` and `io::send_ping`, so both targets send the same bytes.
+///
+/// A plain `Resource`: `WorldWriter` is `Send` in a page, its socket in a `SendWrapper` whose
+/// one-thread contract a page keeps.
+#[cfg(target_arch = "wasm32")]
+#[derive(Resource)]
+pub(crate) struct WebWriter {
+    writer: Option<benilla_protocol::WorldWriter>,
+    writer_rx: Receiver<io::WriterSwap>,
+    cmd_rx: Receiver<ClientCommand>,
+    /// The park channel, for account data and the barrier with no world writer.
+    park: async_channel::Sender<ParkRequest>,
+    /// `Time`'s elapsed seconds when the next keepalive is due; `None` disarmed. On the frame
+    /// clock, so it holds at any frame rate.
+    next_ping: Option<f64>,
+    /// Send warnings this connection, capped at `io::SEND_WARN_CAP`.
+    warned: u32,
+}
+
+/// The web's `writer_loop`, once a frame: writer swaps, then the frame's commands, then the
+/// keepalive.
+#[cfg(target_arch = "wasm32")]
+fn web_writer_pump(mut web: ResMut<WebWriter>, time: Res<Time>, ping: Res<PingShared>) {
+    let web = &mut *web;
+    let now = time.elapsed_secs_f64();
+    let interval = io::PING_INTERVAL.as_secs_f64();
+    while let Ok(swap) = web.writer_rx.try_recv() {
+        let armed = io::apply_swap(swap, &mut web.writer, &mut web.warned, &ping.0);
+        web.next_ping = armed.then_some(now + interval);
+    }
+    while let Ok(cmd) = web.cmd_rx.try_recv() {
+        io::write_command(web.writer.as_mut(), cmd, Some(&web.park), &mut web.warned);
+    }
+    if web.next_ping.is_some_and(|due| now >= due) {
+        // Sent only with a live writer, re-armed from the send; disarmed otherwise.
+        web.next_ping = None;
+        if let Some(w) = web.writer.as_mut() {
+            web.next_ping = Some(now + interval);
+            io::send_ping(w, &ping.0, &mut web.warned);
+        }
     }
 }
 
@@ -424,11 +488,15 @@ pub(crate) struct ParkGone;
 
 /// The app's end of the park channel for one kind of request.
 pub(crate) enum ParkSender<T> {
-    /// The shared, ordered channel the IO thread reads.
-    Park(Sender<ParkRequest>, std::marker::PhantomData<fn(T)>),
+    /// The shared, ordered channel the IO thread reads; `async_channel`, since the sequencer awaits
+    /// it, and unbounded, so `try_send` fails only once the sequencer is gone.
+    Park(
+        async_channel::Sender<ParkRequest>,
+        std::marker::PhantomData<fn(T)>,
+    ),
     /// A channel of that kind alone, for a test that reads the requests itself.
     #[cfg(test)]
-    Direct(Sender<T>),
+    Direct(async_channel::Sender<T>),
 }
 
 impl<T> Clone for ParkSender<T> {
@@ -443,7 +511,7 @@ impl<T> Clone for ParkSender<T> {
 
 impl<T> ParkSender<T> {
     /// The app's end of the IO thread's park channel.
-    pub(super) fn park(tx: Sender<ParkRequest>) -> Self {
+    pub(super) fn park(tx: async_channel::Sender<ParkRequest>) -> Self {
         ParkSender::Park(tx, std::marker::PhantomData)
     }
 }
@@ -452,7 +520,7 @@ impl<T> ParkSender<T> {
     /// Send a request of either kind, in the order it is made against the rest.
     pub(crate) fn send_request(&self, request: ParkRequest) -> Result<(), ParkGone> {
         match self {
-            ParkSender::Park(tx, _) => tx.send(request).map_err(|_| ParkGone),
+            ParkSender::Park(tx, _) => tx.try_send(request).map_err(|_| ParkGone),
             #[cfg(test)]
             ParkSender::Direct(_) => Err(ParkGone),
         }
@@ -462,16 +530,16 @@ impl<T> ParkSender<T> {
 impl<T: Into<ParkRequest>> ParkSender<T> {
     pub(crate) fn send(&self, request: T) -> Result<(), ParkGone> {
         match self {
-            ParkSender::Park(tx, _) => tx.send(request.into()).map_err(|_| ParkGone),
+            ParkSender::Park(tx, _) => tx.try_send(request.into()).map_err(|_| ParkGone),
             #[cfg(test)]
-            ParkSender::Direct(tx) => tx.send(request).map_err(|_| ParkGone),
+            ParkSender::Direct(tx) => tx.try_send(request).map_err(|_| ParkGone),
         }
     }
 }
 
 #[cfg(test)]
-impl<T> From<Sender<T>> for ParkSender<T> {
-    fn from(tx: Sender<T>) -> Self {
+impl<T> From<async_channel::Sender<T>> for ParkSender<T> {
+    fn from(tx: async_channel::Sender<T>) -> Self {
         ParkSender::Direct(tx)
     }
 }
@@ -538,7 +606,7 @@ pub(crate) enum RealmRequest {
 
 /// The credentials channel to the IO thread's pre-logon park, sent by [`crate::login`].
 #[derive(Resource)]
-pub(crate) struct LoginSubmit(pub(crate) Sender<io::LoginRequest>);
+pub(crate) struct LoginSubmit(pub(crate) async_channel::Sender<io::LoginRequest>);
 
 /// The login abandon generation: Cancel bumps it, and the IO thread drops an
 /// [`io::LoginRequest`] or a [`RealmRequest::Enter`] asked under an older value.

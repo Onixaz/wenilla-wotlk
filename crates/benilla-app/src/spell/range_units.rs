@@ -167,7 +167,7 @@ mod tests {
     fn spline(length: f32, secs: u64) -> Spline {
         Spline {
             points: vec![[0.0; 3], [length, 0.0, 0.0]],
-            start: std::time::Instant::now(),
+            start: bevy::platform::time::Instant::now(),
             duration: std::time::Duration::from_secs(secs),
             id: 1,
             grounded: true,

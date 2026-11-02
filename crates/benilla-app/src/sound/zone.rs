@@ -19,16 +19,20 @@
 //! is a looping stream read from the archive as it plays, opened on the IO pool so the frame that
 //! changes it reads and decodes nothing.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Mutex;
 
 use anyhow::Context;
 use bevy::prelude::*;
+#[cfg(not(target_arch = "wasm32"))]
 use bevy::tasks::futures_lite::future;
+#[cfg(not(target_arch = "wasm32"))]
 use bevy::tasks::{block_on, IoTaskPool, Task};
-use kira::sound::streaming::StreamingSoundData;
 use kira::sound::FromFileError;
 
-use benilla_formats::{AreaSoundCatalog, Chain};
+use benilla_formats::AreaSoundCatalog;
+#[cfg(not(target_arch = "wasm32"))]
+use benilla_formats::Chain;
 
 use crate::net::{ServerSoundKind, ServerSoundMessage};
 use benilla_assets::{AssetSet, LockRecover, WorldAssets};
@@ -36,7 +40,7 @@ use benilla_world::lighting::GameClock;
 use benilla_world::schedule::WorldStage;
 
 use super::kit::{play_kit_ext, KitRef, Latch, PlayExtras, SoundCategory, SoundKits};
-use super::mixer::{self, StreamingSoundHandle};
+use super::mixer::{self, StreamingSoundData, StreamingSoundHandle};
 use super::{AudioListener, SoundConfig, SoundOutput};
 
 /// The zone-to-audio catalog; absent when the client data did not load.
@@ -171,6 +175,11 @@ pub(super) struct ZoneAudio {
     /// Last submersion state; a flip makes the ambience swap instant.
     was_underwater: bool,
     rng: u32,
+    /// wasm32: the music load in flight. The edge only *starts* a load there — the browser
+    /// fetches and decodes it off the main thread (`super::web_load`) and the slot fills a few
+    /// frames later. Native loads inline. (The ambience bed's rides [`OpeningBed`].)
+    #[cfg(target_arch = "wasm32")]
+    pending_music: Option<super::web_load::Pending>,
 }
 
 impl Default for ZoneAudio {
@@ -198,11 +207,26 @@ impl Default for ZoneAudio {
             interior: None,
             was_underwater: false,
             rng: 0x1234_5677,
+            #[cfg(target_arch = "wasm32")]
+            pending_music: None,
         }
     }
 }
 
 impl ZoneAudio {
+    /// Is a music load in flight? Always `false` on native, which loads inline — the predicate
+    /// exists so the transport pump reads the same on both targets.
+    fn music_pending(&self) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.pending_music.is_some()
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            false
+        }
+    }
+
     fn rand(&mut self) -> u32 {
         let mut x = self.rng;
         x ^= x << 13;
@@ -365,6 +389,10 @@ fn zone_audio(
     zone.was_underwater = world.submersion().is_water();
     land_ambience(zone, &mut out, &config, now);
 
+    // ---- land anything the browser finished loading (wasm32; a no-op elsewhere) ----
+    #[cfg(target_arch = "wasm32")]
+    poll_pending_music(zone, &mut out, &config, now);
+
     // ---- music transport ---- Reap a finished track and schedule the next after a silence
     // interval.
     if let Some(h) = &zone.music {
@@ -378,7 +406,9 @@ fn zone_audio(
     // The deadline passed: start the next track. Under a live Lua slot the reference's pump bails
     // before reading the deadline; here the start is refused at the slot and the deadline stays
     // armed until the verb rewrites it, the same outcome.
-    if zone.next_track_at.is_some_and(|t| now >= t) && zone.music.is_none() {
+    // wasm32: a load in flight holds the slot, so the pump does not start a second one.
+    if zone.next_track_at.is_some_and(|t| now >= t) && zone.music.is_none() && !zone.music_pending()
+    {
         let kit = zone_music_row(&areas.0, zone.zone_music).map(|m| m.sounds[phase]);
         pump_zone_music(zone, kit, |zone, kit| {
             start_music_stream(zone, &mut out, &mut kits, &assets, &config, kit)
@@ -560,24 +590,98 @@ fn start_music_stream(
     if zone.lua_slot_live() {
         return false;
     }
-    let Some(mixer_ref) = out.mixer.as_mut() else {
+    if out.mixer.is_none() {
         return false;
-    };
+    }
     let Some((path, kit_vol)) = kits.pick_stream(kit_id) else {
         return false;
     };
-    let bytes = {
-        let chain = assets.chain.lock_recover();
-        chain.read(&path)
-    };
-    let data = match bytes.and_then(mixer::stream_from_bytes) {
-        Ok(d) => d,
-        Err(e) => {
-            if first_unplayable(zone, &path) {
-                warn!("zone music: {path} — {e:#}");
+
+    // **Native loads inline; wasm hands both halves to the browser.** The two targets differ here
+    // and nowhere else in this file — see `super::web_load`'s header for the 206 ms doorway that
+    // forced the split, and for why a deferred start is safe on both slots.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let bytes = {
+            let chain = assets.chain.lock_recover();
+            chain.read(&path)
+        };
+        let data = match bytes.and_then(mixer::stream_from_bytes) {
+            Ok(d) => d,
+            Err(e) => {
+                if first_unplayable(zone, &path) {
+                    warn!("zone music: {path} — {e:#}");
+                }
+                return false;
             }
+        };
+        finish_music(zone, out, config, data, kit_id, kit_vol, &path)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        // The lock is taken to build the URL and dropped before the request starts — never held
+        // across the await.
+        let url = {
+            let chain = assets.chain.lock_recover();
+            chain.url_for_name(&path)
+        };
+        let Some(url) = url else {
+            warn!("zone music: file not in patch chain: {path}");
             return false;
+        };
+        zone.pending_music = Some(super::web_load::begin(url, path, kit_id, kit_vol, 0, false));
+        // `true` = the slot is claimed, which is what every caller actually asks. The disclosed
+        // divergence: the intro fanfare's `MinDelayMinutes` stamp is now taken when the load
+        // starts rather than when the track plays (`web_load`'s header).
+        true
+    }
+}
+
+/// wasm32: land the music load the browser has finished, filling the slot exactly as the
+/// synchronous path would have at the edge. Called once a frame, before the music transport, so
+/// a track that has just landed is never double-started by the pump. A load that failed re-arms
+/// the pump, as a failed open does natively.
+#[cfg(target_arch = "wasm32")]
+fn poll_pending_music(zone: &mut ZoneAudio, out: &mut SoundOutput, config: &SoundConfig, now: f64) {
+    let Some(mut pending) = zone.pending_music.take() else {
+        return;
+    };
+    let started = match pending.take() {
+        None => {
+            zone.pending_music = Some(pending); // still in flight
+            return;
         }
+        Some(Ok(data)) => {
+            let data = StreamingSoundData::from_static(data);
+            let (kit_id, kit_vol) = (pending.kit_id, pending.kit_vol);
+            finish_music(zone, out, config, data, kit_id, kit_vol, &pending.path)
+        }
+        Some(Err(e)) => {
+            if first_unplayable(zone, &pending.path) {
+                warn!("zone music: {e}");
+            }
+            false
+        }
+    };
+    if !started && zone.music.is_none() {
+        zone.next_track_at = Some(now);
+    }
+}
+
+/// The music slot's completion: play the data, hand the outgoing track its 4.0 s fade, latch the
+/// slot's bookkeeping. Shared by the synchronous (native) and deferred (wasm) paths, so the two
+/// differ only in *when* they arrive here with a decoded sound — never in what happens next.
+fn finish_music(
+    zone: &mut ZoneAudio,
+    out: &mut SoundOutput,
+    config: &SoundConfig,
+    data: mixer::StreamingSoundData<kira::sound::FromFileError>,
+    kit_id: u32,
+    kit_vol: f32,
+    path: &str,
+) -> bool {
+    let Some(mixer_ref) = out.mixer.as_mut() else {
+        return false;
     };
     let start_amp = config.category_amp(SoundCategory::Music) * kit_vol;
     match mixer_ref.play_stream(data.volume(mixer::amp_to_db(start_amp))) {
@@ -592,7 +696,7 @@ fn start_music_stream(
             true
         }
         Err(e) => {
-            if first_unplayable(zone, &path) {
+            if first_unplayable(zone, path) {
                 warn!("zone music: {path} — {e:#}");
             }
             false
@@ -733,11 +837,32 @@ fn swap_ambience(
         fade_out_ambience(zone, fade_ms);
         return;
     };
-    let chain = assets.chain.clone();
-    let open_path = path.clone();
-    begin_bed_open(zone, path, kit_vol, fade_ms, move || {
-        open_bed(&chain, &open_path)
-    });
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let chain = assets.chain.clone();
+        let open_path = path.clone();
+        begin_bed_open(zone, path, kit_vol, fade_ms, move || {
+            open_bed(&chain, &open_path)
+        });
+    }
+    // wasm32: the browser fetches and decodes the bed off the main thread (`super::web_load`),
+    // whole-file looping; it lands through [`poll_bed_open`] like the native open does.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let url = assets.chain.lock_recover().url_for_name(&path);
+        let Some(url) = url else {
+            warn!("ambience: file not in patch chain: {path}");
+            fade_out_ambience(zone, fade_ms);
+            return;
+        };
+        let task = super::web_load::begin(url, path.clone(), kit_id, kit_vol, fade_ms, true);
+        zone.ambience_opening = Some(OpeningBed {
+            path,
+            kit_vol,
+            fade_ms,
+            task,
+        });
+    }
 }
 
 /// An ambience bed opening off the main thread, and how it goes in once open.
@@ -745,7 +870,10 @@ struct OpeningBed {
     path: String,
     kit_vol: f32,
     fade_ms: u64,
+    #[cfg(not(target_arch = "wasm32"))]
     task: Task<anyhow::Result<StreamingSoundData<FromFileError>>>,
+    #[cfg(target_arch = "wasm32")]
+    task: super::web_load::Pending,
 }
 
 /// A bed whose open finished, ready to land.
@@ -757,6 +885,7 @@ struct OpenedBed {
 }
 
 /// Run `open` on the IO pool as the next bed, replacing any open in flight.
+#[cfg(not(target_arch = "wasm32"))]
 fn begin_bed_open(
     zone: &mut ZoneAudio,
     path: String,
@@ -775,7 +904,16 @@ fn begin_bed_open(
 
 /// The open in flight, once it has finished.
 fn poll_bed_open(zone: &mut ZoneAudio) -> Option<OpenedBed> {
+    #[cfg(not(target_arch = "wasm32"))]
     let stream = block_on(future::poll_once(&mut zone.ambience_opening.as_mut()?.task))?;
+    #[cfg(target_arch = "wasm32")]
+    let stream = zone
+        .ambience_opening
+        .as_mut()?
+        .task
+        .take()?
+        .map(StreamingSoundData::from_static)
+        .map_err(|e| anyhow::anyhow!(e));
     let OpeningBed {
         path,
         kit_vol,
@@ -794,6 +932,7 @@ fn poll_bed_open(zone: &mut ZoneAudio) -> Option<OpenedBed> {
 /// the reference opens a bed with `FSOUND_Stream_Open` in mode `0x82002`, its `0x2` the loop bit,
 /// and loop count −1, reading through its MPQ file callbacks. The chain's lock covers the archive
 /// lookup alone.
+#[cfg(not(target_arch = "wasm32"))]
 fn open_bed(chain: &Mutex<Chain>, path: &str) -> anyhow::Result<StreamingSoundData<FromFileError>> {
     let archive = chain.lock_recover().archive_for(path)?;
     let file = archive
@@ -1135,10 +1274,11 @@ mod tests {
     use crate::sound::kit::SoundKits;
     use crate::sound::mixer;
     use benilla_formats::SoundKitCatalog;
+    use bevy::platform::time::Instant;
     use kira::sound::streaming::StreamingSoundData;
     use kira::sound::{FromFileError, PlaybackState};
     use std::sync::{mpsc, Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     /// A kit of `files`, of which only the `present` ones open, picked uniformly per attempt as
     /// the reference's weighted pick does: every attempt is logged in `tried`.

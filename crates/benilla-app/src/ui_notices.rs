@@ -2,7 +2,8 @@
 //! and refer-a-friend errors, the level grant offer and the inebriation lines. The dance moves are
 //! read and dropped: nothing built reads them, as `PlayDance` is not.
 
-use std::time::{Duration, Instant};
+use bevy::platform::time::Instant;
+use std::time::Duration;
 
 use benilla_protocol::messages::{InebriationThreshold, ObjectType};
 use benilla_protocol::{SessionEvent, SessionEventKind};
@@ -38,8 +39,8 @@ impl UiClock {
 }
 
 fn unix_now() -> i32 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i32)
 }
 

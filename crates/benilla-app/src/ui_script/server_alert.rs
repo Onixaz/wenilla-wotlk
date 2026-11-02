@@ -527,8 +527,17 @@ pub(crate) fn open_launched(mut urls: MessageReader<LaunchUrl>) {
     }
 }
 
+/// On the page the opener is the browser itself: a new tab.
+#[cfg(target_arch = "wasm32")]
+fn open_in_browser(url: &str) {
+    if let Some(window) = web_sys::window() {
+        let _ = window.open_with_url_and_target(url, "_blank");
+    }
+}
+
 /// The platform's opener, detached. The URL is `http://` and letters, digits, `.`, `-` and `/`
 /// ([`benilla_ui::script::GlueRequest::LaunchUrl`]), so it carries nothing a shell would read.
+#[cfg(not(target_arch = "wasm32"))]
 fn open_in_browser(url: &str) {
     let mut command = if cfg!(target_os = "macos") {
         std::process::Command::new("/usr/bin/open")

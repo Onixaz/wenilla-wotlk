@@ -15,7 +15,8 @@
 //! (the item cooldown and 0x28, else the spell cooldown and 0x3c), the power gate (items skip it),
 //! and the opcode (`0xab` vs `0x12e`).
 
-use std::time::Instant;
+// `bevy::platform::time::Instant`, not `bevy::platform::time::Instant`: this flows into `crate::cooldowns`/`crate::ui_script::UiClock`, which on wasm32 (the default `web` Bevy feature) is a genuinely different type from `bevy::platform::time::Instant` — a plain alias for it everywhere else.
+use bevy::platform::time::Instant;
 
 use benilla_protocol::messages::UseItemTarget;
 use bevy::ecs::system::SystemParam;

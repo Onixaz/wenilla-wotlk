@@ -12,9 +12,9 @@
 //!
 //! This module only moves the streamed GameObject; riding keys on [`Transport`], not the drive.
 
+use bevy::platform::time::Instant;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use avian3d::prelude::{Position, RigidBody, Rotation};
 use benilla_formats::{

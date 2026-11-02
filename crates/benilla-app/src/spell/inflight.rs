@@ -2,7 +2,10 @@
 //! on-next-swing strike, the running channel, the auto-repeat key, and the local abort on a move,
 //! jump or Esc (the cast abort).
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// Bevy's `Instant`, not std's: std's panics on wasm32, and these stores trade with `UiClock::anchor`.
+use bevy::platform::time::Instant;
 
 use bevy::prelude::*;
 

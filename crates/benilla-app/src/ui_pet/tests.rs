@@ -800,7 +800,7 @@ fn a_cooldown_alone_is_pushed_with_no_event_from_the_bar_feed() {
     app.world_mut()
         .resource_mut::<PetBar>()
         .cooldowns
-        .start_spell(CLAW, &claw(), 0, std::time::Instant::now(), None);
+        .start_spell(CLAW, &claw(), 0, bevy::platform::time::Instant::now(), None);
     assert_eq!(
         seen(&mut app),
         Vec::<String>::new(),

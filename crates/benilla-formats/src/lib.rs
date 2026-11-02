@@ -18,6 +18,8 @@ mod tga;
 pub use tga::tga_to_rgba;
 /// Where the WoW install is; [`Chain`] opens it.
 mod install;
+/// Web-target chain plumbing (HTTP in place of a filesystem); browser-only pieces are gated inside.
+pub mod web;
 pub use install::{
     addon_corpus, addon_corpus_candidates, candidates, drop_in_install, project_folder,
     set_drop_in_install, set_project_folder, skipped, wow_data,

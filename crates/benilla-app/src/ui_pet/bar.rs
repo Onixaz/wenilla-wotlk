@@ -1,7 +1,8 @@
 //! The pet action bar's feed: the ten packed words of the last `SMSG_PET_SPELLS`, which the
 //! server owns whole, rendered as ten `PetActionView`s each frame.
 
-use std::time::Instant;
+// std's `Instant` panics on wasm32; this flows into `crate::cooldowns`, which takes bevy's.
+use bevy::platform::time::Instant;
 
 use bevy::prelude::*;
 

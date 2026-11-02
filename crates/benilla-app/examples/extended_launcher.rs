@@ -34,6 +34,7 @@
 //! lua-src = { git = "https://github.com/Onixaz/benilla-wotlk" }
 //! kira = { git = "https://github.com/Onixaz/benilla-wotlk" }
 //! bevy_render = { git = "https://github.com/Onixaz/benilla-wotlk" }
+//! mlua-sys = { git = "https://github.com/Onixaz/benilla-wotlk" }
 //!
 //! # The dev build; `assert_no_alloc` keeps its debug assertions, or `benilla-app` does
 //! # not build.

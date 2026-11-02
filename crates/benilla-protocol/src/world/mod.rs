@@ -5,13 +5,13 @@
 //! server, 6-byte client), bodies never, starting with `SMSG_AUTH_RESPONSE`. 3.3.5a keeps that
 //! shape with its own cipher and layouts ([`cipher`]).
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::io::Write;
 use std::sync::OnceLock;
 
 use anyhow::{anyhow, Result};
 
 use crate::messages::{self, ServerPacket};
+use crate::transport::ReadExactAsync;
 
 use cipher::{Decrypter, Encrypter};
 
@@ -32,26 +32,31 @@ pub const WORLD_PORT: u16 = 8085;
 
 /// Read and decrypt one packet, unparsed: its opcode and body. `decrypter` is `None` only for
 /// `SMSG_AUTH_CHALLENGE`.
-pub(super) fn recv_raw(
-    stream: &mut TcpStream,
+///
+/// Awaited rather than blocking ([`crate::transport`]): on the web the bytes arrive through the
+/// event loop, and natively the future is ready the instant it is polled.
+pub(super) async fn recv_raw(
+    stream: &mut impl ReadExactAsync,
     decrypter: Option<&mut Decrypter>,
 ) -> Result<(u16, Vec<u8>)> {
     let (body_len, opcode) = cipher::read_server_header(stream, decrypter)
+        .await
         .map_err(|e| anyhow!("reading world header: {e}"))?;
     let mut body = vec![0u8; body_len];
     stream
-        .read_exact(&mut body)
+        .read_exact_async(&mut body)
+        .await
         .map_err(|e| anyhow!("reading world body (opcode {opcode:#x}, {body_len} bytes): {e}"))?;
     Ok((opcode, body))
 }
 
 /// Read, decrypt and parse one packet; `decrypter` is `None` only for `SMSG_AUTH_CHALLENGE`. A
 /// body that does not parse is an [`Unparsed`] error.
-pub(super) fn recv_packet(
-    stream: &mut TcpStream,
+pub(super) async fn recv_packet(
+    stream: &mut impl ReadExactAsync,
     decrypter: Option<&mut Decrypter>,
 ) -> Result<ServerPacket> {
-    let (opcode, body) = recv_raw(stream, decrypter)?;
+    let (opcode, body) = recv_raw(stream, decrypter).await?;
     messages::parse_server(opcode, &body).map_err(|e| {
         Unparsed {
             opcode,
@@ -93,7 +98,7 @@ pub fn observe_sends(observer: SendObserver) {
 /// Write one client packet: a 6-byte header, its size counting opcode and body, then the body.
 /// The sole write path of the world socket, so the one place [`observe_sends`] reports from.
 pub(super) fn send_packet(
-    stream: &mut TcpStream,
+    stream: &mut impl Write,
     encrypter: Option<&mut Encrypter>,
     opcode: u16,
     body: &[u8],

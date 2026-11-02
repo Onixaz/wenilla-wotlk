@@ -23,7 +23,7 @@ static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 /// The release allocator, mimalloc: the frame's allocation churn (command queues, extract
 /// buffers, per-system scratch) runs through thread-local heaps instead of the OS heap's
 /// lock. `WOW_SYS_ALLOC` is not a switch: an allocator is chosen at link time.
-#[cfg(all(not(debug_assertions), not(doctest)))]
+#[cfg(all(not(debug_assertions), not(doctest), not(target_arch = "wasm32")))]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -48,6 +48,7 @@ mod cinematic;
 mod combat_log;
 mod combat_text;
 mod console;
+#[cfg(not(target_arch = "wasm32"))]
 mod crash;
 mod creature_anim;
 mod creature_type;
@@ -211,6 +212,13 @@ mod video;
 mod vplates;
 mod wdb;
 mod weapon_trail;
+mod webbridge;
+/// The web build's env-var stand-in (a browser tab has no process environment) — see the
+/// module doc. `pub` because the plan's "Env/config on web" interface names it as
+/// `benilla_app::webenv::var` by that exact path; every in-crate caller still just writes
+/// `crate::webenv::var` like any other module.
+pub mod webenv;
+mod webprogress;
 mod world_backdrop;
 mod world_state;
 mod world_state_ui;
@@ -306,6 +314,8 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
 
     // From here a panic leaves `benilla-config/Diagnostics/crash-<unix>.txt`; armed before the
     // `App` exists, so a panic while plugins build is reported too.
+    // The browser entry installs console_error_panic_hook; filesystem reports are native.
+    #[cfg(not(target_arch = "wasm32"))]
     crash::install(build);
 
     let mut app = App::new();
@@ -490,6 +500,8 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
         start: run_mode::start_state(),
     });
 
+    app.add_plugins(webbridge::WebBridgePlugin);
+
     // benilla-assets' loaders go into the live `AssetServer`, so they register after `AssetPlugin`.
     benilla_assets::register_asset_loaders(&mut app);
 
@@ -514,6 +526,9 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
             eprintln!("executor: no render app — ExtractSchedule flip NOT applied");
         }
     }
+
+    // Boot-progress bridge (webprogress.rs): tell the hosting page the Startup pile is done.
+    app.add_systems(PostStartup, webprogress::signal_startup);
 
     // A crate on top of benilla adds its plugins here ([`run_with`]).
     if let Some(extend) = extend {

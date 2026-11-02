@@ -1,7 +1,7 @@
 //! Measurement (#347): where the first `ToggleAchievementFrame()` spends its time.
 
+use bevy::platform::time::Instant;
 use std::sync::Arc;
-use std::time::Instant;
 
 use benilla_ui::script::{
     AchievementBook, AchievementDb, AchievementUpdate, CriteriaWire, WowDate,

@@ -101,6 +101,8 @@ pub(crate) struct BindingsState {
     /// The last bit-clearing Stop's keep-smoothing argument: `CameraOrSelectOrMoveStop`'s sticky
     /// flag, false from every other Stop.
     keep_smoothing: bool,
+    /// The web bridge's latches, by command name ([`Self::synth_press`]).
+    synth: Vec<String>,
 }
 
 /// The physical input a latch waits on: a keyboard key by its code, not its name, so its release
@@ -151,6 +153,66 @@ impl BindingsState {
         self.steering()
             && (self.just_pressed(Input::TurnOrAction)
                 || self.just_pressed(Input::CameraOrSelectOrMove))
+    }
+
+    // ── The synthetic seam ── commands asserted by something that is not a key: the web bridge
+    // (`crate::webbridge`). A synthetic press runs the command's body exactly as a key's does
+    // ([`press`]), so every consumer reads it through the accessors above and cannot tell it from
+    // a key; its latch is a command name with no physical input, so the stuck-latch sweep never
+    // releases it. A VM swap drops it with the key latches, and the bridge re-asserts next frame.
+
+    /// Press `command` from the bridge, once: run its body with `keystate = "down"`, apply the
+    /// calls it made this frame, and latch it until [`Self::synth_release`]. An analog `amount`
+    /// scales the one-shot amounts the body fired (the page's wheel magnitude on a zoom; `1.0` is
+    /// the reference's key step). Already latched: nothing. `false` when there is no such command.
+    pub(crate) fn synth_press(
+        &mut self,
+        script: &mut UiScript,
+        command: &str,
+        amount: f32,
+    ) -> bool {
+        if self.synth.iter().any(|c| c == command) {
+            return true;
+        }
+        let before = self.amounts.len();
+        match script.execute_binding(command, true) {
+            Ok(false) => return false,
+            Ok(true) => {}
+            Err(e) => warn!("bindings({command}): {e}"),
+        }
+        self.apply_script_input(script.take_binding_input());
+        for a in &mut self.amounts[before..] {
+            a.1 *= amount;
+        }
+        self.synth.push(command.to_owned());
+        true
+    }
+
+    /// Release the bridge's latch on `command`, if any, running its `runOnUp` up-half (with no
+    /// VM, only the latch goes). A key's latch on the same command is untouched.
+    pub(crate) fn synth_release(&mut self, script: Option<&mut UiScript>, command: &str) {
+        let Some(i) = self.synth.iter().position(|c| c == command) else {
+            return;
+        };
+        self.synth.remove(i);
+        if let Some(s) = script {
+            if let Err(e) = s.execute_binding(command, false) {
+                warn!("bindings({command}): {e}");
+            }
+            self.apply_script_input(s.take_binding_input());
+        }
+    }
+
+    /// Release every synthetic latch: world exit, the typing edge, the bridge letting go.
+    pub(crate) fn synth_release_all(&mut self, mut script: Option<&mut UiScript>) {
+        while let Some(command) = self.synth.last().cloned() {
+            self.synth_release(script.as_deref_mut(), &command);
+        }
+    }
+
+    /// Is `command` latched by the bridge?
+    pub(crate) fn synth_latched(&self, command: &str) -> bool {
+        self.synth.iter().any(|c| c == command)
     }
 }
 
@@ -380,6 +442,7 @@ fn latch_and_dispatch(
     if let Some(script) = script.as_ref() {
         if same_vm.claim(script) {
             state.latched.clear();
+            state.synth.clear();
             state.held.clear();
         }
     }
@@ -1742,5 +1805,82 @@ mod tests {
             "let a = \"x\\\"y\"; // \"comment\"\nlet c = '\"'; let b = r#\"ToggleBackpack();\"#;",
         );
         assert_eq!(found, ["x\\\"y", "ToggleBackpack();"]);
+    }
+
+    // ── The synthetic seam (`BindingsState::synth_*`, the web bridge's door) ──
+
+    fn synth(app: &mut App, f: impl FnOnce(&mut BindingsState, &mut UiScript)) {
+        app.world_mut()
+            .resource_scope(|world, mut state: Mut<BindingsState>| {
+                let mut script = world.non_send_resource_mut::<UiScript>();
+                f(&mut state, &mut script);
+            });
+    }
+
+    #[test]
+    fn a_synthetic_hold_runs_the_body_once_and_survives_the_sweep() {
+        let mut app = harness();
+        app.update();
+        synth(&mut app, |s, vm| {
+            assert!(s.synth_press(vm, "MOVEFORWARD", 1.0))
+        });
+        assert!(state(&app).pressed(Input::MoveForward));
+        assert!(
+            state(&app).just_pressed(Input::MoveForward),
+            "the press edge"
+        );
+        // Idempotent: a second assert neither re-runs the body nor re-latches.
+        synth(&mut app, |s, vm| {
+            assert!(s.synth_press(vm, "MOVEFORWARD", 1.0))
+        });
+        assert_eq!(state(&app).synth.len(), 1);
+        // The stuck-latch sweep reads keys; a synthetic latch has none to read up.
+        app.update();
+        assert!(state(&app).pressed(Input::MoveForward));
+        assert!(!state(&app).just_pressed(Input::MoveForward));
+        synth(&mut app, |s, vm| s.synth_release(Some(vm), "MOVEFORWARD"));
+        assert!(
+            !state(&app).pressed(Input::MoveForward),
+            "the up-half ran its Stop"
+        );
+    }
+
+    #[test]
+    fn a_synthetic_fire_scales_the_bodys_amount() {
+        let mut app = harness();
+        app.update();
+        synth(&mut app, |s, vm| {
+            assert!(s.synth_press(vm, "CAMERAZOOMIN", 2.5))
+        });
+        assert!(state(&app).fired(Input::CameraZoomIn));
+        assert_eq!(state(&app).amount(Input::CameraZoomIn), 2.5);
+        app.update();
+        assert!(
+            !state(&app).fired(Input::CameraZoomIn),
+            "an edge lasts one frame"
+        );
+    }
+
+    #[test]
+    fn an_unknown_synthetic_command_runs_nothing_and_says_so() {
+        let mut app = harness();
+        app.update();
+        synth(&mut app, |s, vm| {
+            assert!(!s.synth_press(vm, "NOSUCHCOMMAND", 1.0))
+        });
+        assert!(state(&app).synth.is_empty());
+    }
+
+    #[test]
+    fn a_vm_swap_drops_the_synthetic_latches_without_their_up_halves() {
+        let mut app = harness();
+        app.update();
+        synth(&mut app, |s, vm| {
+            assert!(s.synth_press(vm, "ACTIONBUTTON1", 1.0))
+        });
+        assert_eq!(lua_str(&app, "AB1"), "down");
+        app.insert_non_send_resource(core_script());
+        app.update();
+        assert!(state(&app).synth.is_empty());
     }
 }

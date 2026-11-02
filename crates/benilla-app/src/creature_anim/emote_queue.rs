@@ -3,7 +3,8 @@
 //! arms the first at its delay (`0x71a260`); the per-frame pass plays the due head's `AnimID` and
 //! arms the next at its own delay past the played sequence's length plus 500 ms (`0x73adc0`).
 
-use std::time::{Duration, Instant};
+use bevy::platform::time::Instant;
+use std::time::Duration;
 
 use benilla_assets::ModelAnimations;
 use bevy::prelude::*;
@@ -136,6 +137,7 @@ pub(super) fn drive_emote_queues(
             anim_id: anim_of(emote) as u16,
             seq: play_seq.next(),
             via_player: false,
+            remap_special: true,
         });
     }
 }

@@ -1081,6 +1081,10 @@ pub(crate) struct Model {
     /// Events bindings raise. Deviation: fired at the next tick, not synchronously as in the
     /// reference, because a binding runs inside Lua and cannot re-enter handler dispatch.
     pub(crate) pending_events: Vec<(String, Vec<ScriptValue>)>,
+    /// The event tap: every event `fire_event` dispatches, copied for a host-side observer that
+    /// is not a frame (the web bridge). `None` is off, the default; the host drains it once per
+    /// frame (`UiScript::take_tapped_events`), and an undrained tap is capped.
+    pub(crate) event_tap: Option<Vec<(String, Vec<ScriptValue>)>>,
     /// The last cursor position in UI space (logical px, y-up), behind `GetCursorPosition()`.
     pub(crate) cursor_pos: (f32, f32),
 
@@ -1682,6 +1686,7 @@ impl Model {
             nameplates: super::nameplate::NamePlates::default(),
             worldstate: super::worldstate::WorldStateUiState::default(),
             pending_events: Vec::new(),
+            event_tap: None,
             cursor_pos: (0.0, 0.0),
             minimap_ping_request: None,
             minimap_ping: (0.0, 0.0),
@@ -2053,12 +2058,12 @@ impl Model {
         // `WOW_LAYOUT_TOUCH_TRACE=<secs>:<n>`: backtraces the first `n` touches after `secs`.
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::OnceLock;
-        static SPEC: OnceLock<Option<(std::time::Instant, f64, AtomicU32)>> = OnceLock::new();
+        static SPEC: OnceLock<Option<(web_time::Instant, f64, AtomicU32)>> = OnceLock::new();
         let spec = SPEC.get_or_init(|| {
             let v = std::env::var("WOW_LAYOUT_TOUCH_TRACE").ok()?;
             let (secs, n) = v.split_once(':')?;
             Some((
-                std::time::Instant::now(),
+                web_time::Instant::now(),
                 secs.trim().parse().ok()?,
                 AtomicU32::new(n.trim().parse().ok()?),
             ))
@@ -2093,12 +2098,12 @@ enum Adopt {
 fn derive_trace_armed() -> bool {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::OnceLock;
-    static SPEC: OnceLock<Option<(std::time::Instant, f64, AtomicU32)>> = OnceLock::new();
+    static SPEC: OnceLock<Option<(web_time::Instant, f64, AtomicU32)>> = OnceLock::new();
     let Some((t0, delay, left)) = SPEC.get_or_init(|| {
         let v = std::env::var("WOW_LAYOUT_DERIVE_TRACE").ok()?;
         let (secs, n) = v.split_once(':')?;
         Some((
-            std::time::Instant::now(),
+            web_time::Instant::now(),
             secs.trim().parse().ok()?,
             AtomicU32::new(n.trim().parse().ok()?),
         ))

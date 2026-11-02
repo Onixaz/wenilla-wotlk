@@ -12,6 +12,23 @@ The client connects to compatible 3.3.5a servers using the original network prot
 
 This project does not distribute Blizzard's original client code or game assets. Users must provide their own game data.
 
+## In a browser (prototype fork)
+
+This fork compiles the same client to WebAssembly, after
+[wenilla](https://github.com/Arnesen/wenilla): raw TCP becomes a WebSocket through a small local
+host (`wenilla-host`), the MPQ chain becomes single files fetched over HTTP, and the C Lua 5.1 VM
+is built for wasm against the wasi-sdk sysroot. WebGPU is required for the world.
+
+```bash
+scripts/web-setup.sh                                   # once: wasm target, wasm-bindgen, wasi-sdk, binaryen
+scripts/web-build.sh                                   # -> web/dist/
+cargo run --release -p wenilla-host -- --www web/dist --data /path/to/WotLK/Data --upstream <server ip>
+# open http://127.0.0.1:8090/  (dev page: ?user=…&pass=…&char=… log in without typing)
+```
+
+`wenilla-host` is a local testing tool: it serves the game data you point it at with no login,
+so keep it on loopback. See [`web/README.md`](web/README.md) for how the port works.
+
 ## Status
 
 > [!IMPORTANT]

@@ -425,7 +425,7 @@ pub(crate) fn test_character(guid: u64, name: &str) -> Character {
 
 /// The roster policy and its CVar mirror without the screen, for tests over a real CVar host.
 #[cfg(test)]
-pub(crate) fn add_test_systems(app: &mut App, pick: crossbeam_channel::Sender<CharRequest>) {
+pub(crate) fn add_test_systems(app: &mut App, pick: async_channel::Sender<CharRequest>) {
     app.insert_state(ClientState::CharSelect)
         .init_resource::<Roster>()
         .insert_resource(CharPick(pick.into()))
@@ -563,7 +563,7 @@ mod tests {
     #[test]
     fn a_return_and_its_roster_in_one_drain_show_the_roster() {
         for refused in [false, true] {
-            let (tx, rx) = crossbeam_channel::unbounded();
+            let (tx, rx) = async_channel::unbounded();
             let mut app = App::new();
             app.add_plugins((MinimalPlugins, bevy::state::app::StatesPlugin))
                 .insert_state(ClientState::InWorld)
@@ -639,7 +639,7 @@ mod tests {
     /// The write is at Enter World, not at selection.
     #[test]
     fn only_entering_the_world_writes_the_cvar() {
-        let (tx, _rx) = crossbeam_channel::unbounded();
+        let (tx, _rx) = async_channel::unbounded();
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
             .init_resource::<Roster>()

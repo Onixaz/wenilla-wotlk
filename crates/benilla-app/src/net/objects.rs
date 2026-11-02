@@ -479,7 +479,7 @@ fn object_create(
         .flatten()
         .map(|progress_ms| crate::transport::TransportAnchor {
             progress_ms,
-            at: std::time::Instant::now(),
+            at: bevy::platform::time::Instant::now(),
         });
     // The placement, and on a type-11 lift the basis its keyframe offsets rotate through.
     let go_quat = (kind == EntityKind::GameObject)

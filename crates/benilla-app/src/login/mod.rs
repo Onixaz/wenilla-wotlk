@@ -122,7 +122,7 @@ impl Attempt<'_> {
         self.intent.in_flight = true;
         self.intent.announced = announced;
         self.intent.retry_at = None;
-        let _ = self.submit.0.send(LoginRequest {
+        let _ = self.submit.0.try_send(LoginRequest {
             user: user.to_string(),
             pass: pass.to_string(),
             host: self.realmlist.address().to_string(),
@@ -407,8 +407,8 @@ mod tests {
 
     /// `drive_policy` alone with the env fast path spent, so an ambient `WOW_USER` cannot seed
     /// credentials.
-    fn policy_app() -> (App, crossbeam_channel::Receiver<LoginRequest>) {
-        let (tx, rx) = crossbeam_channel::unbounded();
+    fn policy_app() -> (App, async_channel::Receiver<LoginRequest>) {
+        let (tx, rx) = async_channel::unbounded();
         let mut app = App::new();
         app.init_resource::<Time>()
             .init_resource::<LoginIntent>()
@@ -526,7 +526,7 @@ mod tests {
     /// and the session that parked behind its back is abandoned.
     #[test]
     fn a_login_edge_behind_the_abandon_generation_abandons_the_session() {
-        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx, rx) = async_channel::unbounded();
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, bevy::state::app::StatesPlugin))
             .insert_state(ClientState::Login)

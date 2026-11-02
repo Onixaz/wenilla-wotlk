@@ -1188,7 +1188,7 @@ pub(crate) fn played_time_bridge(
     commands: Res<NetCommands>,
     answer: Option<ResMut<crate::net::PlayedTimeAnswer>>,
     clock: Option<Res<crate::net::PlayedClock>>,
-    mut seeded: Local<crate::ui_script::VmMemo<Option<std::time::Instant>>>,
+    mut seeded: Local<crate::ui_script::VmMemo<Option<bevy::platform::time::Instant>>>,
 ) {
     let Some(mut script) = script else {
         return;

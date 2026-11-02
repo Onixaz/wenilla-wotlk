@@ -9,7 +9,10 @@
 //! unit's running cast (`castCount` and spell, `+0xa5c`/`+0xa6c`).
 
 use std::collections::HashMap;
-use std::time::Instant;
+
+// Bevy's `Instant`, not std's: std's panics on wasm32, and every `Instant` this store trades
+// meets `crate::ui_script::UiClock::anchor`.
+use bevy::platform::time::Instant;
 
 use benilla_formats::SpellDisplay;
 use bevy::prelude::*;

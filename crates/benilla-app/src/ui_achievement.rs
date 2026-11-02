@@ -135,8 +135,8 @@ fn list_parts(d: &AllAchievementData) -> (Vec<(u32, u32)>, Vec<CriteriaWire>) {
 
 /// Seconds since the epoch, the `time(NULL)` the handlers stamp timers with.
 fn unix_now() -> u32 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as u32)
 }
 

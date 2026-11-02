@@ -269,9 +269,18 @@ fn work(plan: CompositePlan, chain: Arc<Mutex<Chain>>, bake: crate::video::Compo
 /// Read and decode one BLP off `chain`, locked only to find its archive.
 fn read_texture(chain: &Mutex<Chain>, path: &str) -> anyhow::Result<BlpMipChain> {
     let name = path.replace('/', "\\");
-    let archive = chain.lock_recover().archive_for(&name)?;
-    let bytes = archive
-        .read_file(&name)
+    #[cfg(not(target_arch = "wasm32"))]
+    let bytes = {
+        let archive = chain.lock_recover().archive_for(&name)?;
+        archive
+            .read_file(&name)
+            .with_context(|| format!("reading texture '{name}'"))?
+    };
+    // wasm32: the chain has no archives, only the web host's Data URLs (`benilla_formats::web`).
+    #[cfg(target_arch = "wasm32")]
+    let bytes = chain
+        .lock_recover()
+        .read(&name)
         .with_context(|| format!("reading texture '{name}'"))?;
     blp_bytes_to_mip_chain(&bytes).with_context(|| format!("decoding texture '{name}'"))
 }
@@ -365,8 +374,8 @@ mod tests {
 
     /// Land until `key` is done, or give up after two seconds.
     fn land_until(c: &mut SkinComposites, images: &mut Assets<Image>, key: SkinKey) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while c.running.contains_key(&key) && std::time::Instant::now() < deadline {
+        let deadline = bevy::platform::time::Instant::now() + std::time::Duration::from_secs(2);
+        while c.running.contains_key(&key) && bevy::platform::time::Instant::now() < deadline {
             c.land(images);
             std::thread::yield_now();
         }

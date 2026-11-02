@@ -36,9 +36,21 @@ pub(super) fn install(
     builder
 }
 
+/// [`install_at`] on wasm32: no tap (no writer thread, no file), so `$WOW_MIX_TAP` does nothing
+/// on the page; the caller treats `None` as "not recording".
+#[cfg(target_arch = "wasm32")]
+pub(super) fn install_at(
+    _builder: &mut kira::track::MainTrackBuilder,
+    _path: &std::path::Path,
+    _sample_rate: u32,
+) -> Option<Arc<AtomicU64>> {
+    None
+}
+
 /// Install a tap writing `path`, and return its frame clock: the count of frames processed, which
 /// is the write position in the file. A game system reads it to place an event on the waveform,
 /// since the game and device clocks drift. `None` when the file cannot be created.
+#[cfg(not(target_arch = "wasm32"))]
 pub(super) fn install_at(
     builder: &mut kira::track::MainTrackBuilder,
     path: &std::path::Path,

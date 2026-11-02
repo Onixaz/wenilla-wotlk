@@ -139,7 +139,7 @@ fn on_played_time(
 ) {
     if let SessionEvent::PlayedTime { total, level, show } = ev {
         debug!("net: played time {total} s (level {level} s, shown {show})");
-        clock.0 = Some((total, std::time::Instant::now()));
+        clock.0 = Some((total, bevy::platform::time::Instant::now()));
         // Only a shown answer prints and fires `TIME_PLAYED_MSG` (`0x4013f6`).
         if show {
             answer.0 = Some((total, level));

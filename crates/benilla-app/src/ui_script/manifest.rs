@@ -47,7 +47,7 @@ pub(super) fn shipped_manifest_files() -> Vec<String> {
 }
 
 /// Runs `UIParent_ManageFramePositions` after the interface has loaded.
-fn bootstrap_positions(script: &UiScript) -> Vec<String> {
+pub(super) fn bootstrap_positions(script: &UiScript) -> Vec<String> {
     if let Err(e) = script.run("UIParent_ManageFramePositions()") {
         error!("ui_script: managed-positions bootstrap: {e}");
         return vec![format!("managed-positions bootstrap: {e}")];
@@ -156,31 +156,44 @@ pub(crate) fn load_default_ui(script: &UiScript) -> Vec<String> {
 /// which benilla does not ship, and a modified interface file is loaded rather than refused.
 pub(super) fn load_core(script: &UiScript) -> Vec<String> {
     let Some(core) = reference_ui::core() else {
-        let e = format!(
-            "{}: not found — the stock interface is not built",
-            reference_ui::TOC
-        );
-        error!("ui_script: {e}");
-        script.report_load_failure(&e);
-        // Into the UI load's own record, before any banner.
-        let mut log = benilla_ui::status::Status::default();
-        log.report(
-            benilla_ui::status::FAILURE,
-            benilla_ui::status::missing(reference_ui::TOC, false),
-        );
-        script.report_load_status(log);
-        let mut failures = vec![e];
-        failures.extend(load_core_bindings(script));
-        return failures;
+        return load_core_missing(script);
     };
     let mut toc = benilla_ui::status::Status::default();
     let mut failures = core.load_files_into(script, &core.toc.files, &mut toc);
+    failures.extend(close_core(script, toc));
+    failures
+}
+
+/// [`load_core`] with no `FrameXML.toc` on the chain: the failure, then the bindings. Apart (with
+/// [`close_core`]) so the browser's sliced entry load (`lifecycle::run_pending_entry_load`) can
+/// walk the toc's rows a frame at a time and still end exactly as this does.
+pub(super) fn load_core_missing(script: &UiScript) -> Vec<String> {
+    let e = format!(
+        "{}: not found — the stock interface is not built",
+        reference_ui::TOC
+    );
+    error!("ui_script: {e}");
+    script.report_load_failure(&e);
+    // Into the UI load's own record, before any banner.
+    let mut log = benilla_ui::status::Status::default();
+    log.report(
+        benilla_ui::status::FAILURE,
+        benilla_ui::status::missing(reference_ui::TOC, false),
+    );
+    script.report_load_status(log);
+    let mut failures = vec![e];
+    failures.extend(load_core_bindings(script));
+    failures
+}
+
+/// [`load_core`]'s tail once every toc row has run: the toc's record into the load's, then the
+/// bindings.
+pub(super) fn close_core(script: &UiScript, toc: benilla_ui::status::Status) -> Vec<String> {
     let mut log = benilla_ui::status::Status::default();
     let banner = benilla_ui::status::toc_banner(reference_ui::TOC);
     toc.close_into(&mut log, script.framexml_debug(), banner);
     script.report_load_status(log);
-    failures.extend(load_core_bindings(script));
-    failures
+    load_core_bindings(script)
 }
 
 /// The stock key-binding commands, the UI init's next step after the toc walk: the chain's
@@ -257,7 +270,7 @@ pub(crate) fn load_stock_bindings(script: &mut UiScript) {
 
 /// Every [`LAYER_MANIFEST`] entry, in order, after the whole core: the layer loads as more of the
 /// stock load, with no `ADDON_LOADED` and no registry row, as FrameXML does.
-fn load_layer(script: &UiScript) -> Vec<String> {
+pub(super) fn load_layer(script: &UiScript) -> Vec<String> {
     let layer = Addon::layer();
     layer.load_files(script, &layer.toc.files)
 }

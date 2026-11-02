@@ -346,7 +346,7 @@ pub fn classify_entity_interior(
     // (`FadeMaterials::material_for`), so the two writers never fight.
     mut parts: PartWrite,
 ) {
-    let _t0 = std::time::Instant::now();
+    let _t0 = bevy::platform::time::Instant::now();
     let (mut n_anchors, mut n_resolved, mut n_written) = (0usize, 0usize, 0usize);
     // Anchors with no part to ask, the tripwire for a fade lockout creeping back.
     let mut n_fade_blocked = 0usize;
@@ -481,7 +481,7 @@ pub fn classify_entity_interior(
         };
         let seated = held.get(anchor).ok().and_then(|(_, s)| s).map(|s| s.0);
         n_resolved += 1;
-        let _r = std::time::Instant::now();
+        let _r = bevy::platform::time::Instant::now();
         let (attach, attach_at) = attach_anchor(containment, bake_center, anchor_t);
         // Rayed in the pre-pass; a miss (none expected) rays here.
         let verdict = verdicts.remove(&anchor).unwrap_or_else(|| {

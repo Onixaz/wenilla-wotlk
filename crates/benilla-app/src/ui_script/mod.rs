@@ -261,7 +261,9 @@ pub(crate) struct UiInput;
 #[derive(Resource)]
 pub(crate) struct UiClock {
     /// `Time<Real>::last_update()` at the tick that produced [`Self::ui_now`].
-    pub(crate) anchor: std::time::Instant,
+    /// `bevy::platform::time::Instant`, not std's: that is what `Time<Real>` hands back, and on
+    /// wasm32 the two are different types (`web_time::Instant` there).
+    pub(crate) anchor: bevy::platform::time::Instant,
     /// The VM clock after that tick, in seconds since this process started.
     pub(crate) ui_now: f64,
 }
@@ -270,7 +272,7 @@ pub(crate) struct UiClock {
 impl Default for UiClock {
     fn default() -> Self {
         Self {
-            anchor: std::time::Instant::now(),
+            anchor: bevy::platform::time::Instant::now(),
             ui_now: 0.0,
         }
     }

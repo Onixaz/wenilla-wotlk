@@ -315,8 +315,8 @@ fn lua_bag_pos(bag_index: u8, slot: u8) -> Option<(i64, u32)> {
 /// A fresh guild name: a 13-character prefix, a space and the low 8 digits of the wall clock, 22
 /// characters within `MAX_CHARTER_NAME` (24); `IsValidCharterName` allows digits and spaces.
 fn probe_guild_name(prefix: &str) -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let secs = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
         % 100_000_000;
     format!("{prefix} {secs:08}")

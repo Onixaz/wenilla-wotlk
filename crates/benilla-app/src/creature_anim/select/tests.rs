@@ -941,7 +941,8 @@ fn a_flying_spline_is_fly_before_backward_and_speed() {
 
 #[test]
 fn unify_stamps_flying_from_the_live_spline_on_every_leg() {
-    use std::time::{Duration, Instant};
+    use bevy::platform::time::Instant;
+    use std::time::Duration;
     let spline = |grounded| crate::net::Spline {
         deck: None,
         arc: None,
@@ -968,7 +969,8 @@ fn unify_stamps_flying_from_the_live_spline_on_every_leg() {
 /// the finished arc is stopped, so the landing pick is JumpEnd.
 #[test]
 fn unify_reads_a_flying_arc_as_falling_and_its_end_as_stopped() {
-    use std::time::{Duration, Instant};
+    use bevy::platform::time::Instant;
+    use std::time::Duration;
     let arc = |frac: f32, facing_fixed| crate::net::Spline {
         deck: None,
         arc: Some(benilla_protocol::SplineArc {
@@ -1022,7 +1024,8 @@ fn special_attacks_follow_the_held_weapon() {
 #[test]
 fn the_granted_modes_fold_into_the_flags_word_on_every_leg_but_our_own() {
     use crate::net::UnitMoveModes;
-    use std::time::{Duration, Instant};
+    use bevy::platform::time::Instant;
+    use std::time::Duration;
 
     let rooted = UnitMoveModes(move_flags::ROOT);
     let walking = UnitMoveModes(move_flags::WALK_MODE);

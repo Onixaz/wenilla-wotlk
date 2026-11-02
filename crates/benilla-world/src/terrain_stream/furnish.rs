@@ -3,7 +3,7 @@
 //! tile line never uploads a whole row in one frame. While the body is not live (entry, teleport)
 //! the cap is off: the loading screen absorbs the burst and waits on furnished tiles.
 
-use std::time::Instant;
+use bevy::platform::time::Instant;
 
 use benilla_assets::{chunks_to_mesh, AdtTile};
 use bevy::camera::primitives::MeshAabb;

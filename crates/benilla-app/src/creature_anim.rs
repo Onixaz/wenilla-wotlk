@@ -4,7 +4,7 @@
 //! on a standing idle unit and on the SpineLow torso-masked overlay while moving, seated or
 //! airborne in combat. Death overrides everything.
 
-use std::time::Instant;
+use bevy::platform::time::Instant;
 
 use benilla_assets::{AnimClip, ModelAnimations};
 use benilla_formats::AnimDataCatalog;

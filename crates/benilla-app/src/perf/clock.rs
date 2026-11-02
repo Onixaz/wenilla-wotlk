@@ -66,7 +66,7 @@ fn cycle_hz() -> Option<f64> {
         {
             // SAFETY: `_rdtsc` reads the time-stamp counter, present on every x86-64 CPU.
             let tsc = || unsafe { core::arch::x86_64::_rdtsc() };
-            let (t0, c0) = (std::time::Instant::now(), tsc());
+            let (t0, c0) = (bevy::platform::time::Instant::now(), tsc());
             std::thread::sleep(std::time::Duration::from_millis(10));
             let (dt, dc) = (t0.elapsed().as_secs_f64(), tsc().wrapping_sub(c0));
             (dt > 0.0 && dc > 0).then(|| dc as f64 / dt)
@@ -294,7 +294,8 @@ pub(crate) fn thread_cpu_table() -> Option<Vec<(usize, String, f64, f64)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
+    use bevy::platform::time::Instant;
+    use std::time::Duration;
 
     /// The thread clock moves with work, never past the wall, and not while asleep.
     #[test]

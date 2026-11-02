@@ -878,7 +878,7 @@ pub(crate) fn unify(
     // at once (`0x73eda7`), a jump JumpStart; its end stops the unit before the landing pick, so
     // a knockback lands in JumpEnd 39 (`0x6eb0b0`, `0x73d383`).
     if let Some(s) = spline.filter(|s| s.arc.is_some()) {
-        if let Some(vz) = s.airborne(std::time::Instant::now()) {
+        if let Some(vz) = s.airborne(bevy::platform::time::Instant::now()) {
             let far = if s.facing_fixed {
                 move_flags::FALLING_FAR
             } else {

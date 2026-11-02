@@ -114,7 +114,7 @@ pub(crate) static GX_PERF: [std::sync::atomic::AtomicU64; 5] = [
 ];
 
 /// Scope guard adding one site's wall time to [`GX_PERF`] slot `i`; a no-op when the meter is off.
-pub(crate) struct GxPerfGuard(Option<(usize, std::time::Instant)>);
+pub(crate) struct GxPerfGuard(Option<(usize, bevy::platform::time::Instant)>);
 impl Drop for GxPerfGuard {
     fn drop(&mut self) {
         if let Some((i, t0)) = self.0 {
@@ -126,7 +126,7 @@ impl Drop for GxPerfGuard {
     }
 }
 pub(crate) fn gx_perf_guard(i: usize) -> GxPerfGuard {
-    GxPerfGuard(gx_perf_enabled().then(|| (i, std::time::Instant::now())))
+    GxPerfGuard(gx_perf_enabled().then(|| (i, bevy::platform::time::Instant::now())))
 }
 
 /// One diverted batch, kept after its cell bakes so an unload or a later admission can re-bake.

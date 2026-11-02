@@ -707,7 +707,7 @@ fn the_entry_load_waits_for_the_cover_to_present() {
     world.insert_resource(crate::loading_screen::LoadingScreen::test_covering());
     world.insert_resource(crate::loading_screen::EntryCover::default());
     world.insert_resource(roster_named("Onehunter", 1));
-    world.insert_resource(super::PendingEntryUiLoad);
+    world.insert_resource(super::PendingEntryUiLoad::default());
 
     // Covered frames 1 and 2: the cover has not presented yet.
     for frame in 1..=2 {
@@ -721,15 +721,21 @@ fn the_entry_load_waits_for_the_cover_to_present() {
             "covered frame {frame}: the burst must wait for the cover to reach the glass"
         );
     }
-    // Covered frame 3: two cover renders have committed, so the load runs.
-    world
-        .resource_mut::<crate::loading_screen::EntryCover>()
-        .tick(true);
-    super::lifecycle::run_pending_entry_load(&mut world);
+    // Covered frame 3 onward: two cover renders have committed, so the load runs, sliced over
+    // as many frames as its budget needs.
+    let mut frames = 0;
+    while world.get_resource::<super::PendingEntryUiLoad>().is_some() {
+        world
+            .resource_mut::<crate::loading_screen::EntryCover>()
+            .tick(true);
+        super::lifecycle::run_pending_entry_load(&mut world);
+        frames += 1;
+        assert!(frames < 10_000, "the sliced entry load never finished");
+    }
     assert_eq!(
         probe_saw(&world).as_deref(),
         Some("Onehunter"),
-        "the third covered frame pays the load, behind a presented cover"
+        "the load ran behind a presented cover, over {frames} frame(s)"
     );
     assert!(
         world.get_resource::<super::PendingEntryUiLoad>().is_none(),
@@ -752,15 +758,38 @@ fn no_cover_means_the_entry_load_runs_at_once() {
     world.insert_resource(State::new(crate::char_select::ClientState::InWorld));
     world.insert_resource(crate::loading_screen::LoadingScreen::default());
     world.insert_resource(roster_named("Onehunter", 1));
-    world.insert_resource(super::PendingEntryUiLoad);
+    world.insert_resource(super::PendingEntryUiLoad::default());
 
+    let boot_session = world
+        .non_send_resource::<benilla_ui::script::UiScript>()
+        .session();
     super::lifecycle::run_pending_entry_load(&mut world);
+
+    // "At once" = the first frame runs the load instead of counting cover frames that never come
+    // (natively the whole of it; the browser slices it over frames).
+    assert!(
+        world.get_resource::<super::PendingEntryUiLoad>().is_none(),
+        "uncovered: the load runs on the first frame"
+    );
+    let mut frames = 1;
+    while world.get_resource::<super::PendingEntryUiLoad>().is_some() {
+        super::lifecycle::run_pending_entry_load(&mut world);
+        frames += 1;
+        assert!(frames < 10_000, "the sliced entry load never finished");
+    }
     assert_eq!(
         probe_saw(&world).as_deref(),
         Some("Onehunter"),
-        "uncovered: the load runs immediately"
+        "uncovered: the load ran, over {frames} frame(s)"
     );
 
+    assert_ne!(
+        world
+            .non_send_resource::<benilla_ui::script::UiScript>()
+            .session(),
+        boot_session,
+        "sliced entry must replace the glue VM"
+    );
     drop(world);
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -778,7 +807,7 @@ fn leaving_inside_the_deferral_window_drops_the_load_and_writes_nothing() {
     world.insert_resource(crate::loading_screen::LoadingScreen::test_covering());
     world.insert_resource(roster_named("Onehunter", 1));
     world.insert_resource(crate::loading_screen::EntryCover::default());
-    world.insert_resource(super::PendingEntryUiLoad);
+    world.insert_resource(super::PendingEntryUiLoad::default());
 
     world
         .resource_mut::<crate::loading_screen::EntryCover>()
@@ -871,7 +900,7 @@ fn the_login_one_shots_wait_for_the_in_game_ui() {
 
     // The transition ran and the load is still owed: three frames inside the deferral window.
     app.insert_resource(State::new(crate::char_select::ClientState::InWorld));
-    app.insert_resource(super::PendingEntryUiLoad);
+    app.insert_resource(super::PendingEntryUiLoad::default());
     for frame in 1..=3 {
         app.update();
         assert_eq!(
@@ -1273,7 +1302,7 @@ fn the_ui_is_not_up_in_the_frame_between_the_wire_and_the_state() {
 
     // The transition ran: `OnEnter` parked the VM and armed the latch.
     world.insert_resource(State::new(crate::char_select::ClientState::InWorld));
-    world.insert_resource(super::PendingEntryUiLoad);
+    world.insert_resource(super::PendingEntryUiLoad::default());
     assert!(
         !run_ingame_ui_up(&mut world),
         "the deferral window — a parked VM, and nothing to receive an event"

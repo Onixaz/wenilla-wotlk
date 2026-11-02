@@ -62,27 +62,29 @@ fn an_empty_account_parks_at_select_without_creating_a_character() {
 
     let (events_tx, events) = crossbeam_channel::unbounded();
     let (writer_tx, _writer_rx) = crossbeam_channel::unbounded::<WriterSwap>();
-    let (login_tx, login_rx) = crossbeam_channel::unbounded();
-    let (park_tx, park_rx) = crossbeam_channel::unbounded();
+    // The parks are async channels: the sequencer awaits them, and `block_on` turns it over here
+    // as the native net thread does.
+    let (login_tx, login_rx) = async_channel::unbounded();
+    let (park_tx, park_rx) = async_channel::unbounded();
     let cycle = thread::spawn(move || {
         let parks = Parks {
             login_rx,
             park_rx,
             screen_asks_roster: Default::default(),
         };
-        let ended = run(
+        let ended = futures_lite::future::block_on(run(
             &events_tx,
             &writer_tx,
             &parks,
             &AtomicU64::new(0),
             &Mutex::new(PingClock::default()),
             &mut Default::default(),
-        );
+        ));
         matches!(ended, Ok(Cycle::Repark))
     });
 
     login_tx
-        .send(LoginRequest {
+        .send_blocking(LoginRequest {
             user: fake::USER.into(),
             pass: fake::PASS.into(),
             host: realmd.addr.clone(),
@@ -93,7 +95,7 @@ fn an_empty_account_parks_at_select_without_creating_a_character() {
     assert!(!failed);
     assert_eq!(realms[0].name, REALM);
     park_tx
-        .send(ParkRequest::Realm(enter(realms[0].clone())))
+        .send_blocking(ParkRequest::Realm(enter(realms[0].clone())))
         .unwrap();
     assert!(
         matches!(next_event(&events), SessionEvent::WorldAuthenticated { .. }),
@@ -117,7 +119,7 @@ fn an_empty_account_parks_at_select_without_creating_a_character() {
     }
     // Select's Back ends the cycle, so the socket is done and its log complete.
     park_tx
-        .send(ParkRequest::Char(CharRequest::Abandon))
+        .send_blocking(ParkRequest::Char(CharRequest::Abandon))
         .unwrap();
     assert!(cycle.join().unwrap(), "Back returns to the login park");
     let sent = world.sent.lock().unwrap().clone();
@@ -876,7 +878,7 @@ fn account_data_without_a_world_writer_goes_to_the_park() {
     use crate::net::ClientCommand;
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<ClientCommand>();
     let (_swap_tx, swap_rx) = crossbeam_channel::unbounded::<WriterSwap>();
-    let (park_tx, park_rx) = crossbeam_channel::unbounded::<ParkRequest>();
+    let (park_tx, park_rx) = async_channel::unbounded::<ParkRequest>();
     thread::spawn(move || {
         writer_loop(
             &cmd_rx,
@@ -898,7 +900,7 @@ fn account_data_without_a_world_writer_goes_to_the_park() {
         }))
         .unwrap();
     cmd_tx.send(ClientCommand::Flush(done)).unwrap();
-    match park_rx.recv_timeout(WAIT).unwrap() {
+    match park_within(&park_rx) {
         ParkRequest::Char(CharRequest::AccountData(Wire::Upload { slot, time, bytes })) => {
             assert_eq!((slot, time, bytes.as_slice()), (7, 5, &b"VERSION 5\n"[..]));
         }
@@ -906,7 +908,7 @@ fn account_data_without_a_world_writer_goes_to_the_park() {
     }
     assert!(
         matches!(
-            park_rx.recv_timeout(WAIT).unwrap(),
+            park_within(&park_rx),
             ParkRequest::Char(CharRequest::Flush(_))
         ),
         "then the barrier, behind it"
@@ -915,4 +917,19 @@ fn account_data_without_a_world_writer_goes_to_the_park() {
         park_rx.try_recv().is_err(),
         "the played-time ask was dropped, not parked"
     );
+}
+
+/// The next request on the async park channel within [`WAIT`]; the channel has no blocking
+/// timeout of its own.
+fn park_within(rx: &async_channel::Receiver<ParkRequest>) -> ParkRequest {
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        match rx.try_recv() {
+            Ok(request) => return request,
+            Err(async_channel::TryRecvError::Empty) if std::time::Instant::now() < deadline => {
+                thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => panic!("no park request within {WAIT:?}: {e}"),
+        }
+    }
 }

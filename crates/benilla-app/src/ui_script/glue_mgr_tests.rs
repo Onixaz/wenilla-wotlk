@@ -734,12 +734,8 @@ fn a_logout_keeps_the_link_for_the_screens_roster_ask() {
 
 /// An app with the manager, the native login's glue asks and the stock glue VM on the login
 /// screen. Returns it, the credentials channel and the abandon generation.
-fn stock_app() -> (
-    App,
-    crossbeam_channel::Receiver<LoginRequest>,
-    Arc<AtomicU64>,
-) {
-    let (tx, rx) = crossbeam_channel::unbounded();
+fn stock_app() -> (App, async_channel::Receiver<LoginRequest>, Arc<AtomicU64>) {
+    let (tx, rx) = async_channel::unbounded();
     let abandon = Arc::new(AtomicU64::new(0));
     let mut app = App::new();
     app.init_resource::<Time>()
@@ -1144,9 +1140,9 @@ fn area_row(name: &str) -> benilla_formats::AreaTableRow {
 
 /// Run frames, the VM's own tick between them, until `done` holds.
 fn until(app: &mut App, what: &str, done: impl Fn(&App) -> bool) {
-    let deadline = std::time::Instant::now() + fake::WAIT;
+    let deadline = bevy::platform::time::Instant::now() + fake::WAIT;
     while !done(app) {
-        if std::time::Instant::now() >= deadline {
+        if bevy::platform::time::Instant::now() >= deadline {
             let m = app.world().resource::<GlueMgr>();
             panic!(
                 "timed out waiting for {what}: state {:?}, op {:?}, holder {}, screen {:?}, \

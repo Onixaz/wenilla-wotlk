@@ -11,8 +11,8 @@ use dormancy::{entity_tail, SceneTag};
 pub use fx::point_light;
 use fx::{emitter_fade, spawn_lights_for, spawn_wmo_lights_for};
 
+use bevy::platform::time::Instant;
 use std::sync::Arc;
-use std::time::Instant;
 
 use benilla_assets::coords::{wmo_doodad_local, wow_to_bevy};
 use benilla_assets::{AdtTile, DoodadBase, M2Model, WmoModel};

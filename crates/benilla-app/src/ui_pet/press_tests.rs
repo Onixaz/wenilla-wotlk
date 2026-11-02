@@ -3,7 +3,8 @@
 //! The rig is shared with `flush_tests`, whose packets reach the same list.
 
 use std::collections::HashMap;
-use std::time::Instant;
+// std's `Instant` panics on wasm32; this flows into `crate::cooldowns`, which takes bevy's.
+use bevy::platform::time::Instant;
 
 use bevy::ecs::schedule::Schedule;
 use bevy::ecs::system::RunSystemOnce;

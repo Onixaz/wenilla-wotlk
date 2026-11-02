@@ -43,7 +43,9 @@ fn family(rel: &str) -> Family {
 ///   `VEHICLE_UPDATE`, `VEHICLE_ANGLE_SHOW`, `VEHICLE_POWER_SHOW` and `VEHICLE_ANGLE_UPDATE` on
 ///   the mover change and on each pitch step, the frame the reference fires them (`0x747f40`,
 ///   `0x5fa910`), where a model value would land them a feed pass later.
-const CEILING: usize = 43;
+/// - The browser's JS bridge adds 1: `webbridge/` taps the VM's event stream and evaluates a page's
+///   Lua chunk, as a key binding's body runs; it is the page's feed, not gameplay.
+const CEILING: usize = 44;
 
 /// How far under [`CEILING`] the count may sit before the test asks for the ceiling to follow it.
 const SLACK: usize = 4;

@@ -8,7 +8,11 @@
 //! list packet is handed on as it lands, and the slots are pushed every frame because their
 //! clocks move.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// `bevy::platform::time::Instant` has no monotonic clock behind it in a browser and panics there;
+// bevy's re-export is std's natively and `web_time`'s on wasm32.
+use bevy::platform::time::Instant;
 
 use bevy::prelude::*;
 
@@ -575,8 +579,8 @@ fn feed_battlefield(
     // reads it.
     let ui_now = ui_clock.as_deref().map_or_else(
         || {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            web_time::SystemTime::now()
+                .duration_since(web_time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs() as i32)
         },
         crate::ui_notices::UiClock::now,

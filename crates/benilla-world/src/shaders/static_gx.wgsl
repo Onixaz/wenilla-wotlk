@@ -187,10 +187,18 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
         discard;
     }
     // The sampler follows the wrap flags; a mixed batch clamps its clamped axis a half texel in.
-    // Every sample runs unconditionally: implicit derivatives need uniform control flow.
+    // The derivatives are taken unconditionally (see below) and the select is per fragment.
     var base = vec4<f32>(1.0);
     let wrap_x = (in.word & WORD_WRAP_X) != 0u;
     let wrap_y = (in.word & WORD_WRAP_Y) != 0u;
+    // The samples below sit inside a per-fragment branch (`WORD_TEXTURED` is per vertex), where
+    // WGSL's uniformity rule forbids implicit derivatives — naga lets it through, the browser's
+    // compiler does not. So the derivatives are taken HERE, in uniform flow, and the samples use
+    // `textureSampleGrad`; `mip_bias` folds in as a scale of 2^bias on the footprint, which is
+    // exactly what the bias form does to the LOD.
+    let grad_scale = exp2(view.mip_bias);
+    let uv_dx = dpdx(in.uv) * grad_scale;
+    let uv_dy = dpdy(in.uv) * grad_scale;
     if ((in.word & WORD_TEXTURED) != 0u) {
         let layer = i32(recs[in.word & 0xffffu].x & 0xffffu);
         let dims = vec2<f32>(textureDimensions(tex_array).xy);
@@ -202,10 +210,11 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
         if (!wrap_y) {
             uv_mixed.y = clamp(uv_mixed.y, inset.y, 1.0 - inset.y);
         }
-        // The render-scale LOD bias: bevy's material path applies it for free, this lane by hand.
-        let c_repeat = textureSampleBias(tex_array, samp_repeat, in.uv, layer, view.mip_bias);
-        let c_clamp = textureSampleBias(tex_array, samp_clamp, in.uv, layer, view.mip_bias);
-        let c_mixed = textureSampleBias(tex_array, samp_repeat, uv_mixed, layer, view.mip_bias);
+        // The render-scale LOD bias: bevy's material path applies it for free, this lane by hand
+        // (folded into the gradients above).
+        let c_repeat = textureSampleGrad(tex_array, samp_repeat, in.uv, layer, uv_dx, uv_dy);
+        let c_clamp = textureSampleGrad(tex_array, samp_clamp, in.uv, layer, uv_dx, uv_dy);
+        let c_mixed = textureSampleGrad(tex_array, samp_repeat, uv_mixed, layer, uv_dx, uv_dy);
         if (wrap_x && wrap_y) {
             base = c_repeat;
         } else if (!wrap_x && !wrap_y) {

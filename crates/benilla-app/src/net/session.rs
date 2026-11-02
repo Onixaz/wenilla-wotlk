@@ -695,8 +695,8 @@ fn time_speed(
 /// timed-quest timer) are dated in; its skew against ours is logged once per session.
 fn server_unix_time(unix_time: u32, reset_in: u32, clock: &mut ServerWallClock) {
     if clock.0.is_none() {
-        let local = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let local = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         info!(

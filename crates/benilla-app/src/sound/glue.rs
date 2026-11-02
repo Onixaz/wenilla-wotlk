@@ -56,7 +56,23 @@ struct GlueMusic {
     ambience: Option<mixer::StreamingSoundHandle<kira::sound::FromFileError>>,
     ambience_kit: Option<u32>,
     ambience_volume: f32,
+    /// wasm32: the theme's load in flight — the browser fetches and decodes it off the main
+    /// thread (`super::web_load`, the same carry as the zone soundscape's) and the stream starts
+    /// on the frame it lands. Native opens the stream inline and has no use for these.
+    #[cfg(target_arch = "wasm32")]
+    pending: Option<super::web_load::Pending>,
+    /// wasm32: the ambience's load in flight, landed the same way.
+    #[cfg(target_arch = "wasm32")]
+    pending_ambience: Option<super::web_load::Pending>,
+    /// wasm32: a theme load that failed does not retry every frame — the per-frame restart would
+    /// fire a fresh `fetch` on each one. It retries after [`GLUE_MUSIC_RETRY`].
+    #[cfg(target_arch = "wasm32")]
+    retry_at: Option<bevy::platform::time::Instant>,
 }
+
+/// wasm32: how long a failed theme load waits before the next attempt.
+#[cfg(target_arch = "wasm32")]
+const GLUE_MUSIC_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Default for GlueMusic {
     fn default() -> Self {
@@ -70,6 +86,12 @@ impl Default for GlueMusic {
             ambience: None,
             ambience_kit: None,
             ambience_volume: 1.0,
+            #[cfg(target_arch = "wasm32")]
+            pending: None,
+            #[cfg(target_arch = "wasm32")]
+            pending_ambience: None,
+            #[cfg(target_arch = "wasm32")]
+            retry_at: None,
         }
     }
 }
@@ -84,6 +106,15 @@ fn open_glue_music(
     config: &SoundConfig,
     name: &str,
 ) {
+    // wasm32: a load in flight, or one that failed lately, holds the theme's restart.
+    #[cfg(target_arch = "wasm32")]
+    if music.pending.is_some()
+        || music
+            .retry_at
+            .is_some_and(|t| bevy::platform::time::Instant::now() < t)
+    {
+        return;
+    }
     let (Some(assets), Some(kits), Some(mixer_ref)) = (assets, kits, out.mixer.as_mut()) else {
         return;
     };
@@ -94,28 +125,46 @@ fn open_glue_music(
     let Some((file, volume)) = kits.pick_stream(kit) else {
         return;
     };
-    let bytes = {
-        let chain = assets.chain.lock_recover();
-        chain.read(&file)
-    };
-    let data = match bytes.and_then(mixer::stream_from_bytes) {
-        Ok(d) => d,
-        Err(e) => {
-            debug!("glue music: {file} — {e:#}");
+    // Native opens the stream inline; wasm hands the fetch and the decode to the browser and
+    // starts the theme on the frame it lands ([`land_glue_loads`]).
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (mixer_ref, config);
+        // The lock is held to build the URL and dropped before the request starts.
+        let url = assets.chain.lock_recover().url_for_name(&file);
+        let Some(url) = url else {
+            // Not on the chain at all: the same silence native gives, without a request a frame.
+            debug!("glue music: file not in patch chain: {file}");
+            music.retry_at = Some(bevy::platform::time::Instant::now() + GLUE_MUSIC_RETRY);
             return;
+        };
+        music.pending = Some(super::web_load::begin(url, file, kit, volume, 0, false));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let bytes = {
+            let chain = assets.chain.lock_recover();
+            chain.read(&file)
+        };
+        let data = match bytes.and_then(mixer::stream_from_bytes) {
+            Ok(d) => d,
+            Err(e) => {
+                debug!("glue music: {file} — {e:#}");
+                return;
+            }
+        };
+        let amp = config.category_amp(SoundCategory::Music) * volume;
+        match mixer_ref.play_stream(data.volume(mixer::amp_to_db(amp))) {
+            Ok(h) => {
+                info!("glue music: {name} — {file}");
+                music.handle = Some(h);
+                music.kit = Some(kit);
+                music.volume = volume;
+                music.fading = false;
+                music.watch.reset();
+            }
+            Err(e) => debug!("glue music: {e:#}"),
         }
-    };
-    let amp = config.category_amp(SoundCategory::Music) * volume;
-    match mixer_ref.play_stream(data.volume(mixer::amp_to_db(amp))) {
-        Ok(h) => {
-            info!("glue music: {name} — {file}");
-            music.handle = Some(h);
-            music.kit = Some(kit);
-            music.volume = volume;
-            music.fading = false;
-            music.watch.reset();
-        }
-        Err(e) => debug!("glue music: {e:#}"),
     }
 }
 
@@ -140,33 +189,106 @@ fn open_glue_ambience(
     let Some((file, volume)) = kits.pick_stream(kit) else {
         return;
     };
-    let bytes = {
-        let chain = assets.chain.lock_recover();
-        chain.read(&file)
-    };
-    let data = match bytes.and_then(mixer::stream_from_bytes) {
-        Ok(d) => d,
-        Err(e) => {
-            debug!("glue ambience: {file} — {e:#}");
+    // wasm32: the browser fetches and decodes the bed, whole-file looping; it starts, with its
+    // fade-in, on the frame it lands ([`land_glue_loads`]).
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (mixer_ref, config);
+        let url = assets.chain.lock_recover().url_for_name(&file);
+        let Some(url) = url else {
+            debug!("glue ambience: file not in patch chain: {file}");
             return;
+        };
+        let fade_ms = fade.filter(|s| *s > 0.0).map_or(0, |s| (s * 1000.0) as u64);
+        music.pending_ambience = Some(super::web_load::begin(
+            url, file, kit, volume, fade_ms, true,
+        ));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let bytes = {
+            let chain = assets.chain.lock_recover();
+            chain.read(&file)
+        };
+        let data = match bytes.and_then(mixer::stream_from_bytes) {
+            Ok(d) => d,
+            Err(e) => {
+                debug!("glue ambience: {file} — {e:#}");
+                return;
+            }
+        };
+        let amp = config.category_amp(SoundCategory::Ambience) * volume;
+        let fade_in = fade
+            .filter(|s| *s > 0.0)
+            .map(|s| mixer::fade((s * 1000.0) as u64));
+        let data = data
+            .loop_region(..)
+            .fade_in_tween(fade_in)
+            .volume(mixer::amp_to_db(amp));
+        match mixer_ref.play_stream(data) {
+            Ok(h) => {
+                info!("glue ambience: {name} — {file}");
+                music.ambience = Some(h);
+                music.ambience_kit = Some(kit);
+                music.ambience_volume = volume;
+            }
+            Err(e) => debug!("glue ambience: {e:#}"),
         }
-    };
-    let amp = config.category_amp(SoundCategory::Ambience) * volume;
-    let fade_in = fade
-        .filter(|s| *s > 0.0)
-        .map(|s| mixer::fade((s * 1000.0) as u64));
-    let data = data
-        .loop_region(..)
-        .fade_in_tween(fade_in)
-        .volume(mixer::amp_to_db(amp));
-    match mixer_ref.play_stream(data) {
-        Ok(h) => {
-            info!("glue ambience: {name} — {file}");
-            music.ambience = Some(h);
-            music.ambience_kit = Some(kit);
-            music.ambience_volume = volume;
+    }
+}
+
+/// wasm32: start the theme and the ambience whose loads the browser has finished, exactly as the
+/// native open would have at the request. A theme load that failed waits [`GLUE_MUSIC_RETRY`].
+#[cfg(target_arch = "wasm32")]
+fn land_glue_loads(music: &mut GlueMusic, out: &mut SoundOutput, config: &SoundConfig) {
+    if let Some(mut pending) = music.pending.take() {
+        match pending.take() {
+            None => music.pending = Some(pending),
+            Some(Err(e)) => {
+                debug!("glue music: {} — {e}", pending.path);
+                music.retry_at = Some(bevy::platform::time::Instant::now() + GLUE_MUSIC_RETRY);
+            }
+            Some(Ok(data)) => {
+                let amp = config.category_amp(SoundCategory::Music) * pending.kit_vol;
+                let data = mixer::StreamingSoundData::from_static(data);
+                let data = data.volume(mixer::amp_to_db(amp));
+                match out.mixer.as_mut().map(|m| m.play_stream(data)) {
+                    None => {}
+                    Some(Ok(h)) => {
+                        info!("glue music: {} — {}", music.track, pending.path);
+                        music.handle = Some(h);
+                        music.kit = Some(pending.kit_id);
+                        music.volume = pending.kit_vol;
+                        music.fading = false;
+                        music.watch.reset();
+                    }
+                    Some(Err(e)) => debug!("glue music: {e:#}"),
+                }
+            }
         }
-        Err(e) => debug!("glue ambience: {e:#}"),
+    }
+    if let Some(mut pending) = music.pending_ambience.take() {
+        match pending.take() {
+            None => music.pending_ambience = Some(pending),
+            Some(Err(e)) => debug!("glue ambience: {} — {e}", pending.path),
+            Some(Ok(data)) => {
+                let amp = config.category_amp(SoundCategory::Ambience) * pending.kit_vol;
+                let fade_in = (pending.fade_ms > 0).then(|| mixer::fade(pending.fade_ms));
+                let data = mixer::StreamingSoundData::from_static(
+                    data.fade_in_tween(fade_in).volume(mixer::amp_to_db(amp)),
+                );
+                match out.mixer.as_mut().map(|m| m.play_stream(data)) {
+                    None => {}
+                    Some(Ok(h)) => {
+                        info!("glue ambience: {}", pending.path);
+                        music.ambience = Some(h);
+                        music.ambience_kit = Some(pending.kit_id);
+                        music.ambience_volume = pending.kit_vol;
+                    }
+                    Some(Err(e)) => debug!("glue ambience: {e:#}"),
+                }
+            }
+        }
     }
 }
 
@@ -179,6 +301,11 @@ fn glue_cut() -> kira::Tween {
 
 /// Stop the glue ambience over `fade`.
 fn fade_glue_ambience(music: &mut GlueMusic, fade: kira::Tween) {
+    // wasm32: a stop also drops a load still in flight, which aborts its fetch.
+    #[cfg(target_arch = "wasm32")]
+    {
+        music.pending_ambience = None;
+    }
     if let Some(mut h) = music.ambience.take() {
         h.stop(fade);
     }
@@ -187,6 +314,12 @@ fn fade_glue_ambience(music: &mut GlueMusic, fade: kira::Tween) {
 
 /// Stop the held theme over `fade`; the handle drops once the watch sees it stopped.
 fn fade_glue_music(music: &mut GlueMusic, fade: kira::Tween) {
+    // wasm32: a stop also drops a load still in flight, and forgets a failed one's wait.
+    #[cfg(target_arch = "wasm32")]
+    {
+        music.pending = None;
+        music.retry_at = None;
+    }
     if let Some(h) = music.handle.as_mut() {
         h.stop(fade);
         music.fading = true;
@@ -253,6 +386,11 @@ fn drive_glue_music_requests(
                 if asked.is_some() && asked == music.ambience_kit && music.ambience.is_some() {
                     continue;
                 }
+                // wasm32: the same kit still loading counts as the same kit playing.
+                #[cfg(target_arch = "wasm32")]
+                if asked.is_some() && music.pending_ambience.as_ref().map(|p| p.kit_id) == asked {
+                    continue;
+                }
                 fade_glue_ambience(&mut music, mixer::fade(GLUE_AMBIENCE_SWITCH_FADE_MS));
                 open_glue_ambience(
                     &mut music,
@@ -295,6 +433,11 @@ fn hand_off_glue_music(
         h.stop(mixer::fade(GLUE_MUSIC_FADE_OUT_MS));
         music.fading = true;
     }
+    // wasm32: a theme still loading never starts in the world.
+    #[cfg(target_arch = "wasm32")]
+    {
+        music.pending = None;
+    }
     fade_glue_ambience(&mut music, glue_cut());
 }
 
@@ -313,6 +456,8 @@ fn watch_glue_music(
     mut kits: Option<ResMut<SoundKits>>,
 ) {
     let music = &mut *music;
+    #[cfg(target_arch = "wasm32")]
+    land_glue_loads(music, &mut out, &config);
     let on_glue = state.is_none_or(|s| *s.get() != ClientState::InWorld);
     if music.handle.is_none() && on_glue && !music.track.is_empty() {
         let track = music.track.clone();

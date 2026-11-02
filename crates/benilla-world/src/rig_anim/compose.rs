@@ -253,7 +253,7 @@ pub fn finalize_rig_worlds(
     if refresh.is_empty() {
         return;
     }
-    let cost_t0 = crate::rig_palette::rig_cost_enabled().then(std::time::Instant::now);
+    let cost_t0 = crate::rig_palette::rig_cost_enabled().then(bevy::platform::time::Instant::now);
     // A rig's chain and rows read only that rig and its root's frame, so the drawn set (~950
     // doodad rigs at Northshire Abbey) builds them in parallel, in refresh order; the shared rows,
     // the anchors and the cascade write after. A seat another rig re-seats this frame is read as

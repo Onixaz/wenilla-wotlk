@@ -51,11 +51,12 @@ pub(crate) use channels::seed_zone_channel_catalog;
 /// The joined-channel roster and the `ChatChannels.dbc` catalog, named by `net`'s docs and tests.
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use edit::ChannelState;
-/// Test-only: `ui_script::chat_tests` checks every fired name against the live `ChatTypeInfo`.
-#[cfg(test)]
+/// `ui_script::chat_tests` checks every fired name against the live `ChatTypeInfo`; in the app the
+/// router and the web bridge (`crate::webbridge`, which names the event on its `chat` line) call it.
 pub(crate) use event::event_name;
 pub(crate) use event::{default_color, ChatEvent, ChatEventKind};
 pub(crate) use feed::ChatLog;
+pub(crate) use frames::ChatWindows;
 /// The per-character chat cache's restore, called from the world-entry UI load: its two events
 /// must precede the session's first chat line and `PLAYER_LOGIN`.
 pub(crate) use settings::restore_chat_looks;

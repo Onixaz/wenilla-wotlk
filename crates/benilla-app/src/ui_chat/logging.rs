@@ -117,11 +117,27 @@ pub(crate) fn local_now() -> LocalTime {
     }
 }
 
+/// Now, in the browser's time zone: wasm32 has neither `GetLocalTime` nor `localtime_r`, and
+/// std's clock panics there.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn local_now() -> LocalTime {
+    let d = js_sys::Date::new_0();
+    LocalTime {
+        year: d.get_full_year(),
+        month: d.get_month() + 1,
+        day: d.get_date(),
+        hour: d.get_hours(),
+        min: d.get_minutes(),
+        sec: d.get_seconds(),
+        milli: d.get_milliseconds(),
+    }
+}
+
 /// Now, in the process's time zone.
 #[cfg(unix)]
 pub(crate) fn local_now() -> LocalTime {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let now = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .unwrap_or_default();
     LocalTime {
         milli: now.subsec_millis(),

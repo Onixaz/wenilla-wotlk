@@ -19,6 +19,7 @@
 //! With `$WOW_CAPTURE` set every path resolves to `None`: a capture neither reads nor writes
 //! player state.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -29,7 +30,14 @@ const STATE_DIR: &str = "benilla-config";
 /// The state folder, or `None` when persistence is off (a capture run, or no executable path).
 /// It may not exist yet: [`write_atomic`] creates it, and a reader treats a missing file as
 /// defaults.
+#[cfg_attr(target_arch = "wasm32", allow(unreachable_code))]
 pub(crate) fn home() -> Option<PathBuf> {
+    // On the page the folder is virtual: every resident is a small text file, and they live in
+    // the browser's `localStorage` under keys named by these same paths (see [`web_store`]). The
+    // callers' contract is unchanged — a path in, `read_to_string`/`write_atomic` on it — which
+    // is what makes this the one place the web needs to know about.
+    #[cfg(target_arch = "wasm32")]
+    return Some(PathBuf::from("/benilla-config"));
     if std::env::var_os("WOW_CAPTURE").is_some() {
         return None; // hermetic: captures neither read nor write player state
     }
@@ -327,7 +335,16 @@ pub(crate) fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
 }
 
 /// [`write_atomic`] for bytes: the saved-variables files carry Lua byte strings as they are.
+/// On the page the store holds text, so bytes that are not UTF-8 are stored lossily there.
 pub(crate) fn write_atomic_bytes(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    #[cfg(target_arch = "wasm32")]
+    return web_store::set(path, &String::from_utf8_lossy(contents));
+    #[cfg(not(target_arch = "wasm32"))]
+    write_atomic_fs(path, contents)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_atomic_fs(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -359,6 +376,55 @@ pub(crate) fn write_saved_file(path: &Path, contents: &[u8]) -> std::io::Result<
         let _ = std::fs::rename(path, &bak);
     }
     write_atomic_bytes(path, contents)
+}
+
+/// Read a state file — the read twin of [`write_atomic_bytes`], so that the page's store answers
+/// too. Absent is `ErrorKind::NotFound` on both targets. On the page the store holds text, so the
+/// bytes are its UTF-8.
+pub(crate) fn read(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(target_arch = "wasm32")]
+    return web_store::get(path).map(String::into_bytes);
+    #[cfg(not(target_arch = "wasm32"))]
+    std::fs::read(path)
+}
+
+/// The page's state folder: `window.localStorage`, one entry per file, keyed by the file's own
+/// path (`/benilla-config/config.toml`, `/benilla-config/macros/account.txt`, …). Everything
+/// [`write_atomic`] writes is text, and the whole folder is a few tens of KB, far under the
+/// ~5 MB an origin gets — so the simplest store there is also the right one. Per browser and
+/// per origin, like a `benilla-config/` beside each install; nothing crosses to the server.
+#[cfg(target_arch = "wasm32")]
+mod web_store {
+    use std::io::{Error, ErrorKind, Result};
+    use std::path::Path;
+
+    fn key(path: &Path) -> String {
+        format!("benilla:{}", path.display())
+    }
+
+    fn storage() -> Result<web_sys::Storage> {
+        web_sys::window()
+            .and_then(|w| w.local_storage().ok().flatten())
+            .ok_or_else(|| Error::new(ErrorKind::Unsupported, "localStorage unavailable"))
+    }
+
+    pub(super) fn get(path: &Path) -> Result<String> {
+        storage()?
+            .get_item(&key(path))
+            .map_err(|_| Error::new(ErrorKind::Other, "localStorage read failed"))?
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::NotFound,
+                    format!("{} not stored", path.display()),
+                )
+            })
+    }
+
+    pub(super) fn set(path: &Path, contents: &str) -> Result<()> {
+        storage()?
+            .set_item(&key(path), contents)
+            .map_err(|_| Error::new(ErrorKind::Other, "localStorage write failed (quota?)"))
+    }
 }
 
 /// Test plumbing for the persistence env vars: `set_var` is process-global, so every such test

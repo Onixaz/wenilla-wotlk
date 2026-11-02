@@ -3503,7 +3503,7 @@ mod dependency_tests {
                         *v = v.wrapping_add((i ^ j) as u64);
                     }
                 }
-                let t = std::time::Instant::now();
+                let t = bevy::platform::time::Instant::now();
                 s.tick(DT);
                 ticked += t.elapsed();
             }

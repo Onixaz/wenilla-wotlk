@@ -8,11 +8,14 @@
 //! reaches a hook. Saved variables and the CVar diff are not flushed from inside a panic.
 //! Without a local state home (a hermetic capture run) no file is written.
 
+use bevy::platform::time::Instant;
 use std::fmt::Write as _;
 use std::panic::PanicHookInfo;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+use web_time::SystemTime;
+use web_time::UNIX_EPOCH;
 
 use crate::BuildId;
 

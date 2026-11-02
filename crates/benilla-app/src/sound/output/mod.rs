@@ -36,9 +36,10 @@ mod device;
 #[path = "cpal.rs"]
 mod device;
 
+use bevy::platform::time::Instant;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bevy::log::{debug, warn};

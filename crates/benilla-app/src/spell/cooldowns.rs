@@ -13,7 +13,13 @@
 //! makes (`ACTIONBAR_UPDATE_COOLDOWN`, `SPELL_UPDATE_COOLDOWN`); a natural expiry does not, since
 //! the stock `Cooldown.lua` frame hides itself at the end.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// `bevy::platform::time::Instant`, not `bevy::platform::time::Instant`: every `Instant` in this file
+// eventually meets `UiClock::anchor` in `ui_triple` (`crate::ui_script::UiClock`'s own doc has
+// the full reason) — on wasm32 those are genuinely different types, so this whole store has to
+// speak the one that's correct there too. A plain alias for `bevy::platform::time::Instant` everywhere else.
+use bevy::platform::time::Instant;
 
 use bevy::prelude::*;
 

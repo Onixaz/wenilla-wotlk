@@ -8,7 +8,8 @@
 //! ([`InstanceState::saw_own_dungeon`]), because AzerothCore never sends
 //! `SMSG_UPDATE_INSTANCE_OWNERSHIP`, so the server alone would never offer the reset.
 
-use std::time::{Duration, Instant};
+use bevy::platform::time::Instant;
+use std::time::Duration;
 
 use benilla_protocol::messages::{
     EncounterUnitUpdate, InstanceLockWarning, InstanceResetFailure, RaidInstanceMessage,

@@ -520,7 +520,7 @@ impl EnableStore {
     /// character with neither still gets an empty node.
     pub(crate) fn load(realm: &str, characters: &[String]) -> Self {
         let read = |path: Option<PathBuf>| {
-            path.and_then(|p| std::fs::read(p).ok())
+            path.and_then(|p| crate::local_state::read(&p).ok())
                 .map(|b| parse_enable_state(&benilla_ui::source::decode(&b)))
         };
         let nodes = characters

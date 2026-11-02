@@ -31,6 +31,8 @@ use bevy::prelude::*;
 use crate::ui_script::VmMemo;
 use benilla_ui::script::{SeededCvar, UiScript};
 
+#[cfg(any(target_arch = "wasm32", test))]
+mod browser;
 mod camera_tuning;
 #[cfg(test)]
 mod stock_census_tests;
@@ -731,6 +733,13 @@ fn load_config(world: &mut World) {
         // `gxApi` is the render backend, a fact about the machine that `sync_cvars` pushes live, so
         // it is never persisted.
         cvars.own_for_session("gxApi", None);
+        // The page's URL settings are session-owned, before the saved file loads.
+        #[cfg(target_arch = "wasm32")]
+        for row in REGISTERED {
+            if let Some(value) = crate::webenv::var(&format!("WOW_{}", row.name)) {
+                browser::apply_override(&mut cvars, row.name, &value);
+            }
+        }
         match stored {
             StoredConfig::Absent => {} // no file, hermetic capture, or no install
             StoredConfig::Bad(msg) => {
@@ -805,7 +814,7 @@ fn stored_config() -> StoredConfig {
     let Some(path) = crate::local_state::config_path() else {
         return StoredConfig::Absent; // hermetic capture or no install: session-only state
     };
-    match std::fs::read(&path) {
+    match crate::local_state::read(&path) {
         Ok(bytes) => StoredConfig::Table(wtf::parse(&String::from_utf8_lossy(&bytes))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => StoredConfig::Absent,
         Err(e) => StoredConfig::Bad(format!("config: cannot read {}: {e}", path.display())),
@@ -2093,7 +2102,7 @@ mod tests {
         };
 
         // ── Launch 1: the roster lands, and the player enters the world as the third row. ────
-        let (tx, _rx) = crossbeam_channel::unbounded();
+        let (tx, _rx) = async_channel::unbounded();
         let mut app = cvar_app();
         app.add_plugins(bevy::state::app::StatesPlugin);
         crate::char_select::add_test_systems(&mut app, tx);
@@ -2117,7 +2126,7 @@ mod tests {
         );
 
         // ── Launch 2: a fresh client over the same folder, and the roster arrives. ───────────
-        let (tx, _rx2) = crossbeam_channel::unbounded();
+        let (tx, _rx2) = async_channel::unbounded();
         let mut app = cvar_app();
         app.add_plugins(bevy::state::app::StatesPlugin);
         crate::char_select::add_test_systems(&mut app, tx);

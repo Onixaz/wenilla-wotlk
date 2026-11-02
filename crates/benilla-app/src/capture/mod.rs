@@ -30,8 +30,9 @@
 //! fixture ([`scenarios::ui_opted_in`]); `WOW_CAPTURE_UI=1` paints the UI over a world scenario,
 //! whose baselines are UI-free by default. `WOW_CAPTURE=list` prints the scenario names.
 
+use bevy::platform::time::Instant;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Capturing, Screenshot, ScreenshotCaptured};

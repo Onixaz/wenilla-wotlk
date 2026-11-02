@@ -88,13 +88,13 @@ const PVP_TIMER_SPAN: std::time::Duration = std::time::Duration::from_millis(300
 #[derive(Default)]
 struct PvpTimer {
     flags: Option<u32>,
-    stamp: Option<std::time::Instant>,
+    stamp: Option<bevy::platform::time::Instant>,
 }
 
 impl PvpTimer {
     /// World entry (`0x6e7f50`): PvP desired clears the stamp, no timer flag starts it, a running
     /// timer keeps the zeroed stamp.
-    fn enter(&mut self, flags: u32, now: std::time::Instant) {
+    fn enter(&mut self, flags: u32, now: bevy::platform::time::Instant) {
         if flags & PVP_DESIRED != 0 {
             self.stamp = None;
         } else if flags & PVP_TIMER == 0 {
@@ -104,7 +104,7 @@ impl PvpTimer {
 
     /// The `PLAYER_FLAGS` watch (`0x6e102c`): a change in `0x40300` re-stamps unless the timer flag
     /// was set before and after (the PvP cooldown's stamp, `0x6de750`).
-    fn watch(&mut self, old: u32, new: u32, now: std::time::Instant) {
+    fn watch(&mut self, old: u32, new: u32, now: bevy::platform::time::Instant) {
         if (old ^ new) & 0x40300 == 0 {
             return;
         }
@@ -116,7 +116,7 @@ impl PvpTimer {
     }
 
     /// The PvP toggle's timer (`0x6de7a0`).
-    fn toggle_timer(&self, now: std::time::Instant) -> i32 {
+    fn toggle_timer(&self, now: bevy::platform::time::Instant) -> i32 {
         if self.flags.unwrap_or(0) & PVP_TIMER == 0 {
             return PVP_TIMER_SPAN.as_millis() as i32;
         }
@@ -140,7 +140,7 @@ fn feed_pvp_timer(
     let Some(mut script) = script else {
         return;
     };
-    let now = std::time::Instant::now();
+    let now = bevy::platform::time::Instant::now();
     if let Some(flags) = self_store.iter().next().map(|s| s.0.player_flags()) {
         match timer.flags {
             None => timer.enter(flags, now),
@@ -353,7 +353,7 @@ mod tests {
     /// Otherwise a pane whose numbers arrived before it existed would never paint.
     #[test]
     fn the_pvp_timer_starts_when_the_flag_comes_on_and_runs_out_to_minus_one() {
-        let t0 = std::time::Instant::now();
+        let t0 = bevy::platform::time::Instant::now();
         let mut t = PvpTimer::default();
         t.enter(PVP_DESIRED, t0);
         t.flags = Some(PVP_DESIRED);
@@ -372,7 +372,7 @@ mod tests {
     /// A login with the timer flag already on keeps the zeroed stamp, so the timer reads -1.
     #[test]
     fn a_login_inside_the_timer_reads_it_as_run_out() {
-        let now = std::time::Instant::now();
+        let now = bevy::platform::time::Instant::now();
         let mut t = PvpTimer::default();
         t.enter(PVP_TIMER, now);
         t.flags = Some(PVP_TIMER);

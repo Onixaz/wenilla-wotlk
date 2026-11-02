@@ -13,6 +13,12 @@ workspace = true
 # features and their `dev` is forwarded here, or unification would put it back in a player build.
 default = ["dev"]
 dev = ["benilla-formats/dev", "benilla-assets/dev"]
+# The browser render backend, chosen by the launcher (`wenilla`): WebGL2 runs everywhere but has
+# no storage buffers (the shared light blob and the skin palettes are storage — decision 0278), so
+# the world needs WebGPU; WebGL2 stays selectable for the glue screens and as the census baseline.
+# Mutually exclusive — bevy asserts if both are on.
+webgl2 = ["bevy/webgl2"]
+webgpu = ["bevy/webgpu"]
 
 [dependencies]
 avian3d = "0.6"
@@ -44,3 +50,8 @@ objc2-app-kit = { version = "0.2", features = [
 objc2-foundation = "0.2"
 # `sel!`, for the two selectors `mac_quit` swaps; the objc2 that objc2-app-kit 0.2 builds against.
 objc2 = "0.5"
+
+# WebGL2 is bevy's wasm32 render backend (no WebGPU fallback here). `bevy.workspace = true` above
+# already carries it transitively (`default_platform` bundles it for every target), but named
+# explicitly on the wasm32 target table per the plan's feature-unification note — this crate and
+# `benilla-app` must resolve `bevy` to the SAME feature set or cargo builds two copies.

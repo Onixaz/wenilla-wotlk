@@ -1,7 +1,9 @@
 //! The world connection's header cipher and server-header framing, one per reference client:
 //! 1.12.1's byte cipher with 4-byte server headers, 3.3.5a's RC4 with 4- or 5-byte ones.
 
-use std::io::{self, Read};
+use std::io;
+
+use crate::transport::ReadExactAsync;
 
 use benilla_srp::vanilla_header::{DecrypterHalf, EncrypterHalf, HeaderCrypto};
 use benilla_srp::wotlk_header::{Arc4, WotlkHeaderCrypto};
@@ -70,19 +72,19 @@ impl From<WotlkHeaderCrypto> for Crypto {
 /// Read one server header, decrypting it once `decrypter` is set: the body length, opcode
 /// excluded, and the opcode. The size is big-endian and counts the opcode; the opcode is
 /// little-endian.
-pub(super) fn read_server_header(
-    stream: &mut impl Read,
+pub(super) async fn read_server_header(
+    stream: &mut impl ReadExactAsync,
     mut decrypter: Option<&mut Decrypter>,
 ) -> io::Result<(usize, u16)> {
     let mut first = [0u8; 1];
-    stream.read_exact(&mut first)?;
+    stream.read_exact_async(&mut first).await?;
     if let Some(d) = decrypter.as_deref_mut() {
         d.decrypt(&mut first);
     }
     let large = decrypter.as_deref().is_some_and(|d| d.is_large(first[0]));
     let mut rest = [0u8; 4];
     let rest = if large { &mut rest[..] } else { &mut rest[..3] };
-    stream.read_exact(rest)?;
+    stream.read_exact_async(rest).await?;
     if let Some(d) = decrypter {
         d.decrypt(rest);
     }
@@ -107,7 +109,7 @@ mod tests {
     fn a_plain_header_is_size_and_opcode() {
         let wire = [0x00, 0x2A, 0xEC, 0x01];
         assert_eq!(
-            read_server_header(&mut &wire[..], None).unwrap(),
+            futures_lite::future::block_on(read_server_header(&mut &wire[..], None)).unwrap(),
             (0x28, 0x01EC)
         );
     }
@@ -119,7 +121,11 @@ mod tests {
         server.encrypter().encrypt(&mut wire);
         let mut client = Crypto::from(HeaderCrypto::from_session_key(KEY));
         assert_eq!(
-            read_server_header(&mut &wire[..], Some(&mut client.decrypter)).unwrap(),
+            futures_lite::future::block_on(read_server_header(
+                &mut &wire[..],
+                Some(&mut client.decrypter)
+            ))
+            .unwrap(),
             (0x8000, 0x01EE)
         );
     }
@@ -137,11 +143,13 @@ mod tests {
 
         let mut r = &wire[..];
         assert_eq!(
-            read_server_header(&mut r, Some(&mut client.decrypter)).unwrap(),
+            futures_lite::future::block_on(read_server_header(&mut r, Some(&mut client.decrypter)))
+                .unwrap(),
             (0x0B, 0x01EE)
         );
         assert_eq!(
-            read_server_header(&mut r, Some(&mut client.decrypter)).unwrap(),
+            futures_lite::future::block_on(read_server_header(&mut r, Some(&mut client.decrypter)))
+                .unwrap(),
             (0x01_2344, 0x00A9)
         );
         assert!(r.is_empty());

@@ -3,7 +3,8 @@
 //! and roster of each team, the result, event and invitation lines, and the inspected player's
 //! teams. The VM sorts the roster and owns its selection.
 
-use std::time::{Duration, Instant};
+use bevy::platform::time::Instant;
+use std::time::Duration;
 
 use bevy::prelude::*;
 

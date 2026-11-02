@@ -5,7 +5,11 @@
 //! name lands. `UPDATE_BATTLEFIELD_SCORE` fires on a pushed board and on the status-3 arrival,
 //! before `UPDATE_BATTLEFIELD_STATUS` (`0x54b148` before `0x54b1a9`).
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// `bevy::platform::time::Instant` has no monotonic clock behind it in a browser and panics there;
+// bevy's re-export is std's natively and `web_time`'s on wasm32.
+use bevy::platform::time::Instant;
 
 use bevy::prelude::*;
 

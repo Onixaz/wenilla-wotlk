@@ -2,9 +2,10 @@
 //! its body is built only once it can draw dressed, as the reference withholds a unit whose first
 //! composite is pending.
 
+use bevy::platform::time::Instant;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use benilla_formats::{load_item_display_catalog, open_chain, CharSections, NpcAppearance};
 use benilla_protocol::ObjectFields;

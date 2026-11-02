@@ -113,8 +113,9 @@ fn draw(rand: u32, count: i32) -> i32 {
 /// A clock-seeded generator in place of the reference's table-driven one; only the range law above
 /// is the reference's.
 fn random_words() -> impl Iterator<Item = u32> {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    // `web_time`, not `std`: a browser has no `SystemTime` behind that name and panics on it.
+    let nanos = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0x9E37_79B9_7F4A_7C15);
     let mut x = nanos | 1;

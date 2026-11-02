@@ -5,6 +5,7 @@ pub mod auth;
 pub mod events;
 pub mod guid;
 pub mod messages;
+pub mod transport;
 pub mod wire;
 pub mod world;
 pub use auth::{AuthReject, LogonReply};
@@ -24,10 +25,10 @@ pub use world::{
     WorldConnectEvent, WorldReader, WorldSession, WorldWriter, WORLD_PORT,
 };
 
-use std::net::TcpStream;
-
 use anyhow::{anyhow, Context, Result};
 use benilla_srp::{NormalizedString, PublicKey, SrpClientChallenge, SESSION_KEY_LENGTH};
+
+use crate::transport::Conn;
 
 /// The port a stock vmangos `realmd` listens on.
 pub const AUTH_PORT: u16 = 3724;
@@ -70,28 +71,35 @@ impl std::fmt::Display for DialFailure {
 
 impl std::error::Error for DialFailure {}
 
-/// Resolves, then tries every resolved address in turn: `localhost` gives `::1` first, and a
-/// server may bind only IPv4.
-fn dial(host: &str, port: u16) -> Result<TcpStream> {
-    use std::net::ToSocketAddrs;
+/// Resolves, then dials: `localhost` gives `::1` first, and a server may bind only IPv4, so the
+/// connect tries every resolved address in turn. On the web the page resolves nothing (the host
+/// proxies the dial), so a failure there can only be "nothing answered".
+async fn dial(host: &str, port: u16) -> Result<Conn> {
     let address = format!("{host}:{port}");
-    let addrs: Vec<std::net::SocketAddr> = match (host, port).to_socket_addrs() {
-        Ok(addrs) => addrs.collect(),
-        Err(e) => {
-            return Err(anyhow::Error::new(DialFailure {
-                address,
-                unresolved: true,
-            })
-            .context(format!("resolving {host}: {e}")))
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::net::ToSocketAddrs;
+        match (host, port)
+            .to_socket_addrs()
+            .map(|mut a| a.next().is_some())
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(anyhow::Error::new(DialFailure {
+                    address,
+                    unresolved: true,
+                }))
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(DialFailure {
+                    address,
+                    unresolved: true,
+                })
+                .context(format!("resolving {host}: {e}")))
+            }
         }
-    };
-    if addrs.is_empty() {
-        return Err(anyhow::Error::new(DialFailure {
-            address,
-            unresolved: true,
-        }));
     }
-    TcpStream::connect(&addrs[..]).map_err(|e| {
+    Conn::connect(host, port).await.map_err(|e| {
         anyhow::Error::new(DialFailure {
             address,
             unresolved: false,
@@ -129,21 +137,25 @@ pub struct Logon {
     pub session_key: [u8; SESSION_KEY_LENGTH],
     pub realms: Vec<RealmInfo>,
     /// `None` once a refresh has failed; the held list is then final.
-    stream: Option<TcpStream>,
+    stream: Option<Conn>,
 }
 
 impl Logon {
     /// The reference's `RequestRealmList`: re-reads the list, keeping the old one and dropping
     /// the socket on failure (realmd closes idle sockets); `timeout` bounds a silent server.
-    pub fn refresh_realms(&mut self, timeout: std::time::Duration) -> bool {
+    /// `async` because the read is: a page cannot block for realmd's answer.
+    pub async fn refresh_realms(&mut self, timeout: std::time::Duration) -> bool {
         let Some(stream) = self.stream.as_mut() else {
             return false;
         };
-        let refreshed = (|| -> Result<Vec<RealmInfo>> {
+        let refreshed = async {
             stream.set_read_timeout(Some(timeout))?;
             auth::write_realm_list_request(stream).context("requesting realm list")?;
-            auth::read_realm_list(stream).context("reading realm list")
-        })();
+            auth::read_realm_list(stream)
+                .await
+                .context("reading realm list")
+        }
+        .await;
         match refreshed {
             Ok(realms) => {
                 self.realms = realms;
@@ -167,8 +179,14 @@ impl Logon {
     }
 }
 
-/// The full SRP6 logon against a `realmd`, then the realm list.
+/// The blocking twin of [`logon_async`], for the CLIs, probes and the native net thread.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn logon(host: &str, username: &str, password: &str) -> Result<Logon> {
+    futures_lite::future::block_on(logon_async(host, username, password))
+}
+
+/// The full SRP6 logon against a `realmd`, then the realm list.
+pub async fn logon_async(host: &str, username: &str, password: &str) -> Result<Logon> {
     let (host, port) = host_port(host, AUTH_PORT);
 
     let username_n =
@@ -182,15 +200,16 @@ pub fn logon(host: &str, username: &str, password: &str) -> Result<Logon> {
     let (mut stream, reply, server_public_key) = {
         let mut dialed = None;
         for _ in 0..MAX_CHALLENGE_DIALS {
-            let mut stream = dial(host, port)?;
+            let mut stream = dial(host, port).await?;
             auth::write_logon_challenge(&mut stream, &username.to_uppercase())
                 .context("sending logon challenge")?;
-            let Some(reply) =
-                auth::read_challenge_reply(&mut stream).context("reading logon challenge reply")?
+            let Some(reply) = auth::read_challenge_reply(&mut stream)
+                .await
+                .context("reading logon challenge reply")?
             else {
                 // `SUCCESS_SURVEY` on the challenge authenticates with no SRP exchange; the
                 // reference's success arm copies no key.
-                return finish_logon(stream, [0u8; SESSION_KEY_LENGTH]);
+                return finish_logon(stream, [0u8; SESSION_KEY_LENGTH]).await;
             };
             let server_public_key = PublicKey::from_le_bytes(reply.server_public_key)
                 .map_err(|e| anyhow!("invalid server public key: {e}"))?;
@@ -221,23 +240,27 @@ pub fn logon(host: &str, username: &str, password: &str) -> Result<Logon> {
     )
     .context("sending logon proof")?;
 
-    let session_key =
-        match auth::read_proof_reply(&mut stream).context("reading logon proof reply")? {
-            Some(server_proof) => *challenge
-                .verify_server_proof(server_proof)
-                .map_err(|e| anyhow!("server proof mismatch (wrong password?): {e}"))?
-                .session_key(),
-            // `SUCCESS_SURVEY` on the proof authenticates with no `M2` to check; the key is the one
-            // this exchange derived.
-            None => challenge.into_unverified_session_key(),
-        };
-    finish_logon(stream, session_key)
+    let session_key = match auth::read_proof_reply(&mut stream)
+        .await
+        .context("reading logon proof reply")?
+    {
+        Some(server_proof) => *challenge
+            .verify_server_proof(server_proof)
+            .map_err(|e| anyhow!("server proof mismatch (wrong password?): {e}"))?
+            .session_key(),
+        // `SUCCESS_SURVEY` on the proof authenticates with no `M2` to check; the key is the one
+        // this exchange derived.
+        None => challenge.into_unverified_session_key(),
+    };
+    finish_logon(stream, session_key).await
 }
 
 /// An authenticated logon's tail: the realm list over the same socket.
-fn finish_logon(mut stream: TcpStream, session_key: [u8; SESSION_KEY_LENGTH]) -> Result<Logon> {
+async fn finish_logon(mut stream: Conn, session_key: [u8; SESSION_KEY_LENGTH]) -> Result<Logon> {
     auth::write_realm_list_request(&mut stream).context("requesting realm list")?;
-    let realms = auth::read_realm_list(&mut stream).context("reading realm list")?;
+    let realms = auth::read_realm_list(&mut stream)
+        .await
+        .context("reading realm list")?;
 
     Ok(Logon {
         session_key,

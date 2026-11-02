@@ -10,7 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 use benilla_protocol::messages::{self, opcode};
-use benilla_protocol::{SessionEnd, SessionEvent};
+use benilla_protocol::SessionEvent;
 use benilla_srp::wotlk_header::WotlkHeaderCrypto;
 use benilla_srp::{
     password_verifier, NormalizedString, GENERATOR, LARGE_SAFE_PRIME_LITTLE_ENDIAN,
@@ -20,7 +20,7 @@ use crossbeam_channel::{Receiver, Sender};
 use num_bigint::BigUint;
 use sha1::{Digest, Sha1};
 
-use super::{run, writer_loop, Cycle, LoginRequest, Parks, PingClock, WriterSwap};
+use super::{sequencer, writer_loop, LoginRequest, Parks, PingClock, WriterSwap};
 use crate::net::{CharRequest, ClientCommand, ParkRequest, ParkSender, RealmRequest};
 
 pub(crate) const USER: &str = "empty";
@@ -576,7 +576,7 @@ pub(crate) struct Cycles {
     pub(crate) events: Receiver<SessionEvent>,
     /// The app's commands, to the write thread and on to the world socket while in the world.
     pub(crate) commands: Sender<ClientCommand>,
-    pub(crate) login: Sender<LoginRequest>,
+    pub(crate) login: async_channel::Sender<LoginRequest>,
     pub(crate) realm: ParkSender<RealmRequest>,
     pub(crate) pick: ParkSender<CharRequest>,
     pub(crate) abandon: Arc<AtomicU64>,
@@ -598,42 +598,26 @@ fn spawn_cycles_for(screen_asks_roster: bool) -> Cycles {
     let (commands, cmd_rx) = crossbeam_channel::unbounded::<ClientCommand>();
     let (writer_tx, writer_rx) = crossbeam_channel::unbounded::<WriterSwap>();
     thread::spawn(move || writer_loop(&cmd_rx, writer_rx, &Mutex::new(PingClock::default()), None));
-    let (login, login_rx) = crossbeam_channel::unbounded();
-    let (park_tx, park_rx) = crossbeam_channel::unbounded::<ParkRequest>();
+    let (login, login_rx) = async_channel::unbounded();
+    let (park_tx, park_rx) = async_channel::unbounded::<ParkRequest>();
     let abandon = Arc::new(AtomicU64::new(0));
-    let thread_abandon = Arc::clone(&abandon);
+    let parks = Parks {
+        login_rx,
+        park_rx,
+        screen_asks_roster: Arc::new(std::sync::atomic::AtomicBool::new(screen_asks_roster)),
+    };
+    let (thread_abandon, clock) = (
+        Arc::clone(&abandon),
+        Arc::new(Mutex::new(PingClock::default())),
+    );
     thread::spawn(move || {
-        let parks = Parks {
-            login_rx,
-            park_rx,
-            screen_asks_roster: Arc::new(std::sync::atomic::AtomicBool::new(screen_asks_roster)),
-        };
-        let clock = Mutex::new(PingClock::default());
-        let mut tails = Default::default();
-        loop {
-            match run(
-                &events_tx,
-                &writer_tx,
-                &parks,
-                &thread_abandon,
-                &clock,
-                &mut tails,
-            ) {
-                Ok(Cycle::Exit) => return,
-                Ok(Cycle::Repark) => {}
-                Err(e) => {
-                    if events_tx
-                        .send(SessionEvent::Disconnected {
-                            reason: format!("disconnected: {e:#}"),
-                            end: SessionEnd::Lost,
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-            }
-        }
+        futures_lite::future::block_on(sequencer(
+            events_tx,
+            writer_tx,
+            parks,
+            thread_abandon,
+            clock,
+        ))
     });
     Cycles {
         events,
@@ -649,7 +633,7 @@ fn spawn_cycles_for(screen_asks_roster: bool) -> Cycles {
 pub(crate) fn login(cycles: &Cycles, host: &str) {
     cycles
         .login
-        .send(LoginRequest {
+        .send_blocking(LoginRequest {
             user: USER.into(),
             pass: PASS.into(),
             host: host.into(),

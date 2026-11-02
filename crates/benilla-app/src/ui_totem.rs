@@ -1,6 +1,6 @@
 //! The player's four totem slots (12340 `0xbd0b00`) and their tools, fed to the totem verbs.
 
-use std::time::Instant;
+use bevy::platform::time::Instant;
 
 use bevy::prelude::*;
 

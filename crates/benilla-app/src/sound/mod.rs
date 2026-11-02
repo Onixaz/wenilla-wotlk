@@ -36,6 +36,9 @@ mod money;
 mod mount;
 mod net;
 // Crate-visible for the dev stall watchdog, which asks `output::device_open`.
+// On wasm32 the mixer runs on `web_backend` (`mixer::MixBackend`), so most of the
+// device layer goes unreferenced there; it stays compiled so it cannot rot behind a target gate.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) mod output;
 mod probe;
 mod reverb;
@@ -45,6 +48,10 @@ mod ui;
 mod vocal;
 mod water;
 mod weather;
+#[cfg(target_arch = "wasm32")]
+mod web_backend;
+#[cfg(target_arch = "wasm32")]
+mod web_load;
 mod zone;
 pub(crate) use emote::EmoteSounds;
 /// First-play kit decodes so far, for the probe's tail line.

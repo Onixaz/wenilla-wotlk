@@ -1,8 +1,9 @@
 //! The server-authored path walk ([`Spline`], `SMSG_MONSTER_MOVE`) and the terrain re-ground
 //! that goes with it ([`ground_clamp_creatures`]).
 
+use bevy::platform::time::Instant;
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use benilla_assets::coords::{bevy_to_wow, wow_to_bevy};
 use benilla_protocol::{CreateSpline, EntityKind, SplineArc};
@@ -625,7 +626,7 @@ pub(in crate::net) fn ground_clamp_creatures(
 ) {
     let cost = clamp_cost_enabled();
     let legacy = clamp_seat_disabled();
-    let t0 = cost.then(std::time::Instant::now);
+    let t0 = cost.then(bevy::platform::time::Instant::now);
     let epoch = epoch.get();
 
     // The gate runs serially over every row: most units are skipped or held, and fanning those
@@ -1728,7 +1729,8 @@ mod swim_gate {
 /// that must not be; the trench floor is flat under the whole mid-path window.
 #[cfg(test)]
 mod server_moved_players {
-    use std::time::{Duration, Instant};
+    use bevy::platform::time::Instant;
+    use std::time::Duration;
 
     use avian3d::prelude::*;
     use benilla_assets::coords::wow_to_bevy;
@@ -2076,7 +2078,8 @@ mod server_moved_players {
 /// walking, where every face is a backface; a walker on a hill; re-basing on a new path.
 #[cfg(test)]
 mod inside_a_hull {
-    use std::time::{Duration, Instant};
+    use bevy::platform::time::Instant;
+    use std::time::Duration;
 
     use avian3d::prelude::*;
     use benilla_protocol::EntityKind;

@@ -7,7 +7,11 @@
 //! answering `(0, 0)` off it. The app resolves the list that way each frame. A name landing fires
 //! `WORLD_MAP_NAME_UPDATE`, as in the reference.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// `bevy::platform::time::Instant` has no monotonic clock behind it in a browser and panics there;
+// bevy's re-export is std's natively and `web_time`'s on wasm32.
+use bevy::platform::time::Instant;
 
 use bevy::prelude::*;
 

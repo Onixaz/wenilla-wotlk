@@ -188,8 +188,8 @@ fn matching<T>(answers: &[T], baseline: usize, want: impl Fn(&T) -> bool) -> Opt
 
 /// A ticket text unique per run (to the second); the suffix tells a run's two texts apart.
 fn unique_text(suffix: &str) -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let secs = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!("benilla probe {secs}{suffix}")

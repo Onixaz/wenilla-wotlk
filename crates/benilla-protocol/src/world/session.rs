@@ -1,11 +1,10 @@
-use std::net::{TcpStream, ToSocketAddrs};
-
 use anyhow::{anyhow, bail, Context, Result};
 use benilla_srp::vanilla_header::ProofSeed;
 use benilla_srp::wotlk_header::WotlkHeaderCrypto;
 use benilla_srp::{NormalizedString, SESSION_KEY_LENGTH};
 
 use crate::messages::{self, opcode, Character, MoveMode, ServerPacket};
+use crate::transport::Conn;
 use crate::SessionEvent;
 
 use super::cipher::Crypto;
@@ -68,7 +67,7 @@ const GLUE_KEPT: [u16; 3] = [
 
 /// An authenticated world-server session with header encryption active.
 pub struct WorldSession {
-    stream: TcpStream,
+    stream: Conn,
     crypto: Crypto,
     link: LinkFacts,
     /// The language chat sends speak, the character's faction tongue: vmangos drops chat, even
@@ -131,8 +130,9 @@ pub enum WorldConnectEvent {
 impl WorldSession {
     /// Connect and complete the auth handshake with the logon's account and session key, for the
     /// realm list's `realm_id`, which `CMSG_AUTH_SESSION` names to the world server.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn connect(
-        addr: impl ToSocketAddrs,
+        addr: &str,
         username: &str,
         session_key: [u8; SESSION_KEY_LENGTH],
         realm_id: u8,
@@ -140,19 +140,42 @@ impl WorldSession {
         Self::connect_queued(addr, username, session_key, realm_id, &mut |_| true)
     }
 
-    /// [`Self::connect`], calling `on_event` once the socket connects and with each queue position;
-    /// `false` abandons the connect.
-    /// Deviation: checked per queue packet where the reference checks each tick, so a cancel can
-    /// lag one server update.
+    /// [`Self::connect_queued`], blocking — the native net thread's and the probes' connect.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn connect_queued(
-        addr: impl ToSocketAddrs,
+        addr: &str,
         username: &str,
         session_key: [u8; SESSION_KEY_LENGTH],
         realm_id: u8,
         on_event: &mut dyn FnMut(WorldConnectEvent) -> bool,
     ) -> Result<Self> {
+        futures_lite::future::block_on(Self::connect_queued_async(
+            addr,
+            username,
+            session_key,
+            realm_id,
+            on_event,
+        ))
+    }
+
+    /// [`Self::connect`], calling `on_event` once the socket connects and with each queue position;
+    /// `false` abandons the connect.
+    /// Deviation: checked per queue packet where the reference checks each tick, so a cancel can
+    /// lag one server update.
+    /// `addr` is `host[:port]`, the realm list's own address form; a bare host gets
+    /// [`WORLD_PORT`](crate::WORLD_PORT).
+    pub async fn connect_queued_async(
+        addr: &str,
+        username: &str,
+        session_key: [u8; SESSION_KEY_LENGTH],
+        realm_id: u8,
+        on_event: &mut dyn FnMut(WorldConnectEvent) -> bool,
+    ) -> Result<Self> {
+        let (host, port) = crate::host_port(addr, super::WORLD_PORT);
         let mut queued = false;
-        let mut stream = TcpStream::connect(addr).context("connecting to world server")?;
+        let mut stream = Conn::connect(host, port)
+            .await
+            .context("connecting to world server")?;
         if !on_event(WorldConnectEvent::Connected) {
             bail!("world connect abandoned");
         }
@@ -165,7 +188,7 @@ impl WorldSession {
             .set_read_timeout(Some(HANDSHAKE_READ_TIMEOUT))
             .context("setting handshake read timeout")?;
 
-        let (challenge_opcode, challenge) = recv_raw(&mut stream, None)?;
+        let (challenge_opcode, challenge) = recv_raw(&mut stream, None).await?;
         let server_seed = server_seed(challenge_opcode, &challenge)?;
 
         let username_n =
@@ -205,7 +228,7 @@ impl WorldSession {
 
         // AUTH_RESPONSE is not always first, so others are skipped; Warden data ends the connect.
         loop {
-            let packet = session.recv_glue()?;
+            let packet = session.recv_glue().await?;
             match packet {
                 ServerPacket::AuthResponse {
                     result,
@@ -329,8 +352,8 @@ impl WorldSession {
 
     /// One packet of the handshake or the roster: the auth response and the character list parsed,
     /// every other packet left as [`ServerPacket::Other`].
-    fn recv_glue(&mut self) -> Result<ServerPacket> {
-        let (opcode, body) = recv_raw(&mut self.stream, Some(&mut self.crypto.decrypter))?;
+    async fn recv_glue(&mut self) -> Result<ServerPacket> {
+        let (opcode, body) = recv_raw(&mut self.stream, Some(&mut self.crypto.decrypter)).await?;
         match opcode {
             opcode::SMSG_AUTH_RESPONSE => messages::parse_auth_response_wotlk(&body)
                 .map_err(|e| anyhow!("parsing SMSG_AUTH_RESPONSE: {e}")),
@@ -355,9 +378,16 @@ impl WorldSession {
         }
     }
 
-    /// Read + decrypt + parse one server packet.
+    /// Read + decrypt + parse one server packet (blocking) — the native twin of
+    /// [`Self::recv_async`].
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn recv(&mut self) -> Result<ServerPacket> {
-        let packet = recv_packet(&mut self.stream, Some(&mut self.crypto.decrypter))?;
+        futures_lite::future::block_on(self.recv_async())
+    }
+
+    /// Read + decrypt + parse one server packet.
+    pub async fn recv_async(&mut self) -> Result<ServerPacket> {
+        let packet = recv_packet(&mut self.stream, Some(&mut self.crypto.decrypter)).await?;
         self.keep_glue(&packet);
         // `SMSG_ADDON_INFO` can reach any of the handshake's read loops, so it is caught here.
         if let ServerPacket::AddonInfo { statuses } = &packet {
@@ -370,8 +400,8 @@ impl WorldSession {
     /// not parse: skipped, as the world stream skips it ([`WorldReader::poll`]), since back from
     /// the world the link still carries what the world session left in flight (a pong, a reply
     /// vmangos serves to an authenticated session).
-    fn recv_parsed(&mut self) -> Result<Option<ServerPacket>> {
-        match self.recv() {
+    async fn recv_parsed(&mut self) -> Result<Option<ServerPacket>> {
+        match self.recv_async().await {
             Ok(packet) => Ok(Some(packet)),
             Err(e) if e.downcast_ref::<super::Unparsed>().is_some() => Ok(None),
             Err(e) => Err(e),
@@ -394,11 +424,17 @@ impl WorldSession {
         )
     }
 
-    /// Request and return the character list, remembering each race for the chat language.
+    /// [`Self::char_enum_async`], blocking.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn char_enum(&mut self) -> Result<Vec<Character>> {
+        futures_lite::future::block_on(self.char_enum_async())
+    }
+
+    /// Request and return the character list, remembering each race for the chat language.
+    pub async fn char_enum_async(&mut self) -> Result<Vec<Character>> {
         self.send(opcode::CMSG_CHAR_ENUM, &[])?;
         loop {
-            let packet = self.recv_glue()?;
+            let packet = self.recv_glue().await?;
             match packet {
                 ServerPacket::CharEnum { characters } => {
                     self.link.roster_races = characters.iter().map(|c| (c.guid, c.race)).collect();
@@ -419,21 +455,33 @@ impl WorldSession {
         }
     }
 
-    /// Create a character; returns the `SMSG_CHAR_CREATE` result byte.
+    /// [`Self::create_character_async`], blocking.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn create_character(&mut self, req: &messages::CharCreateReq) -> Result<u8> {
+        futures_lite::future::block_on(self.create_character_async(req))
+    }
+
+    /// Create a character; returns the `SMSG_CHAR_CREATE` result byte.
+    pub async fn create_character_async(&mut self, req: &messages::CharCreateReq) -> Result<u8> {
         self.send(opcode::CMSG_CHAR_CREATE, &messages::char_create(req))?;
         loop {
-            if let Some(ServerPacket::CharCreate { result }) = self.recv_parsed()? {
+            if let Some(ServerPacket::CharCreate { result }) = self.recv_parsed().await? {
                 return Ok(result);
             }
         }
     }
 
-    /// Delete a character at character select; returns the `SMSG_CHAR_DELETE` result byte.
+    /// [`Self::delete_character_async`], blocking.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn delete_character(&mut self, guid: u64) -> Result<u8> {
+        futures_lite::future::block_on(self.delete_character_async(guid))
+    }
+
+    /// Delete a character at character select; returns the `SMSG_CHAR_DELETE` result byte.
+    pub async fn delete_character_async(&mut self, guid: u64) -> Result<u8> {
         self.send(opcode::CMSG_CHAR_DELETE, &messages::full_guid(guid))?;
         loop {
-            if let Some(ServerPacket::CharDelete { result }) = self.recv_parsed()? {
+            if let Some(ServerPacket::CharDelete { result }) = self.recv_parsed().await? {
                 return Ok(result);
             }
         }
@@ -962,22 +1010,22 @@ impl WorldSession {
         self.stream
             .set_read_timeout(None)
             .context("clearing handshake read timeout")?;
-        let read_stream = self
+        let (reader, writer) = self
             .stream
-            .try_clone()
-            .context("cloning world socket for split")?;
+            .split()
+            .context("splitting the world connection")?;
         let Crypto {
             encrypter,
             decrypter,
         } = self.crypto;
         Ok((
             WorldReader {
-                stream: read_stream,
+                reader,
                 decrypter,
                 link: self.link,
             },
             WorldWriter {
-                stream: self.stream,
+                writer,
                 encrypter,
                 chat_language: self.chat_language,
                 cast_counter: self.cast_counter,
@@ -992,12 +1040,15 @@ impl WorldSession {
     /// direction reached, and the reads wait with the handshake's bound again, as every park step
     /// awaits one reply.
     pub fn rejoin(reader: WorldReader, writer: WorldWriter) -> Result<Self> {
-        // The read half is a clone of the write half's socket; dropping it closes nothing.
+        // The read half is a second handle onto the write half's connection; dropping it closes
+        // nothing.
         let WorldReader {
-            decrypter, link, ..
+            reader: read_half,
+            decrypter,
+            link,
         } = reader;
         let session = WorldSession {
-            stream: writer.stream,
+            stream: Conn::rejoin(read_half, writer.writer),
             crypto: Crypto {
                 encrypter: writer.encrypter,
                 decrypter,
@@ -1015,7 +1066,9 @@ impl WorldSession {
         Ok(session)
     }
 
-    /// Log out to character select, waiting up to `timeout`; needs a socket read timeout.
+    /// Log out to character select, waiting up to `timeout`; needs a socket read timeout. Native
+    /// only: the deadline is std's clock, and the app logs out through the split writer instead.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn logout(&mut self, timeout: std::time::Duration) -> Result<()> {
         self.send(opcode::CMSG_LOGOUT_REQUEST, &[])?;
         let deadline = std::time::Instant::now() + timeout;

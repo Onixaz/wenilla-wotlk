@@ -947,7 +947,7 @@ mod tests {
             if unit_runs {
                 world.entity_mut(unit).insert(crate::net::Spline {
                     points: vec![[distance, 0.0, 0.0], [distance + 16.0, 0.0, 0.0]],
-                    start: std::time::Instant::now(),
+                    start: bevy::platform::time::Instant::now(),
                     duration: std::time::Duration::from_secs(2),
                     id: 1,
                     grounded: true,

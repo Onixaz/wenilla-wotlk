@@ -49,7 +49,7 @@ pub(crate) fn load_saved_variables(
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let loaded = match std::fs::read(&path) {
+        let loaded = match crate::local_state::read(&path) {
             Ok(bytes) => match script.run_chunk(&bytes) {
                 Ok(()) => {
                     info!("saved variables: loaded {}", path.display());
