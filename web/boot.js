@@ -11,14 +11,14 @@
 //      "game data N/M" line for the prefetch, then indeterminate "Starting…" states driven by
 //      the client's own `window.__wenilla_progress(stage)` calls (benilla-app/src/webprogress.rs)
 //      until "ready" — the first glue screen — fades the overlay out.
-//   2. SHRINK the unresponsive window: `/data/*` is served immutable (max-age=1y), and a sync
-//      XHR is served from the HTTP cache when the same URL was fetch()ed first (verified live:
-//      transferSize 0, deliveryType "cache"). So the overlay prefetches the boot read-set — a
-//      checked-in manifest (boot-manifest.json) captured from a traced boot — with a small
-//      fetch pool, in parallel with the wasm download. The catalog pile then costs parse, not
-//      ~100 serial network round trips. Every miss (drift, missing manifest) degrades to
-//      exactly today's behavior, and a warm-cache visitor flies through all of it: progress is
-//      measured, never scripted.
+//   2. SHRINK the unresponsive window: the overlay creates the page's data store
+//      (datastore.js, `window.__wenilla_data`) and fills it with the boot read-set — a
+//      checked-in manifest (boot-manifest.json) captured from a traced boot, plus every name a
+//      synchronous read missed on earlier visits — in parallel with the wasm download. The
+//      client's synchronous chain reads then answer from memory: no XHR, no round trip, no
+//      byte-by-byte decode. Every miss (drift, missing manifest) degrades to a synchronous XHR
+//      and is learned for next time, and a returning visitor reads the store's persistent cache
+//      instead of the network: progress is measured, never scripted.
 //
 // Page contract: `const w = await boot(init); bind(w.memory);` — bind must stay immediately
 // after (the Lua WASI shims need the module's linear memory). Query switches: `?boottrace=1`
@@ -30,7 +30,6 @@
 // build and that is cosmetic — the bar is clamped at 99% until the stream actually ends.
 const BR_RATIO = 5.0;
 const READY_TIMEOUT_MS = 20000;
-const PREFETCH_CONCURRENCY = 8;
 
 export async function boot(init, opts = {}) {
   const q = new URLSearchParams(location.search);
@@ -39,11 +38,19 @@ export async function boot(init, opts = {}) {
   const skipPrefetch = q.get('boottrace') === '1' || q.get('noprefetch') === '1';
   installProgressHook(ui, skipPrefetch);
 
+  // The store must exist before the client starts: its synchronous reads look for it once.
+  const store = dataStore();
   const prefetch = skipPrefetch
-    ? Promise.resolve()
-    : prefetchManifest('./boot-manifest.json', (done, total) => ui.setData(done, total)).catch(
-        () => ui.setData(0, 0)
-      );
+    ? store
+    : store
+        .then((s) =>
+          prefetchManifest(s, './boot-manifest.json', 'boot', (done, total) => ui.setData(done, total))
+        )
+        .catch(() => ui.setData(0, 0));
+  // The world-entry set follows at once, while the client instantiates and builds its glue: the
+  // network is otherwise idle then, and a player who logs straight in reaches world entry
+  // seconds later.
+  if (!skipPrefetch) prefetch.then(() => store).then(startWorldPrefetch, () => {});
 
   // Compile immediately: merely fetching a Response leaves its body backpressured until
   // someone consumes it. Instantiation must still wait for the cache warmup because the
@@ -54,7 +61,7 @@ export async function boot(init, opts = {}) {
   let w;
   try {
     // Attach rejection handlers to both operations now, including while prefetch is pending.
-    const [module] = await Promise.all([wasm, prefetch]);
+    const [module] = await Promise.all([wasm, prefetch, store]);
     w = await init({ module_or_path: module });
   } catch (e) {
     ui.fail('The client failed to start: ' + (e && e.message ? e.message : e));
@@ -111,57 +118,82 @@ async function fetchWasm(url, onBytes) {
   return new Response(counted, { status: r.status, statusText: r.statusText, headers: r.headers });
 }
 
-/// Warm the HTTP cache with a manifest's read-set: fetch the manifest, then a fixed-size pool of
-/// full-body fetches. Failures are counted as done and otherwise ignored — a miss just means
-/// that file loads the old way. A missing/invalid manifest resolves immediately (line hides).
-/// Used twice: the boot set before `init()`, the world-entry set after `ready`.
-async function prefetchManifest(manifestUrl, onProgress) {
-  const r = await fetch(manifestUrl);
-  if (!r.ok) return onProgress(0, 0);
-  const manifest = await r.json();
-  const names = Array.isArray(manifest && manifest.names) ? manifest.names : [];
-  if (!names.length) return onProgress(0, 0);
-  let done = 0;
-  onProgress(0, names.length);
-  const queue = names.slice();
-  async function worker() {
-    for (;;) {
-      const name = queue.shift();
-      if (name === undefined) return;
-      try {
-        const resp = await fetch('/data/' + encodeURIComponent(name));
-        if (resp.ok) await resp.arrayBuffer(); // body fully read = body fully cached
-      } catch (_) {
-        /* offline blip, 404 drift — the sync XHR path will deal with it */
-      }
-      done += 1;
-      onProgress(done, names.length);
-    }
+/// The page's data store, created once (datastore.js). Loaded by URL so the module resolves
+/// beside this one wherever the page serves it.
+async function dataStore() {
+  if (!window.__wenilla_data) {
+    const { createStore } = await import(new URL('./datastore.js', import.meta.url).href);
+    window.__wenilla_data ??= createStore();
   }
-  await Promise.all(Array.from({ length: PREFETCH_CONCURRENCY }, worker));
+  return window.__wenilla_data;
+}
+
+/// Fill the store with a phase's read-set: the manifest's names plus the names synchronous reads
+/// missed in that phase on earlier visits. Failures are counted as done and otherwise ignored — a
+/// miss just means that file loads the old way. Used twice: the boot set before `init()`, the
+/// world-entry set right after it.
+async function prefetchManifest(store, manifestUrl, phase, onProgress) {
+  let names = [];
+  try {
+    const r = await fetch(manifestUrl);
+    if (r.ok) {
+      const manifest = await r.json();
+      if (Array.isArray(manifest && manifest.names)) names = manifest.names;
+    }
+  } catch (_) {
+    /* no manifest: the learned names alone */
+  }
+  // The name index answers every existence question the client asks; ~12 MB of JSON that a
+  // synchronous read would hold the thread for. The locale names the archives' language.
+  if (phase === 'boot') names = ['__index', '__locale', ...names];
+  const all = Array.from(new Set([...names, ...store.learned(phase)]));
+  if (!all.length) return onProgress(0, 0);
+  onProgress(0, all.length);
+  await store.prefetch(all, { priority: 'high', onProgress });
+}
+
+/// The world-entry prefetch's progress, for the corner line once the glue is up.
+const world = { done: 0, total: 0, finished: false, onChange: null };
+
+function startWorldPrefetch(store) {
+  prefetchManifest(store, './world-manifest.json', 'world', (done, total) => {
+    world.done = done;
+    world.total = total;
+    world.onChange?.();
+  })
+    .catch(() => {})
+    .finally(() => {
+      world.finished = true;
+      world.onChange?.();
+    });
 }
 
 /// `window.__wenilla_progress(stage)` — the client's calls land here (webprogress.rs).
 ///
-/// `ready` also starts the SECOND prefetch: the world-entry read-set. Entering the world used
-/// to be one frozen frame of ~200 synchronous sprite reads (184 `Interface\…\*.blp` on the
-/// first UI draw, plus a few quest-marker models and zone sounds) — 206 s on a cold 100 ms-RTT
-/// cache. That set is location-independent, so `world-manifest.json` (captured the same way
-/// as the boot manifest, minus the boot set) is warmed while the player is at the glue screens,
-/// with a corner line so it is visible but never in the way. Whatever is still in flight when
-/// they click Enter World just loads the old way.
+/// `ready` switches the store to learning world-entry misses, and shows the SECOND prefetch —
+/// the world-entry read-set, started after the boot set — in a corner line while it is still
+/// running. Entering the world used to be one frozen frame of hundreds of synchronous reads (the
+/// FrameXML files and their sprites on the first UI draw, the spell and item tables). That set
+/// is `world-manifest.json` (captured the same way as the boot manifest, minus the boot set) plus
+/// what earlier visits learned; whatever is still in flight when the player clicks Enter World
+/// just loads the old way.
 function installProgressHook(ui, skipPrefetch) {
   window.__wenilla_progress = (stage) => {
     if (stage === 'startup') ui.setStage('Loading interface…');
     else if (stage === 'ready') {
       ui.hide();
-      if (!skipPrefetch) {
+      window.__wenilla_data?.setPhase('world');
+      if (!skipPrefetch && !world.finished) {
         const corner = createCornerLine();
-        prefetchManifest('./world-manifest.json', (done, total) =>
-          corner.set(total > 0 && done < total ? `preparing world data — ${done}/${total}` : '')
-        )
-          .catch(() => {})
-          .finally(() => corner.remove());
+        world.onChange = () => {
+          if (world.finished) {
+            world.onChange = null;
+            corner.remove();
+          } else {
+            corner.set(world.total > 0 ? `preparing world data — ${world.done}/${world.total}` : '');
+          }
+        };
+        world.onChange();
       }
     }
   };

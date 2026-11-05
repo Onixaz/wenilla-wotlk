@@ -71,11 +71,8 @@ pub const MPQ_SOURCE: &str = "mpq";
 #[derive(Clone)]
 pub struct MpqAssetReader {
     // On `wasm32` this field is written (by `open`, so a caller building one behaves identically
-    // on both targets) but never read: `read` below talks to the web host directly with an async
-    // `fetch` rather than through `Chain`'s synchronous `XMLHttpRequest`, because `AssetReader` is
-    // already async everywhere Bevy calls it and blocking the main thread inside an `async fn`
-    // would be silly when it doesn't have to (`Chain::read`'s sync XHR exists for the ~60 call
-    // sites that read the chain synchronously off the main thread, which this isn't one of).
+    // on both targets) but never read: `read` below fetches asynchronously through the page's
+    // data store rather than `Chain::read`'s synchronous `XMLHttpRequest`.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     chain: Arc<Chain>,
 }
@@ -108,11 +105,14 @@ impl AssetReader for MpqAssetReader {
         Ok(VecReader::new(bytes))
     }
 
-    // The web target has no filesystem, so there is no `Chain::contains` pre-check to make cheaply
-    // — a fetch is the only way to find out either answer, so `read` just does the one fetch and
-    // turns a 404 into `NotFound` (see `wasm_fetch`).
+    // The web target reads through the page's data store (`benilla_formats::web::load`): the
+    // name index answers absence without a round trip, a read joins a fetch already in flight or
+    // takes bytes fetched ahead, and the bytes it gets have their own reads fetched ahead at once
+    // (`web::expand`), so a loader's serial reads after it (a WMO's groups, an M2's skin and
+    // `.anim` files, an ADT's layer textures) are one round trip, not one each.
     #[cfg(target_arch = "wasm32")]
     async fn read<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
+        use benilla_formats::web;
         let raw = path
             .to_str()
             .ok_or_else(|| AssetReaderError::NotFound(path.to_path_buf()))?;
@@ -120,17 +120,29 @@ impl AssetReader for MpqAssetReader {
         // archive name the web host resolves.
         let stripped = strip_sampler_marker(raw);
         let internal = stripped.as_deref().unwrap_or(raw);
-        let url = format!(
-            "{}/{}",
-            benilla_formats::web::data_base(),
-            benilla_formats::web::encode_name(internal)
-        );
-        let bytes = wasm_fetch(&url).await.map_err(|e| match e {
-            WasmFetchError::NotFound => AssetReaderError::NotFound(path.to_path_buf()),
-            WasmFetchError::Other(msg) => {
-                AssetReaderError::Io(Arc::new(std::io::Error::other(msg)))
-            }
-        })?;
+        // The index, not `Chain::url_for_name`: that one feeds the boot trace, which records the
+        // synchronous reads alone.
+        if web::index_has(internal) == Some(false) {
+            return Err(AssetReaderError::NotFound(path.to_path_buf()));
+        }
+        let io = |msg: String| AssetReaderError::Io(Arc::new(std::io::Error::other(msg)));
+        let bytes = match web::load(internal, true, false).await {
+            Some(Ok(Some(bytes))) => bytes,
+            Some(Ok(None)) => return Err(AssetReaderError::NotFound(path.to_path_buf())),
+            Some(Err(msg)) => return Err(io(msg)),
+            // A page without the store: one plain fetch, as before it existed.
+            None => wasm_fetch(&format!(
+                "{}/{}",
+                web::data_base(),
+                web::encode_name(&web::index_key(internal))
+            ))
+            .await
+            .map_err(|e| match e {
+                WasmFetchError::NotFound => AssetReaderError::NotFound(path.to_path_buf()),
+                WasmFetchError::Other(msg) => io(msg),
+            })?,
+        };
+        web::expand(internal, &bytes);
         Ok(VecReader::new(bytes))
     }
 

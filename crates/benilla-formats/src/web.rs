@@ -3,9 +3,16 @@
 //! companion web host (`wenilla-host`, Lane H) serves — `GET {origin}/data/{encoded name}`,
 //! `HEAD` for existence, `GET /data/__index` for the name list. This module is that HTTP shim.
 //!
-//! [`encode_name`] is plain string math with no browser dependency, so it is exercised natively
-//! (`tests/web_names.rs`); [`data_base`], [`fetch_sync`], and [`exists_sync`] need `web-sys` and
-//! only make sense — and only compile their bodies — on `wasm32`.
+//! Every read goes through the page's data store first (`web/datastore.js`,
+//! `window.__wenilla_data`), which holds bytes fetched ahead: a synchronous read the store can
+//! answer never becomes a synchronous `XMLHttpRequest`, and an asynchronous one joins a fetch
+//! already in flight. `expand` is what fills it as the world streams: the moment a file's bytes
+//! arrive, the names its loader reads next ([`crate::web_deps`]) are fetched ahead, so a loader's
+//! serial reads (a WMO's groups, an M2's skin and `.anim` files) land in one round trip.
+//!
+//! [`encode_name`] and [`index_key`] are plain string math with no browser dependency, so they
+//! are exercised natively (`tests/web_names.rs`); everything else needs `web-sys` and only
+//! compiles its body on `wasm32` ([`prefetch_parents`] is a no-op elsewhere).
 
 /// Percent-encode `name` exactly like JavaScript's `encodeURIComponent`: the unreserved set is
 /// `A-Za-z0-9-_.!~*'()`; every other byte, including `\` (chain names are internally
@@ -26,6 +33,18 @@ pub fn encode_name(name: &str) -> String {
     }
     out
 }
+
+/// The chain's key for a name, as the MPQ hash matches names: any case, `/` ≡ `\`. Both the name
+/// index and the URLs use it, so every spelling of one file is one HTTP cache entry and one store
+/// entry (`dataKey` in `web/datastore.js` is its twin).
+pub fn index_key(name: &str) -> String {
+    name.replace('/', "\\").to_ascii_lowercase()
+}
+
+/// Fetch `names` ahead, each with whatever its loader reads after it, walked as their bytes land
+/// (the page's `expand`): the terrain streamer's tiles ahead of the viewer. Nothing off the page.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn prefetch_parents<I: IntoIterator<Item = String>>(_names: I) {}
 
 #[cfg(target_arch = "wasm32")]
 mod wasm {
@@ -124,7 +143,173 @@ mod wasm {
     fn js_err(e: JsValue) -> std::io::Error {
         std::io::Error::other(format!("{e:?}"))
     }
+
+    /// The page's data store, `window.__wenilla_data` (`web/datastore.js`): its object and the
+    /// three methods the client calls, looked up once. `None` on a page that predates it, where
+    /// every read takes the path it took before the store existed.
+    struct Store {
+        obj: JsValue,
+        get: js_sys::Function,
+        load: js_sys::Function,
+        prefetch: js_sys::Function,
+    }
+
+    thread_local! {
+        static STORE: std::cell::OnceCell<Option<Store>> = const { std::cell::OnceCell::new() };
+        /// The chain's name index (`GET /data/__index`), shared by every `Chain`; `None` inside
+        /// when it could not be fetched or parsed, and callers fall back to asking per name.
+        static INDEX: std::cell::OnceCell<Option<std::collections::HashSet<String>>> =
+            const { std::cell::OnceCell::new() };
+        /// Parents [`expand`] has walked lately, so one model on forty tiles is walked once.
+        static WALKED: std::cell::RefCell<std::collections::HashSet<String>> =
+            std::cell::RefCell::new(std::collections::HashSet::new());
+    }
+
+    /// How many parents [`WALKED`] remembers before it starts over: a revisited area walks again.
+    const WALKED_MAX: usize = 8192;
+
+    fn with_store<R>(f: impl FnOnce(&Store) -> R) -> Option<R> {
+        use wasm_bindgen::JsCast;
+        STORE.with(|cell| {
+            cell.get_or_init(|| {
+                let window = web_sys::window()?;
+                let obj = js_sys::Reflect::get(&window, &"__wenilla_data".into()).ok()?;
+                if !obj.is_object() {
+                    return None;
+                }
+                let method = |name: &str| -> Option<js_sys::Function> {
+                    js_sys::Reflect::get(&obj, &name.into())
+                        .ok()?
+                        .dyn_into()
+                        .ok()
+                };
+                Some(Store {
+                    get: method("get")?,
+                    load: method("load")?,
+                    prefetch: method("prefetch")?,
+                    obj,
+                })
+            })
+            .as_ref()
+            .map(f)
+        })
+    }
+
+    /// The store's bytes for `name` if they are in memory now, without a request; `consume`
+    /// drops the store's copy. A miss is recorded by the store, which fetches the name ahead on
+    /// the next visit.
+    pub fn resident(name: &str, consume: bool) -> Option<Vec<u8>> {
+        use wasm_bindgen::JsCast;
+        with_store(|s| {
+            let v = s
+                .get
+                .call2(&s.obj, &name.into(), &JsValue::from_bool(consume))
+                .ok()?;
+            Some(v.dyn_into::<js_sys::Uint8Array>().ok()?.to_vec())
+        })
+        .flatten()
+    }
+
+    /// Read `name` through the store: from memory, a fetch already in flight, the persistent
+    /// cache, or the network. `high` is a reader waiting on it; `keep` leaves the bytes in the
+    /// store for a later reader. `None` without a store; `Ok(None)` when the host has no such file.
+    pub async fn load(
+        name: &str,
+        high: bool,
+        keep: bool,
+    ) -> Option<Result<Option<Vec<u8>>, String>> {
+        use wasm_bindgen::JsCast;
+        let promise = with_store(|s| {
+            let opts = js_sys::Object::new();
+            let priority = if high { "high" } else { "low" };
+            let _ = js_sys::Reflect::set(&opts, &"priority".into(), &priority.into());
+            let _ = js_sys::Reflect::set(&opts, &"keep".into(), &JsValue::from_bool(keep));
+            s.load.call2(&s.obj, &name.into(), &opts)
+        })?;
+        let promise: js_sys::Promise = match promise.map(JsCast::dyn_into) {
+            Ok(Ok(p)) => p,
+            Ok(Err(v)) | Err(v) => return Some(Err(format!("{name}: store.load: {v:?}"))),
+        };
+        Some(match wasm_bindgen_futures::JsFuture::from(promise).await {
+            Ok(v) if v.is_null() => Ok(None),
+            Ok(v) => v
+                .dyn_into::<js_sys::Uint8Array>()
+                .map(|a| Some(a.to_vec()))
+                .map_err(|v| format!("{name}: store.load gave {v:?}")),
+            Err(e) => Err(format!("{name}: {e:?}")),
+        })
+    }
+
+    /// Fetch `names` ahead into the store at low priority, without waiting.
+    fn prefetch(names: &[String]) {
+        if names.is_empty() {
+            return;
+        }
+        with_store(|s| {
+            let arr: js_sys::Array = names.iter().map(|n| JsValue::from_str(n)).collect();
+            let _ = s.prefetch.call1(&s.obj, &arr);
+        });
+    }
+
+    /// Whether the chain has `name`, from the shared name index: `None` when there is no index.
+    /// The index arrives through the store when the page fetched it ahead (it is ~12 MB of JSON,
+    /// which a synchronous request would hold the thread for), else by one synchronous fetch.
+    pub fn index_has(name: &str) -> Option<bool> {
+        INDEX.with(|cell| {
+            cell.get_or_init(|| {
+                let bytes = match resident("__index", true) {
+                    Some(b) => b,
+                    None => fetch_sync(&format!("{}/__index", data_base())).ok()?,
+                };
+                let names: Vec<String> = serde_json::from_slice(&bytes).ok()?;
+                Some(names.iter().map(|n| super::index_key(n)).collect())
+            })
+            .as_ref()
+            .map(|set| set.contains(&super::index_key(name)))
+        })
+    }
+
+    /// Fetch ahead what `name`'s loader reads after it, from its `bytes` ([`crate::web_deps`]):
+    /// the leaves straight into the store, the parents fetched, kept and walked in turn. Names the
+    /// chain index lacks are dropped (an ADT layer's `_s` variant is only sometimes there).
+    pub fn expand(name: &str, bytes: &[u8]) {
+        let d = crate::web_deps::deps(name, bytes);
+        let leaves: Vec<String> = d
+            .leaves
+            .into_iter()
+            .filter(|n| index_has(n) != Some(false))
+            .collect();
+        prefetch(&leaves);
+        prefetch_parents(d.parents);
+    }
+
+    /// Fetch `names` ahead and walk each one's own reads as its bytes land (see [`expand`]).
+    pub fn prefetch_parents<I: IntoIterator<Item = String>>(names: I) {
+        for name in names {
+            if index_has(&name) == Some(false) || !first_walk(&name) {
+                continue;
+            }
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Some(Ok(Some(bytes))) = load(&name, false, true).await {
+                    expand(&name, &bytes);
+                }
+            });
+        }
+    }
+
+    /// Mark `name` walked; false when it already was.
+    fn first_walk(name: &str) -> bool {
+        WALKED.with(|w| {
+            let mut w = w.borrow_mut();
+            if w.len() >= WALKED_MAX {
+                w.clear();
+            }
+            w.insert(super::index_key(name))
+        })
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use wasm::{data_base, exists_sync, fetch_sync, trace};
+pub use wasm::{
+    data_base, exists_sync, expand, fetch_sync, index_has, load, prefetch_parents, resident, trace,
+};
