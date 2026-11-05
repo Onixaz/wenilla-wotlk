@@ -38,6 +38,21 @@ const RESTART_S: f64 = 0.02;
 /// The refill interval, milliseconds.
 const PUMP_MS: i32 = 5;
 
+thread_local! {
+    /// The running queue's context and cursor, for [`queued_secs`].
+    static QUEUE: RefCell<Option<(AudioContext, f64)>> = const { RefCell::new(None) };
+}
+
+/// How much rendered mix is queued ahead of what is heard now, seconds: the rendered position
+/// of a sound runs this far ahead of its audible one. 0 with no running queue.
+pub(super) fn queued_secs() -> f64 {
+    QUEUE.with(|q| {
+        q.borrow()
+            .as_ref()
+            .map_or(0.0, |(ctx, cursor)| (cursor - ctx.current_time()).max(0.0))
+    })
+}
+
 /// The renderer and the queue it feeds.
 struct Scheduler {
     ctx: AudioContext,
@@ -69,17 +84,22 @@ impl Scheduler {
                     "audio: output ran dry {:.0} ms ago (underrun {}) — restarted, queue now {:.0} ms",
                     (now - self.cursor) * 1000.0,
                     self.underruns,
-                    self.lead.secs * 1000.0,
+                    self.lead.target() * 1000.0,
                 );
                 self.cursor = now + RESTART_S;
             }
         }
-        while self.cursor < now + self.lead.secs {
+        while self.cursor < now + self.lead.target() {
             if let Err(e) = self.queue_chunk(refill) {
                 bevy::log::warn!("audio: queueing a chunk failed: {e:?}");
-                return;
+                break;
             }
         }
+        let cursor = self.cursor;
+        QUEUE.with(|q| match &mut *q.borrow_mut() {
+            Some((_, c)) => *c = cursor,
+            slot => *slot = Some((self.ctx.clone(), cursor)),
+        });
     }
 
     fn queue_chunk(&mut self, refill: &js_sys::Function) -> Result<(), wasm_bindgen::JsValue> {
@@ -121,6 +141,17 @@ enum State {
 /// kira's [`Backend`] over the page's `AudioContext`.
 pub(super) struct WebBackend {
     state: State,
+}
+
+impl WebBackend {
+    /// Hold the deep queue while a loading cover is up ([`super::web_queue::HOLD_LEAD_S`]).
+    pub(super) fn set_hold(&mut self, hold: bool) {
+        if let State::Running { scheduler, .. } = &self.state {
+            if let Ok(mut s) = scheduler.try_borrow_mut() {
+                s.lead.set_hold(hold);
+            }
+        }
+    }
 }
 
 impl Backend for WebBackend {

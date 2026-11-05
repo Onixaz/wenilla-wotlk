@@ -199,6 +199,24 @@ fn feed_world_hold(
     }
 }
 
+/// On the page, hold the deep audio queue while the loading cover is up: the mix is rendered on
+/// the page's one thread, which a world load stalls for longer than the in-world queue covers.
+#[cfg(target_arch = "wasm32")]
+fn feed_web_queue_hold(
+    mut out: NonSendMut<SoundOutput>,
+    config: Res<SoundConfig>,
+    mut last: Local<Option<bool>>,
+) {
+    if *last == Some(config.world_hold) {
+        return;
+    }
+    let Some(mixer) = out.mixer.as_mut() else {
+        return;
+    };
+    *last = Some(config.world_hold);
+    mixer.hold_web_queue(config.world_hold);
+}
+
 /// Shut the output while the window is unfocused, unless [`SoundConfig::background_sound`].
 /// A missing window opens the gate. The `Local` makes it fire on the edge only: a tween re-issued
 /// every frame would restart the 16 ms ramp forever.
@@ -505,6 +523,8 @@ impl Plugin for SoundPlugin {
         reverb::plugin(app);
         interior::plugin(app);
         sheathe::plugin(app);
+        #[cfg(target_arch = "wasm32")]
+        app.add_systems(PreUpdate, feed_web_queue_hold.after(feed_world_hold));
     }
 }
 

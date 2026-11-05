@@ -586,6 +586,12 @@ pub(crate) struct MixHealth {
 
 impl Mixer {
     /// Service the output backend and fold its window into the health counters, every frame.
+    /// Hold the page's deep audio queue while a loading cover is up (`web_queue::HOLD_LEAD_S`).
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn hold_web_queue(&mut self, hold: bool) {
+        self.manager.backend_mut().set_hold(hold);
+    }
+
     pub(crate) fn poll_health(&mut self) -> MixHealth {
         // The owned device layer reports all of this itself; on wasm32 (`MixBackend`) there is
         // no such backend to ask, so that arm reports nothing at all.
@@ -864,12 +870,22 @@ impl StreamWatch {
     pub(crate) fn feed(&mut self, handle: &StreamingSoundHandle<FromFileError>, dt: f64) {
         use kira::sound::PlaybackState as S;
         let audible = matches!(handle.state(), S::Playing | S::Stopping);
-        match self.observe(
-            audible,
-            handle.position(),
-            dt,
-            bevy::platform::time::Instant::now(),
-        ) {
+        let position = handle.position();
+        // On the page the mix is rendered ahead into a queue whose depth moves (a loading cover
+        // holds seconds of it, then drains it), so the rendered position runs ahead of what is
+        // heard by the queue: measure what is heard. A step back inside the queue's rounding is
+        // held, not read as a new stream.
+        #[cfg(target_arch = "wasm32")]
+        let position = {
+            let heard = position - super::web_backend::queued_secs();
+            match self.phase {
+                Phase::Running { last_pos, .. } if heard < last_pos && last_pos - heard < 0.1 => {
+                    last_pos
+                }
+                _ => heard,
+            }
+        };
+        match self.observe(audible, position, dt, bevy::platform::time::Instant::now()) {
             Some(Verdict::Starved {
                 lost,
                 counted,
@@ -988,7 +1004,10 @@ impl StreamWatch {
                 let (counted, advanced) = (self.expected, self.advanced);
                 let span = now.duration_since(window_start).as_secs_f64();
                 self.begin(pos, now);
-                let lost = counted - advanced;
+                // The frame deltas are stamped at each frame's start and the window at the
+                // system's run, so they disagree by the frames' work before it (on the page, up
+                // to a whole stalled frame): the shorter of the two is the time that surely passed.
+                let lost = counted.min(span) - advanced;
                 (lost > STREAM_STARVED_MIN_SECS).then_some(Verdict::Starved {
                     lost,
                     counted,
@@ -1540,6 +1559,32 @@ pub(super) mod tests {
             );
             pos += dt;
         }
+    }
+
+    /// Frame deltas that overshoot the window's wall span (the deltas stamped at frame start, the
+    /// window after a heavy frame's work) are not silence when the stream kept pace with the wall.
+    #[test]
+    fn stream_watch_does_not_read_a_clock_offset_as_silence() {
+        let t0 = bevy::platform::time::Instant::now();
+        let mut w = StreamWatch::new("test");
+        assert!(w.observe(true, 0.0, 0.3, wall(t0, 0.0)).is_none());
+        assert!(matches!(
+            w.observe(true, 0.01, 0.3, wall(t0, 0.01)),
+            Some(Verdict::Began { .. })
+        ));
+        // Four 300 ms frames whose deltas count 1.2 s while 0.9 s of wall time, and of stream,
+        // passed in the window.
+        let mut reports = Vec::new();
+        for i in 1..=4 {
+            let t = 0.01 + 0.225 * f64::from(i);
+            if let Some(v) = w.observe(true, t, 0.3, wall(t0, t)) {
+                reports.push(v);
+            }
+        }
+        assert!(
+            !reports.iter().any(|v| matches!(v, Verdict::Starved { .. })),
+            "a stream that kept pace with the wall clock is not starved"
+        );
     }
 
     /// A 298 ms hitch at the head of a window, the stream frozen through it, is both counted and

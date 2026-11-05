@@ -11,6 +11,11 @@ const MAX_LEAD_S: f64 = 0.5;
 const SHRINK_AFTER_S: f64 = 2.0;
 /// One shrink step, seconds.
 const SHRINK_STEP_S: f64 = 0.01;
+/// The queue held under a loading cover, seconds. The reference plays the glue music through the
+/// world's load (`StopGlueMusic(3.0f)` fades it only once the load drains, `0x4db91f`), and a load
+/// stalls the page's thread for longer than any in-world hitch; behind the cover a late sound
+/// costs nothing, a cut in the music does.
+pub(super) const HOLD_LEAD_S: f64 = 2.0;
 
 /// The queue's depth policy, apart from Web Audio so it is testable natively.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -19,6 +24,8 @@ pub(super) struct Lead {
     pub(super) secs: f64,
     /// When `secs` last changed, on the context clock.
     since: f64,
+    /// A loading cover is up: the queue holds at least [`HOLD_LEAD_S`].
+    hold: bool,
 }
 
 /// What a refill does before it renders.
@@ -37,7 +44,23 @@ impl Lead {
         Self {
             secs: MIN_LEAD_S,
             since: now,
+            hold: false,
         }
+    }
+
+    /// The queue to keep ahead of the clock now, seconds.
+    pub(super) fn target(&self) -> f64 {
+        if self.hold {
+            self.secs.max(HOLD_LEAD_S)
+        } else {
+            self.secs
+        }
+    }
+
+    /// Raise or drop the cover's floor. Dropping it leaves the in-world depth as it was; what the
+    /// cover queued drains as it plays.
+    pub(super) fn set_hold(&mut self, hold: bool) {
+        self.hold = hold;
     }
 
     /// Classify a refill at `now` with the cursor at `cursor` (0 before the first chunk), and
@@ -47,8 +70,11 @@ impl Lead {
             return Refill::Start;
         }
         if cursor <= now {
-            self.secs = (self.secs * 2.0).min(MAX_LEAD_S);
-            self.since = now;
+            // A stall under the cover says nothing about the world's: it leaves the depth alone.
+            if !self.hold {
+                self.secs = (self.secs * 2.0).min(MAX_LEAD_S);
+                self.since = now;
+            }
             return Refill::Underrun;
         }
         if now - self.since >= SHRINK_AFTER_S && self.secs > MIN_LEAD_S {
@@ -62,6 +88,20 @@ impl Lead {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cover_holds_a_deep_queue_and_leaves_the_world_depth_alone() {
+        let mut lead = Lead::new(0.0);
+        lead.set_hold(true);
+        assert_eq!(lead.target(), HOLD_LEAD_S);
+        assert_eq!(lead.refill(5.0, 4.0), Refill::Underrun);
+        assert_eq!(
+            lead.secs, MIN_LEAD_S,
+            "a stall under the cover does not deepen the world's"
+        );
+        lead.set_hold(false);
+        assert_eq!(lead.target(), MIN_LEAD_S);
+    }
 
     #[test]
     fn the_first_refill_starts_the_cursor() {
