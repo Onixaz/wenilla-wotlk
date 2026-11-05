@@ -4,7 +4,7 @@ import test from 'node:test';
 
 const source = (await readFile(new URL('../boot.js', import.meta.url), 'utf8'))
   .replaceAll('import.meta.url', JSON.stringify(new URL('../boot.js', import.meta.url).href));
-const { boot } = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
+const { boot, missingWebGpu } = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
 const wasmBytes = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]);
 const deferred = () => {
   let resolve;
@@ -22,7 +22,7 @@ function setup(t, fetch) {
     },
   });
   for (const [key, value] of Object.entries({
-    fetch, location: { search: '' }, window: {},
+    fetch, location: { search: '' }, window: {}, navigator: { gpu: {} },
     document: { createElement: element, body: { appendChild() {} } },
     setTimeout: () => 0, clearTimeout: () => {},
   })) {
@@ -79,4 +79,34 @@ test('invalid wasm reports compilation failure and never starts the client', asy
     new Response('invalid', { headers: { 'content-type': 'application/wasm' } }));
   await assert.rejects(boot(() => assert.fail('must not initialize')), WebAssembly.CompileError);
   assert.match(children.get('.stage').textContent, /client failed to start/);
+});
+
+test('a WebGPU build without navigator.gpu says why, by cause', async t => {
+  const set = (key, value) => {
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, key);
+    Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
+    t.after(() => descriptor ? Object.defineProperty(globalThis, key, descriptor) : delete globalThis[key]);
+  };
+  set('location', { origin: 'http://192.168.1.231:8090', search: '' });
+  set('navigator', {});
+  set('isSecureContext', false);
+  assert.match(missingWebGpu(), /secure page.*192\.168\.1\.231:8090.*unsafely-treat-insecure-origin-as-secure/);
+  set('isSecureContext', true);
+  assert.match(missingWebGpu(), /WebGPU turned off.*chrome:\/\/gpu/);
+  set('document', { querySelector: () => ({ content: 'webgl2' }) });
+  assert.equal(missingWebGpu(), null, 'a WebGL2 build does not need it');
+  set('document', { querySelector: () => null });
+  set('navigator', { gpu: {} });
+  assert.equal(missingWebGpu(), null);
+});
+
+test('boot stops before any download when WebGPU is missing', async t => {
+  const fetched = [];
+  const children = setup(t, async url => { fetched.push(String(url)); return new Response(''); });
+  Object.defineProperty(globalThis, 'navigator', { configurable: true, writable: true, value: {} });
+  Object.defineProperty(globalThis, 'isSecureContext', { configurable: true, writable: true, value: false });
+  t.after(() => { delete globalThis.isSecureContext; });
+  await assert.rejects(boot(() => assert.fail('must not initialize')), /secure page/);
+  assert.deepEqual(fetched, []);
+  assert.match(children.get('.stage').textContent, /secure page/);
 });

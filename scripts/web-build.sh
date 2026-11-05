@@ -35,6 +35,9 @@ strip=(--remove-name-section --remove-producers-section)
 [ "${WEB_DEBUG:-0}" = 1 ] && strip=()
 wasm-bindgen --target web --no-typescript "${strip[@]}" --out-dir "${DIST}" "${WASM}"
 cp web/index.html web/wasi_stubs.js web/boot.js web/datastore.js web/platform.js web/bridge.js "${DIST}/"
+# The page says which backend it was built for, so boot.js knows whether to require WebGPU.
+sed -i.bak "s#<meta charset=\"utf-8\">#&<meta name=\"wenilla-backend\" content=\"${BACKEND}\">#" "${DIST}/index.html"
+rm -f "${DIST}/index.html.bak"
 # The bridge examples (web/README.md § "JavaScript bridge"): a HUD, an idle loop.
 mkdir -p "${DIST}/examples" && cp web/examples/*.js "${DIST}/examples/"
 # The boot prefetch manifest (see web/boot.js) — optional so a tree that hasn't captured one

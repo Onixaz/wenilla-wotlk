@@ -34,6 +34,13 @@ const READY_TIMEOUT_MS = 20000;
 export async function boot(init, opts = {}) {
   const q = new URLSearchParams(location.search);
   const ui = createBootUi();
+  // Without WebGPU the client panics creating its surface and the page stays black: say why
+  // before downloading anything.
+  const missing = missingWebGpu();
+  if (missing) {
+    ui.fail(missing);
+    throw new Error(missing);
+  }
   if (q.get('boottrace') === '1') window.__wenilla_boottrace = [];
   const skipPrefetch = q.get('boottrace') === '1' || q.get('noprefetch') === '1';
   installProgressHook(ui, skipPrefetch);
@@ -116,6 +123,25 @@ async function fetchWasm(url, onBytes) {
   // Headers are copied so Content-Type: application/wasm survives — compileStreaming
   // refuses anything else.
   return new Response(counted, { status: r.status, statusText: r.statusText, headers: r.headers });
+}
+
+/// Why this build cannot draw here, or `null`: a WebGPU build (`web-build.sh` stamps the backend
+/// into the page) needs `navigator.gpu`, which browsers only expose to a secure context — https,
+/// or `localhost` — and which a browser can still turn off for a GPU.
+export function missingWebGpu() {
+  const backend = globalThis.document?.querySelector?.('meta[name="wenilla-backend"]')?.content;
+  if (backend === 'webgl2' || globalThis.navigator?.gpu) return null;
+  if (globalThis.isSecureContext === false) {
+    return (
+      `WebGPU needs a secure page, and ${location.origin} is not one. Open it over https ` +
+      '(see web/README.md, "Over https"), or from this machine as http://localhost. ' +
+      'For testing, Chrome can allow this address: chrome://flags/#unsafely-treat-insecure-origin-as-secure.'
+    );
+  }
+  return (
+    'This browser has WebGPU turned off (or not for this GPU): see chrome://gpu, or ' +
+    'chrome://flags/#enable-unsafe-webgpu. It needs Chrome or Edge, or Safari 26+.'
+  );
 }
 
 /// The page's data store, created once (datastore.js). Loaded by URL so the module resolves
