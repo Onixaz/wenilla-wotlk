@@ -99,6 +99,10 @@ public deployment belongs behind a login (`wenilla-realm`), not this host.
   themselves), renders its own play page that fetches the player's hidden game credentials over
   the session and hands them to the client through `window.__wenilla_env`, and adds an admin
   panel for the server. The packaged one-VM deployment is github.com/Arnesen/wenilla-realm.
+- **Music** — music, ambience beds and narration are played by the browser itself (native Web
+  Audio voices, `sound::web_voice`), so a stall of the page (a world load, a shader compile) never
+  pauses them; sound effects are mixed on the page and queued a little ahead
+  (`sound::web_backend`). The output limiter and level meters do not see the music.
 - **Sound** starts on the first click or key in the page — browsers suspend every AudioContext
   until a user gesture; `index.html` resumes it then.
 - **Full screen** — the "full screen" button on both pages (`web/platform.js`) is not just

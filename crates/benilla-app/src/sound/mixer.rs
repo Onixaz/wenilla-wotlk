@@ -82,17 +82,22 @@ impl<Error> StreamingSoundData<Error> {
     }
 }
 
+/// wasm32's stream handle: a native Web Audio voice (`web_voice`), which the browser plays on its
+/// own audio thread, so no stall of the page cuts it. The methods are the [`StaticSoundHandle`]
+/// subset the callers use, with kira's meanings.
 #[cfg(target_arch = "wasm32")]
-pub(crate) struct StreamingSoundHandle<Error>(StaticSoundHandle, std::marker::PhantomData<Error>);
+pub(crate) struct StreamingSoundHandle<Error>(
+    super::web_voice::NativeVoice,
+    std::marker::PhantomData<Error>,
+);
 
 #[cfg(target_arch = "wasm32")]
 impl<Error> StreamingSoundHandle<Error> {
-    /// The [`StaticSoundHandle`] methods this module and its callers actually use — the
-    /// full control surface (`pause`/`seek_to`/`set_loop_region`/…) is identical between kira's
-    /// static and streaming handles (both expand the same `handle_param_setters!` macro), so
-    /// forwarding grows here the moment a caller needs more.
+    /// A fixed volume, ramped over the tween; the callers only ever pass fixed ones.
     pub(crate) fn set_volume(&mut self, volume: impl Into<kira::Value<Decibels>>, tween: Tween) {
-        self.0.set_volume(volume, tween);
+        if let kira::Value::Fixed(db) = volume.into() {
+            self.0.set_volume(db, tween.duration.as_secs_f64());
+        }
     }
     pub(crate) fn state(&self) -> kira::sound::PlaybackState {
         self.0.state()
@@ -101,15 +106,15 @@ impl<Error> StreamingSoundHandle<Error> {
         self.0.position()
     }
     pub(crate) fn stop(&mut self, tween: Tween) {
-        self.0.stop(tween);
+        self.0.stop(tween.duration.as_secs_f64());
     }
     pub(crate) fn pause(&mut self, tween: Tween) {
-        self.0.pause(tween);
+        self.0.pause(tween.duration.as_secs_f64());
     }
     pub(crate) fn resume(&mut self, tween: Tween) {
-        self.0.resume(tween);
+        self.0.resume(tween.duration.as_secs_f64());
     }
-    /// A static sound has no decoder to fail mid-play, so there is never an error to report.
+    /// A decoded sound has no decoder to fail mid-play, so there is never an error to report.
     pub(crate) fn pop_error(&mut self) -> Option<Error> {
         None
     }
@@ -187,6 +192,9 @@ pub(crate) struct Mixer {
     audio_pos: Option<Arc<AtomicU64>>,
     /// The device's negotiated sample rate, the health report's time axis.
     sample_rate: Option<u32>,
+    /// wasm32: the bus the native stream voices play into (`web_voice`).
+    #[cfg(target_arch = "wasm32")]
+    music_bus: Option<super::web_voice::MusicBus>,
 }
 
 impl Mixer {
@@ -259,6 +267,16 @@ impl Mixer {
                 },
             )
             .map_err(|e| anyhow::anyhow!("listener alloc: {e}"))?;
+        #[cfg(target_arch = "wasm32")]
+        let music_bus = manager.backend_mut().context().and_then(|ctx| {
+            match super::web_voice::MusicBus::new(ctx) {
+                Ok(bus) => Some(bus),
+                Err(e) => {
+                    warn!("audio: no music bus: {e}");
+                    None
+                }
+            }
+        });
         Ok(Self {
             manager,
             listener,
@@ -273,6 +291,8 @@ impl Mixer {
             output,
             sample_rate,
             audio_pos,
+            #[cfg(target_arch = "wasm32")]
+            music_bus,
         })
     }
 
@@ -342,11 +362,19 @@ impl Mixer {
     /// Master volume as linear amplitude: the first effect in the main chain.
     pub(crate) fn set_master(&mut self, amp: f32) {
         self.master.set_volume(amp_to_db(amp), glide());
+        #[cfg(target_arch = "wasm32")]
+        if let Some(bus) = self.music_bus.as_mut() {
+            bus.set_master(amp);
+        }
     }
 
     /// Open or shut the output gate, the reference's `FSOUND_SetMute(FSOUND_ALL, …)` on window
     /// activation; its mute is instant, the glide only de-clicks.
     pub(super) fn set_output_gate(&mut self, open: bool) {
+        #[cfg(target_arch = "wasm32")]
+        if let Some(bus) = self.music_bus.as_mut() {
+            bus.set_open(open);
+        }
         self.output.set_volume(
             if open {
                 Decibels::IDENTITY
@@ -468,17 +496,20 @@ impl Mixer {
     }
 
     /// wasm32 twin: `data` is already a fully-decoded [`StaticSoundData`] wearing the streaming
-    /// name (see [`StreamingSoundData`]'s doc) — play it as one and re-wrap the handle.
+    /// name (see [`StreamingSoundData`]'s doc); the browser plays it as a native voice.
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn play_stream(
         &mut self,
         data: StreamingSoundData<FromFileError>,
     ) -> Result<StreamingSoundHandle<FromFileError>> {
-        let handle = self
-            .manager
+        let bus = self
+            .music_bus
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("play stream: no music bus"))?;
+        let voice = bus
             .play(data.0)
             .map_err(|e| anyhow::anyhow!("play stream: {e}"))?;
-        Ok(StreamingSoundHandle(handle, std::marker::PhantomData))
+        Ok(StreamingSoundHandle(voice, std::marker::PhantomData))
     }
 }
 
@@ -586,12 +617,6 @@ pub(crate) struct MixHealth {
 
 impl Mixer {
     /// Service the output backend and fold its window into the health counters, every frame.
-    /// Hold the page's deep audio queue while a loading cover is up (`web_queue::HOLD_LEAD_S`).
-    #[cfg(target_arch = "wasm32")]
-    pub(crate) fn hold_web_queue(&mut self, hold: bool) {
-        self.manager.backend_mut().set_hold(hold);
-    }
-
     pub(crate) fn poll_health(&mut self) -> MixHealth {
         // The owned device layer reports all of this itself; on wasm32 (`MixBackend`) there is
         // no such backend to ask, so that arm reports nothing at all.
@@ -871,20 +896,6 @@ impl StreamWatch {
         use kira::sound::PlaybackState as S;
         let audible = matches!(handle.state(), S::Playing | S::Stopping);
         let position = handle.position();
-        // On the page the mix is rendered ahead into a queue whose depth moves (a loading cover
-        // holds seconds of it, then drains it), so the rendered position runs ahead of what is
-        // heard by the queue: measure what is heard. A step back inside the queue's rounding is
-        // held, not read as a new stream.
-        #[cfg(target_arch = "wasm32")]
-        let position = {
-            let heard = position - super::web_backend::queued_secs();
-            match self.phase {
-                Phase::Running { last_pos, .. } if heard < last_pos && last_pos - heard < 0.1 => {
-                    last_pos
-                }
-                _ => heard,
-            }
-        };
         match self.observe(audible, position, dt, bevy::platform::time::Instant::now()) {
             Some(Verdict::Starved {
                 lost,

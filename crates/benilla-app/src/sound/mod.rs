@@ -53,6 +53,9 @@ mod web_backend;
 #[cfg(target_arch = "wasm32")]
 mod web_load;
 mod web_queue;
+#[cfg(target_arch = "wasm32")]
+mod web_voice;
+mod web_voice_clock;
 mod zone;
 pub(crate) use emote::EmoteSounds;
 /// First-play kit decodes so far, for the probe's tail line.
@@ -197,24 +200,6 @@ fn feed_world_hold(
     if config.world_hold != hold {
         config.world_hold = hold;
     }
-}
-
-/// On the page, hold the deep audio queue while the loading cover is up: the mix is rendered on
-/// the page's one thread, which a world load stalls for longer than the in-world queue covers.
-#[cfg(target_arch = "wasm32")]
-fn feed_web_queue_hold(
-    mut out: NonSendMut<SoundOutput>,
-    config: Res<SoundConfig>,
-    mut last: Local<Option<bool>>,
-) {
-    if *last == Some(config.world_hold) {
-        return;
-    }
-    let Some(mixer) = out.mixer.as_mut() else {
-        return;
-    };
-    *last = Some(config.world_hold);
-    mixer.hold_web_queue(config.world_hold);
 }
 
 /// Shut the output while the window is unfocused, unless [`SoundConfig::background_sound`].
@@ -523,8 +508,6 @@ impl Plugin for SoundPlugin {
         reverb::plugin(app);
         interior::plugin(app);
         sheathe::plugin(app);
-        #[cfg(target_arch = "wasm32")]
-        app.add_systems(PreUpdate, feed_web_queue_hold.after(feed_world_hold));
     }
 }
 
