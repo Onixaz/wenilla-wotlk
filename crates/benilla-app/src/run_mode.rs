@@ -232,7 +232,7 @@ pub(crate) fn fast_path() -> Option<Result<FastPath, String>> {
     let decide = || {
         resolve(
             // Through `webenv`: on the page these are the env object or the query string.
-            |key| crate::webenv::var(key),
+            crate::webenv::var,
             &declared_identities(),
             |user| crate::local_state::probe_lease_path(user).map_or(Ok(true), |p| take_lease(&p)),
         )
