@@ -307,15 +307,21 @@ impl WarmPass {
 const WARM_SETTLE_SECS: f32 = 0.25;
 /// Rigs revealed per frame. On macOS the pipeline cache drains its whole backlog in one frame,
 /// inline, so this bounds each frame's compile batch to within one 43 ms audio device cycle.
-/// `$WOW_WARM_SLICE` overrides it; 0 means unpaced.
+/// `$WOW_WARM_SLICE` (`?warm_slice=` in the browser) overrides it; 0 means unpaced.
+#[cfg(not(target_arch = "wasm32"))]
 const WARM_REVEAL_PER_FRAME: usize = 24;
+/// The browser reveals every rig at once. Its compiles run in the GPU process, the page's one
+/// thread is all the load has, and the music plays off it (`sound::web_voice`), so pacing only
+/// stretches the warm over the cover's slowest frames: a warm Goldshire login drained 2589 rigs
+/// in 7.9 s over 108 paced frames, and in 0.96 s unpaced, which clears the cover 1.0 s sooner.
+#[cfg(target_arch = "wasm32")]
+const WARM_REVEAL_PER_FRAME: usize = usize::MAX;
 
 /// The pacing slice actually in force, `$WOW_WARM_SLICE` applied once.
 fn reveal_slice() -> usize {
     static SLICE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SLICE.get_or_init(|| {
-        let n = std::env::var("WOW_WARM_SLICE")
-            .ok()
+        let n = crate::webenv::var("WOW_WARM_SLICE")
             .and_then(|v| v.parse::<usize>().ok())
             .map_or(
                 WARM_REVEAL_PER_FRAME,
@@ -424,7 +430,12 @@ fn run_warm_pass(
             &mut cache,
             &light.0,
         );
-        info!("pipeline warm: menagerie up ({count} variants, {WARM_REVEAL_PER_FRAME}/frame)");
+        let slice = reveal_slice();
+        if slice == usize::MAX {
+            info!("pipeline warm: menagerie up ({count} variants, unpaced)");
+        } else {
+            info!("pipeline warm: menagerie up ({count} variants, {slice}/frame)");
+        }
         return;
     };
     if warm.done {
