@@ -53,6 +53,45 @@ session cookie. The page derives `ws://`/`wss://` from its own origin, so any ht
 Each tab is a full independent client with its own upstream connection; players need their
 own accounts (a second login on one account kicks the first, as in the real client).
 
+### Over https: from another PC, or deployed
+
+WebGPU and the page's data cache need a secure context: `localhost`, or https. So from another
+machine, `http://<this-machine>:8090` loads but cannot draw the world; serve it over https
+instead. Keep `wenilla-host` on loopback and put a TLS proxy in front of it. With
+[Caddy](https://caddyserver.com) (`brew install caddy`), a `Caddyfile`:
+
+```
+{
+	skip_install_trust
+}
+
+https://<this machine's LAN IP>:8443 {
+	tls internal
+	reverse_proxy 127.0.0.1:8090 {
+		flush_interval -1
+	}
+}
+```
+
+`caddy run --config Caddyfile`, then open `https://<LAN IP>:8443/` on the other PC. `tls internal`
+is Caddy's own certificate authority: the browser warns once (accept it, or install Caddy's
+root, `pki/authorities/local/root.crt` under Caddy's data folder, on that PC), and
+`skip_install_trust` keeps Caddy from adding that root to this machine's keychain.
+`flush_interval -1` passes `/data/__batch`'s files through as they stream. Whatever the proxy, it
+must pass WebSocket upgrades on `/ws/*` and the `Cross-Origin-*` headers through (Caddy does both
+as is; nginx needs the `Upgrade`/`Connection` headers set and `proxy_buffering off`).
+
+Verified through `https://localhost:8443` in Chrome with the untrusted certificate allowed: a
+secure, cross-origin-isolated page, both game sockets over `wss://`, every `/data` request on
+HTTP/2, the data cache kept across visits, and loading times equal to plain `localhost`.
+
+For a deployment with a domain, Caddy fetches and renews a Let's Encrypt certificate by itself:
+point the domain's DNS at the server, open ports 80 and 443, and the site block is
+`game.example.com { reverse_proxy 127.0.0.1:8090 { flush_interval -1 } }`. A LAN address or a
+`.local` name gets no Let's Encrypt certificate; `tailscale serve` is the way to a real one there
+without exposing anything. Either way, `/data` hands your game files to whoever reaches it: a
+public deployment belongs behind a login (`wenilla-realm`), not this host.
+
 ## Things to know
 
 - **Hosting behind a login** — `crates/wenilla-realm` wraps this host's routers behind a session
