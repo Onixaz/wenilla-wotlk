@@ -35,15 +35,13 @@ use super::output::Window;
 use super::output::{self, Event, OutputBackend, OutputSettings};
 #[cfg(target_arch = "wasm32")]
 use super::web_backend::{WebBackend, WebBackendSettings};
-#[cfg(target_arch = "wasm32")]
-use cpal::traits::{DeviceTrait, HostTrait};
 
 /// **The mixer's kira backend.** Upstream's owned device layer (decision 1857) now reaches every
 /// native target — CoreAudio on macOS, cpal elsewhere (1920) — so the mixer runs on it there, and
 /// wenilla's Linux build gets the ring, the render thread and the meters like any other. The
 /// browser is the one target it cannot reach: no threads for that render loop, and no clock for
 /// its meters (`bevy::platform::time::Instant` panics on wasm32). wasm32 therefore runs kira on
-/// [`WebBackend`], Web Audio through cpal. This alias is that seam, and the only one.
+/// [`WebBackend`], Web Audio queued from the page's thread. This alias is that seam, and the only one.
 #[cfg(not(target_arch = "wasm32"))]
 type MixBackend = OutputBackend;
 #[cfg(target_arch = "wasm32")]
@@ -529,44 +527,23 @@ struct MainChain {
     audio_pos: Option<Arc<AtomicU64>>,
 }
 
-/// The device IO buffer [`WebBackend`] asks for on wasm32, in frames (decision 1026).
-/// 2048 at 48 kHz is ~43 ms — long enough that a world-entry compile burst does not starve the
-/// callback.
-#[cfg(target_arch = "wasm32")]
-const TARGET_BUFFER_FRAMES: u32 = 2048;
-
-/// Build [`WebBackend`]'s settings: the default device's config with our explicit buffer size,
-/// and the negotiated sample rate (the mix tap's WAV header must match the renderer); `None` when
-/// the device or config could not be probed, which opens the default config. [`Mixer::new`]'s
-/// caller already tolerates no device. wasm32 only — every native target builds
-/// [`OutputSettings`] for the owned backend instead.
+/// Build [`WebBackend`]'s settings: the page's `AudioContext`, made here so the mix is built for
+/// the rate it plays at (the mix tap's WAV header and the limiter's delay line are sized from it);
+/// `None` when the browser refuses one, and [`Mixer::new`]'s caller already tolerates no device.
+/// wasm32 only — every native target builds [`OutputSettings`] for the owned backend instead.
 #[cfg(target_arch = "wasm32")]
 fn backend_settings() -> (WebBackendSettings, Option<u32>) {
-    let fallback = None;
-    let Some(device) = cpal::default_host().default_output_device() else {
-        return (fallback, None);
-    };
-    let Ok(supported) = device.default_output_config() else {
-        return (fallback, None);
-    };
-    // Clamp into what the device will actually accept; `Unknown` means cpal can't tell us the
-    // range, and asking for a size outside it fails the stream build — so leave those alone.
-    let cpal::SupportedBufferSize::Range { min, max } = supported.buffer_size() else {
-        info!("audio: device reports no buffer-size range — leaving it to the driver");
-        let rate = supported.config().sample_rate;
-        return (fallback, Some(rate));
-    };
-    let frames = TARGET_BUFFER_FRAMES.clamp(*min, *max);
-    let mut config = supported.config();
-    config.buffer_size = cpal::BufferSize::Fixed(frames);
-    info!(
-        "audio: {} Hz, {} ch, buffer {frames} frames (~{:.1} ms)",
-        config.sample_rate,
-        config.channels,
-        f64::from(frames) / f64::from(config.sample_rate) * 1000.0,
-    );
-    let rate = config.sample_rate;
-    (Some(config), Some(rate))
+    match web_sys::AudioContext::new() {
+        Ok(ctx) => {
+            let rate = ctx.sample_rate() as u32;
+            info!("audio: {rate} Hz, queued on the page's AudioContext");
+            (Some(ctx), Some(rate))
+        }
+        Err(e) => {
+            warn!("audio: no AudioContext: {e:?}");
+            (None, None)
+        }
+    }
 }
 
 /// `SoundBufferSize`, the mix-ahead in ms, read once from the stored config at sound init, as

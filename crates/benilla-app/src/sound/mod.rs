@@ -52,6 +52,7 @@ mod weather;
 mod web_backend;
 #[cfg(target_arch = "wasm32")]
 mod web_load;
+mod web_queue;
 mod zone;
 pub(crate) use emote::EmoteSounds;
 /// First-play kit decodes so far, for the probe's tail line.
