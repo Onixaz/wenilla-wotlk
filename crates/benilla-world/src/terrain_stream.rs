@@ -28,6 +28,7 @@ use benilla_assets::MapCatalogRes;
 use benilla_assets::RenderConfig;
 use benilla_assets::{m2_url, wmo_url};
 
+mod ahead;
 mod collider;
 mod furnish;
 pub mod merge;
@@ -471,6 +472,15 @@ impl Plugin for TerrainPlugin {
                     .after(crate::wmo_portal::WmoPvsSet)
                     .in_set(AreaAuthoritySet),
             );
+        // The web build fetches the tiles ahead of the viewer's motion into the page's store.
+        #[cfg(target_arch = "wasm32")]
+        app.add_systems(
+            Update,
+            ahead::prefetch_ahead
+                .in_set(WorldStage::Stream)
+                .after(stream_terrain)
+                .run_if(crate::schedule::world_is_live),
+        );
     }
 }
 

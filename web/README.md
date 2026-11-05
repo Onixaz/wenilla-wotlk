@@ -38,7 +38,9 @@ cargo run --release -p wenilla-host -- --www web/dist --data /path/to/WoW/Data -
 ```
 
 `wenilla-host` (`crates/wenilla-host`) is the whole server side: static files
-(precompressed), `GET /data/{name}` (`HEAD` too; `GET /data/__index` lists the chain), and
+(precompressed), `GET /data/{name}` (`HEAD` too; `GET /data/__index` lists the chain,
+`POST /data/__batch` answers many names in one streamed response, `GET /data/__version` names the
+install so the page knows when its kept copy is stale), and
 `GET /ws/{port}` — a WebSocket↔TCP proxy that only ever dials `--upstream` on 3724 or 8085.
 **`wenilla-host` is for local testing only.** `/data` serves the game files you point it at to
 anyone who can reach the socket, with no login, so it binds to `127.0.0.1` by default and must
@@ -75,10 +77,20 @@ own accounts (a second login on one account kicks the first, as in the real clie
   (`web/platform.js`), which asks the browser not to *evict* that storage under disk pressure —
   the difference between "the player cleared site data" and "the player silently lost their
   keybinds". The grant is heuristic and often only arrives after repeat visits; there is no
-  fallback if it is refused. It covers quota storage only, so the downloaded `/data/*` archives
-  — which live in the ordinary HTTP cache, warmed by `boot.js` — are **not** protected by it;
-  holding those across eviction would mean rehosting them in the Cache API, which nothing here
-  does today.
+  fallback if it is refused. It covers quota storage, which is also where the game data is kept (below).
+- **Game data** — every `/data` read goes through the page's data store (`web/datastore.js`,
+  `window.__wenilla_data`). It fetches in batches (`POST /data/__batch`: one request for up to 64
+  files, streamed file by file, since a browser runs only six HTTP/1.1 requests to a host at once),
+  holds bytes fetched ahead in a bounded memory LRU, and keeps every file it fetched in the Cache
+  API under the host's `__version`, so a second visit reads the disk and a changed install starts
+  clean. The client's synchronous reads (`Chain::read`, ~60 call sites) answer from that memory
+  instead of a synchronous XHR; a miss still works, and is remembered in `localStorage` so the
+  next visit fetches it ahead (at boot, or while at the glue screens for world-entry reads). The
+  bytes a file's loader reads after it — a WMO's groups, an M2's skin and `.anim` files, an ADT's
+  layers, models and buildings — are fetched the moment the file lands
+  (`benilla-formats::web_deps`), and the terrain streamer fetches the tiles ahead of the viewer's
+  motion (`terrain_stream/ahead.rs`). `boot-manifest.json` and `world-manifest.json` seed a
+  first visit; regenerate them from a `?boottrace=1` run when the read set drifts.
 - **Performance** — the client is CPU-bound on its single wasm thread (Bevy's task pools are
   single-threaded on `wasm32`): ~11 ms/frame in an outdoor scene on a laptop iGPU, scaling
   with visible objects, not pixels. `scripts/web-build.sh` runs `wasm-opt -O3` (+6 %). Any CVar
