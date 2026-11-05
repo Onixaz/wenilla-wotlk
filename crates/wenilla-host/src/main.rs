@@ -57,7 +57,9 @@ async fn main() -> Result<()> {
 
     let locale = benilla_formats::data_locale(&cli.data).ok();
     tracing::info!(locale = ?locale, "data locale");
-    let app = wenilla_host::data::router_with_locale(chain, locale)
+    let version = wenilla_host::data::data_version(&cli.data);
+    tracing::info!(version = ?version, "data version");
+    let app = wenilla_host::data::router_with(chain, locale, version)
         .merge(wenilla_host::ws::router(
             cli.upstream.clone(),
             wenilla_host::ALLOWED_PORTS,

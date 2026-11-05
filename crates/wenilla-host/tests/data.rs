@@ -126,3 +126,72 @@ async fn compresses_the_index_and_leaves_blp_texels_alone() {
         "DXT blocks should not be re-compressed:\n{head}"
     );
 }
+
+/// `POST /data/__batch` against the real chain: every asked name comes back once, as asked, with
+/// the chain's own bytes, a missing name as −1, and an oversized batch is refused.
+#[tokio::test]
+async fn a_batch_answers_every_name_with_the_chains_bytes() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let Some(data_dir) = benilla_formats::wow_data() else {
+        eprintln!("skip: no WoW Data directory found (set WOW_DATA)");
+        return;
+    };
+    let chain = Arc::new(Chain::open(&data_dir).expect("open chain"));
+    let app = wenilla_host::data::router(Arc::clone(&chain));
+    let names = [
+        "dbfilesclient\\map.dbc",
+        "interface\\glues\\common\\glue-panel-button-up.blp",
+        "nope\\missing.blp",
+    ];
+    let post = |body: String| {
+        Request::post("/data/__batch")
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let resp = app
+        .clone()
+        .oneshot(post(serde_json::to_string(&names).unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let mut got = std::collections::HashMap::new();
+    let mut at = 0;
+    let u32_at = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    while at < body.len() {
+        let n = u32_at(&body, at) as usize;
+        let name = std::str::from_utf8(&body[at + 4..at + 4 + n])
+            .unwrap()
+            .to_string();
+        let len = u32_at(&body, at + 4 + n) as i32;
+        at += 8 + n;
+        let bytes = (len >= 0).then(|| body[at..at + len as usize].to_vec());
+        at += len.max(0) as usize;
+        assert!(got.insert(name, (len, bytes)).is_none(), "a name twice");
+    }
+    assert_eq!(got.len(), 3);
+    for n in &names[..2] {
+        assert_eq!(
+            got[*n].1.as_deref(),
+            Some(&chain.read(n).unwrap()[..]),
+            "{n}"
+        );
+    }
+    assert_eq!(got["nope\\missing.blp"], (-1, None));
+
+    let too_many = vec!["x"; wenilla_host::data::BATCH_MAX + 1];
+    let resp = app
+        .clone()
+        .oneshot(post(serde_json::to_string(&too_many).unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 413);
+    let resp = app.oneshot(post("not json".into())).await.unwrap();
+    assert_eq!(resp.status(), 400);
+}
