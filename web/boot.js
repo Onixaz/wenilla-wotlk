@@ -30,6 +30,10 @@
 // build and that is cosmetic — the bar is clamped at 99% until the stream actually ends.
 const BR_RATIO = 5.0;
 const READY_TIMEOUT_MS = 20000;
+// How long the client's reads stay at zero before a screen counts as drawn. A loader asks for its
+// next file a frame or more after the last one lands, and the screen's first reads follow the
+// long frame that built it.
+const SETTLE_MS = 1500;
 
 export async function boot(init, opts = {}) {
   const q = new URLSearchParams(location.search);
@@ -175,7 +179,8 @@ async function prefetchManifest(store, manifestUrl, phase, onProgress) {
   const all = Array.from(new Set([...names, ...store.learned(phase)]));
   if (!all.length) return onProgress(0, 0);
   onProgress(0, all.length);
-  await store.prefetch(all, { priority: 'high', onProgress });
+  // The world-entry set is ahead of what the player may do: the screen's own reads go first.
+  await store.prefetch(all, { priority: phase === 'world' ? 'low' : 'high', onProgress });
 }
 
 /// The world-entry prefetch's progress, for the corner line once the glue is up.
@@ -206,8 +211,15 @@ function startWorldPrefetch(store) {
 function installProgressHook(ui, skipPrefetch) {
   window.__wenilla_progress = (stage) => {
     if (stage === 'startup') ui.setStage('Loading interface…');
-    else if (stage === 'ready') {
-      ui.hide();
+    else if (stage === 'charselect') {
+      if (!ui.gone()) return; // the boot cover is still up and already waits for these reads
+      const cover = createBootUi();
+      cover.setStage('Loading characters…');
+      cover.armTimeout(READY_TIMEOUT_MS);
+      whenSettled(window.__wenilla_data).then(() => cover.hide());
+    } else if (stage === 'ready') {
+      ui.setStage('Preparing the screen…');
+      whenSettled(window.__wenilla_data).then(() => ui.hide());
       window.__wenilla_data?.setPhase('world');
       if (!skipPrefetch && !world.finished) {
         const corner = createCornerLine();
@@ -223,6 +235,23 @@ function installProgressHook(ui, skipPrefetch) {
       }
     }
   };
+}
+
+/// Resolves once `store.reading()` has stayed at zero for `quietMs`.
+export function whenSettled(store, { quietMs = SETTLE_MS, everyMs = 100 } = {}) {
+  if (!store) return Promise.resolve();
+  return new Promise((resolve) => {
+    let last = performance.now();
+    const timer = setInterval(() => {
+      const now = performance.now();
+      if (store.reading() > 0) {
+        last = now;
+      } else if (now - last >= quietMs) {
+        clearInterval(timer);
+        resolve();
+      }
+    }, everyMs);
+  });
 }
 
 /// The unobtrusive bottom-left status line the world prefetch reports on.
@@ -311,6 +340,7 @@ function createBootUi() {
       stageEl.className = 'err';
       stageEl.textContent = text;
     },
+    gone: () => gone,
     armTimeout(ms) {
       timeout = setTimeout(() => this.hide(), ms);
     },

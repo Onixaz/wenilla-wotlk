@@ -4,7 +4,7 @@ import test from 'node:test';
 
 const source = (await readFile(new URL('../boot.js', import.meta.url), 'utf8'))
   .replaceAll('import.meta.url', JSON.stringify(new URL('../boot.js', import.meta.url).href));
-const { boot, missingWebGpu } = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
+const { boot, missingWebGpu, whenSettled } = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
 const wasmBytes = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]);
 const deferred = () => {
   let resolve;
@@ -109,4 +109,21 @@ test('boot stops before any download when WebGPU is missing', async t => {
   await assert.rejects(boot(() => assert.fail('must not initialize')), /secure page/);
   assert.deepEqual(fetched, []);
   assert.match(children.get('.stage').textContent, /secure page/);
+});
+
+test('a screen settles only after the client\'s reads stay at zero', async () => {
+  let reading = 2;
+  let settled = false;
+  const done = whenSettled({ reading: () => reading }, { quietMs: 40, everyMs: 5 }).then(() => {
+    settled = true;
+  });
+  await new Promise(r => setTimeout(r, 80));
+  assert.equal(settled, false, 'reads in flight hold the cover');
+  reading = 0;
+  await done;
+  assert.equal(settled, true);
+});
+
+test('no store has nothing to wait for', async () => {
+  await whenSettled(undefined);
 });
