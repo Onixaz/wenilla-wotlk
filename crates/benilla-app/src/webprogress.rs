@@ -20,6 +20,8 @@
 //! - `"ready"`  — the first glue screen (login *or* character select: the env fast path skips
 //!   Login entirely) has spawned. The page fades its overlay here. Sent once, ever —
 //!   [`signal_ready_once`] — because both screens' `materialize_screen` run every frame.
+//! - `"charselect"` — the character screens are entered for the first time, so the page can cover
+//!   the scene's first load as it covers the first glue screen. Sent once, ever.
 //!
 //! Native builds: every function is a no-op; there is no page.
 
@@ -50,6 +52,16 @@ pub(crate) fn signal_ready_once() {
     static SENT: AtomicBool = AtomicBool::new(false);
     if !SENT.swap(true, Ordering::Relaxed) {
         signal("ready");
+    }
+}
+
+/// The `OnEnter` system behind the `"charselect"` stage: one edge per process, since only the
+/// first visit loads the scene.
+pub(crate) fn signal_charselect_once() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SENT: AtomicBool = AtomicBool::new(false);
+    if !SENT.swap(true, Ordering::Relaxed) {
+        signal("charselect");
     }
 }
 
