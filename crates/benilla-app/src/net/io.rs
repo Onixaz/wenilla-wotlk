@@ -891,7 +891,9 @@ async fn world(
                         }
                         // A success renames the roster row the world entry logs in under.
                         Ok(ParkRequest::Char(CharRequest::Service { opcode, body })) => {
-                            if let Some((guid, name)) = session.char_service_async(opcode, &body).await? {
+                            if let Some((guid, name)) =
+                                session.char_service_async(opcode, &body).await?
+                            {
                                 if let Some(c) = characters.iter_mut().find(|c| c.guid == guid) {
                                     c.name = name;
                                 }
@@ -1438,885 +1440,750 @@ pub(super) fn writer_loop(
 /// bytes. The map is total: a new command without a send fails to compile here.
 pub(super) fn dispatch(w: &mut WorldWriter, cmd: ClientCommand) -> Result<()> {
     match cmd {
-                    ClientCommand::Move {
-                        kind,
-                        flags,
-                        pos,
-                        orientation,
-                        pitch,
-                        fall_time,
-                        jump,
-                        transport,
-                    } => w.send_movement(
-                        kind.opcode(),
-                        flags,
-                        pos,
-                        orientation,
-                        pitch,
-                        fall_time,
-                        jump,
-                        transport,
-                    ),
-                    ClientCommand::MoveSplineDone {
-                        flags,
-                        pos,
-                        orientation,
-                        spline_id,
-                    } => w.move_spline_done(flags, pos, orientation, spline_id),
-                    ClientCommand::MoveTimeSkipped { guid, lag_ms } => {
-                        w.move_time_skipped(guid, lag_ms)
-                    }
-                    ClientCommand::TimeSyncResp { counter, client_ms } => {
-                        w.time_sync_resp(counter, client_ms)
-                    }
-                    ClientCommand::ForceSpeedAck {
-                        kind,
-                        guid,
-                        counter,
-                        speed,
-                        flags,
-                        pos,
-                        orientation,
-                        pitch,
-                        fall_time,
-                        jump,
-                        transport,
-                    } => w.force_speed_change_ack(
-                        kind,
-                        guid,
-                        counter,
-                        speed,
-                        flags,
-                        pos,
-                        orientation,
-                        pitch,
-                        fall_time,
-                        jump,
-                        transport,
-                    ),
-                    ClientCommand::Vehicle(v) => match v {
-                        super::VehicleCommand::Empty(opcode) => w.request_vehicle(opcode),
-                        super::VehicleCommand::Pitch {
-                            opcode,
-                            mover,
-                            flags,
-                            flags2,
-                            pos,
-                            orientation,
-                            pitch,
-                        } => w.move_pitch(opcode, mover, flags, flags2, pos, orientation, pitch),
-                        super::VehicleCommand::SwitchSeat { vehicle, seat } => {
-                            w.request_vehicle_switch_seat(vehicle, seat)
-                        }
-                        super::VehicleCommand::ByGuid { opcode, guid } => {
-                            w.vehicle_guid(opcode, guid)
-                        }
-                        super::VehicleCommand::Controlled {
-                            mover,
-                            flags,
-                            pos,
-                            orientation,
-                            seat,
-                        } => w.controlled_vehicle(mover, flags, (pos, orientation), seat),
-                        super::VehicleCommand::ProjectileHit {
-                            caster,
-                            spell,
-                            cast_id,
-                            at,
-                        } => w.update_projectile_position(caster, spell, cast_id, at),
-                    },
-                    ClientCommand::SetActiveMover { guid } => w.set_active_mover(guid),
-                    ClientCommand::NotActiveMover {
-                        guid,
-                        flags,
-                        pos,
-                        orientation,
-                        fall_time,
-                    } => w.move_not_active_mover(guid, flags, pos, orientation, fall_time),
-                    ClientCommand::FarSight { engage } => w.far_sight(engage),
-                    ClientCommand::TeleportAck { guid, counter } => w.teleport_ack(guid, counter),
-                    ClientCommand::WorldportAck => w.worldport_ack(),
-                    ClientCommand::SetSelection { guid } => w.set_selection(guid),
-                    ClientCommand::GetMirrorImageData { guid } => w.get_mirror_image_data(guid),
-                    ClientCommand::CancelAutoRepeat => w.cancel_auto_repeat(),
-                    ClientCommand::CancelCast { spell_id } => w.cancel_cast(spell_id),
-                    ClientCommand::CancelChannelling { spell_id } => w.cancel_channelling(spell_id),
-                    ClientCommand::Chat {
-                        kind,
-                        target,
-                        text,
-                        language,
-                    } => match kind.chat_type() {
-                        Some(chat_type) => {
-                            w.send_message_chat(chat_type, language, target.as_deref(), &text)
-                        }
-                        None => {
-                            bevy::log::warn!(
-                                "net: {kind:?} chat has no wire type on this client; not sent"
-                            );
-                            Ok(())
-                        }
-                    },
-                    // The distribution is an enum, so its map to a chat type is total.
-                    ClientCommand::AddonMessage { distribution, text } => {
-                        w.send_addon_message(super::addon_wire_chat_type(distribution), &text)
-                    }
-                    ClientCommand::JoinChannel {
-                        name,
-                        password,
-                        channel_id,
-                        auto_joined,
-                        voice,
-                    } => w.join_channel(&name, &password, channel_id, auto_joined, voice),
-                    ClientCommand::LeaveChannel { name, channel_id } => {
-                        w.leave_channel(&name, channel_id)
-                    }
-                    ClientCommand::ChannelList { name } => w.channel_list(&name),
-                    ClientCommand::SetChannelWatch { name } => w.set_channel_watch(&name),
-                    ClientCommand::ChannelDisplayList { name } => w.channel_display_list(&name),
-                    ClientCommand::RandomRoll { min, max } => w.random_roll(min, max),
-                    ClientCommand::ChannelOwner { name } => w.channel_owner(&name),
-                    ClientCommand::ChannelSetOwner { name, player } => {
-                        w.channel_set_owner(&name, &player)
-                    }
-                    ClientCommand::ChannelPassword { name, password } => {
-                        w.channel_password(&name, &password)
-                    }
-                    ClientCommand::ChannelModerator { name, player } => {
-                        w.channel_moderator(&name, &player)
-                    }
-                    ClientCommand::ChannelUnmoderator { name, player } => {
-                        w.channel_unmoderator(&name, &player)
-                    }
-                    ClientCommand::ChannelMute { name, player } => w.channel_mute(&name, &player),
-                    ClientCommand::ChannelUnmute { name, player } => {
-                        w.channel_unmute(&name, &player)
-                    }
-                    ClientCommand::ChannelInvite { name, player } => {
-                        w.channel_invite(&name, &player)
-                    }
-                    ClientCommand::ChannelKick { name, player } => w.channel_kick(&name, &player),
-                    ClientCommand::ChannelBan { name, player } => w.channel_ban(&name, &player),
-                    ClientCommand::ChannelUnban { name, player } => {
-                        w.channel_unban(&name, &player)
-                    }
-                    ClientCommand::ChannelAnnouncements { name } => w.channel_announcements(&name),
-                    ClientCommand::ChannelModerate { name } => w.channel_moderate(&name),
-                    ClientCommand::PlayedTime { show } => w.played_time(show),
-                    ClientCommand::SocketGems { item, gems } => w.socket_gems(item, gems),
-                    ClientCommand::ItemRefundInfo { item } => w.item_refund_info(item),
-                    ClientCommand::ItemRefund { item } => w.item_refund(item),
-                    ClientCommand::ReadItem { bag, slot } => w.read_item(bag, slot),
-                    ClientCommand::ItemNameQuery { entry } => w.item_name_query(entry),
-                    // Commands are written in order, so everything before it is out.
-                    ClientCommand::Flush(done) => {
-                        let _ = done.send(());
-                        Ok(())
-                    }
-                    ClientCommand::AccountData(crate::account_data::Wire::Request { slot }) => {
-                        w.request_account_data(slot)
-                    }
-                    ClientCommand::AccountData(crate::account_data::Wire::Upload {
-                        slot,
-                        time,
-                        bytes,
-                    }) => {
-                        bevy::log::info!(
-                            "net: account data slot {slot} up ({} bytes, time {time})",
-                            bytes.len()
-                        );
-                        w.update_account_data(slot, time, &bytes)
-                    }
-                    ClientCommand::NameQuery { guid } => w.name_query(guid),
-                    ClientCommand::CreatureQuery { entry, guid } => w.creature_query(entry, guid),
-                    ClientCommand::PetNameQuery { pet_number, guid } => {
-                        w.pet_name_query(pet_number, guid)
-                    }
-                    ClientCommand::ItemQuery { entry, guid } => w.item_query(entry, guid),
-                    ClientCommand::UseItem {
-                        bag_index,
-                        slot,
-                        spell_id,
-                        item_guid,
-                        target,
-                    } => w.use_item(bag_index, slot, spell_id, item_guid, target),
-                    ClientCommand::OpenItem { bag_index, slot } => w.open_item(bag_index, slot),
-                    ClientCommand::WrapItem {
-                        gift_bag,
-                        gift_slot,
-                        item_bag,
-                        item_slot,
-                    } => w.wrap_item(gift_bag, gift_slot, item_bag, item_slot),
-                    ClientCommand::AutoEquipItem { bag_index, slot } => {
-                        w.auto_equip_item(bag_index, slot)
-                    }
-                    ClientCommand::SetAmmo { entry } => w.set_ammo(entry),
-                    ClientCommand::SwapInvItem { src_slot, dst_slot } => {
-                        w.swap_inv_item(src_slot, dst_slot)
-                    }
-                    ClientCommand::SwapItem {
-                        dst_bag,
-                        dst_slot,
-                        src_bag,
-                        src_slot,
-                    } => w.swap_item(dst_bag, dst_slot, src_bag, src_slot),
-                    ClientCommand::AutoStoreBagItem {
-                        src_bag,
-                        src_slot,
-                        dst_bag,
-                    } => w.auto_store_bag_item(src_bag, src_slot, dst_bag),
-                    ClientCommand::SplitItem {
-                        src_bag,
-                        src_slot,
-                        dst_bag,
-                        dst_slot,
-                        count,
-                    } => w.split_item(src_bag, src_slot, dst_bag, dst_slot, count),
-                    ClientCommand::DestroyItem {
-                        bag_index,
-                        slot,
-                        count,
-                    } => w.destroy_item(bag_index, slot, count),
-                    ClientCommand::CastSpell { spell_id, target } => w.cast_spell(spell_id, target),
-                    ClientCommand::CastSpellCorpse {
-                        spell_id,
-                        target,
-                        corpse_guid,
-                    } => w.cast_spell_corpse(spell_id, target, corpse_guid),
-                    ClientCommand::CastSpellAtDest { spell_id, dest } => {
-                        w.cast_spell_at_dest(spell_id, dest)
-                    }
-                    ClientCommand::CastSpellAtSource { spell_id, src } => {
-                        w.cast_spell_at_source(spell_id, src)
-                    }
-                    ClientCommand::CancelAura { spell_id } => w.cancel_aura(spell_id),
-                    ClientCommand::CancelMountAura => w.cancel_mount_aura(),
-                    ClientCommand::DismissCritter { guid } => w.dismiss_critter(guid),
-                    ClientCommand::SetActionButton { button, packed } => {
-                        w.set_action_button(button, packed)
-                    }
-                    ClientCommand::TotemDestroyed { slot } => w.totem_destroyed(slot),
-                    ClientCommand::SetActionBarToggles { toggles } => {
-                        w.set_actionbar_toggles(toggles)
-                    }
-                    ClientCommand::PetAction {
-                        pet_guid,
-                        packed,
-                        target_guid,
-                    } => w.pet_action(pet_guid, packed, target_guid),
-                    ClientCommand::PetCastSpell {
-                        pet_guid,
-                        spell_id,
-                        target,
-                    } => w.pet_cast_spell(pet_guid, spell_id, target),
-                    ClientCommand::PetCastTrajectory {
-                        pet_guid,
-                        spell_id,
-                        shot,
-                        flags,
-                        flags2,
-                        pos,
-                        orientation,
-                    } => w.pet_cast_trajectory(
-                        pet_guid,
-                        spell_id,
-                        &shot,
-                        flags,
-                        flags2,
-                        pos,
-                        orientation,
-                    ),
-                    ClientCommand::PetSetAction { pet_guid, entries } => {
-                        w.pet_set_action(pet_guid, &entries)
-                    }
-                    ClientCommand::PetStopAttack { pet_guid } => w.pet_stop_attack(pet_guid),
-                    ClientCommand::PetCancelAura { pet_guid, spell_id } => {
-                        w.pet_cancel_aura(pet_guid, spell_id)
-                    }
-                    ClientCommand::PetSpellAutocast {
-                        pet_guid,
-                        spell_id,
-                        enabled,
-                    } => w.pet_spell_autocast(pet_guid, spell_id, enabled),
-                    ClientCommand::PetAbandon { pet_guid } => w.pet_abandon(pet_guid),
-                    ClientCommand::PetRename { pet_guid, name } => w.pet_rename(pet_guid, &name),
-                    ClientCommand::RequestPetInfo => w.request_pet_info(),
-                    ClientCommand::AttackSwing { guid } => w.attack_swing(guid),
-                    ClientCommand::AttackStop => w.attack_stop(),
-                    ClientCommand::SetSheathed { state } => w.set_sheathed(state),
-                    ClientCommand::StandStateChange { state } => w.stand_state_change(state),
-                    ClientCommand::MountSpecial => w.mount_special(),
-                    ClientCommand::Emote { emote_id } => w.emote(emote_id),
-                    ClientCommand::TextEmote {
-                        text_id,
-                        file_index,
-                        target,
-                    } => w.text_emote(text_id, file_index, target),
-                    ClientCommand::GossipHello { guid } => w.gossip_hello(guid),
-                    ClientCommand::GossipSelectOption {
-                        guid,
-                        menu_id,
-                        option,
-                        code,
-                    } => w.gossip_select_option(guid, menu_id, option, code.as_deref()),
-                    ClientCommand::NpcTextQuery { text_id, guid } => w.npc_text_query(text_id, guid),
-                    ClientCommand::ListInventory { guid } => w.list_inventory(guid),
-                    ClientCommand::BuyItem {
-                        vendor,
-                        entry,
-                        slot,
-                        count,
-                    } => w.buy_item(vendor, entry, slot, count),
-                    ClientCommand::BuyItemInSlot {
-                        vendor,
-                        entry,
-                        slot,
-                        bag_guid,
-                        bag_slot,
-                        count,
-                    } => w.buy_item_in_slot(vendor, entry, slot, bag_guid, bag_slot, count),
-                    ClientCommand::SellItem {
-                        vendor,
-                        item_guid,
-                        count,
-                    } => w.sell_item(vendor, item_guid, count),
-                    ClientCommand::BuybackItem { vendor, slot } => w.buyback_item(vendor, slot),
-                    ClientCommand::RepairItem {
-                        vendor,
-                        item_guid,
-                        guild_bank,
-                    } => w.repair_item(vendor, item_guid, guild_bank),
-                    ClientCommand::GmTicketCreate {
-                        map,
-                        pos,
-                        text,
-                        need_response,
-                        more_help,
-                    } => w.gm_ticket_create(map, pos, &text, need_response, more_help),
-                    ClientCommand::GmTicketUpdate { text } => w.gm_ticket_updatetext(&text),
-                    ClientCommand::GmResponseResolve => w.gm_response_resolve(),
-                    ClientCommand::GmTicketGet => w.gm_ticket_get(),
-                    ClientCommand::GmTicketDelete => w.gm_ticket_delete(),
-                    ClientCommand::GmTicketSystemStatus => w.gm_ticket_system_status(),
-                    ClientCommand::GmReportLag { kind, map, pos } => {
-                        w.gm_report_lag(kind, map, pos)
-                    }
-                    ClientCommand::GmSurveySubmit {
-                        survey,
-                        answers,
-                        comment,
-                    } => w.gm_survey_submit(survey, &answers, &comment),
-                    ClientCommand::BinderActivate { binder } => w.binder_activate(binder),
-                    ClientCommand::SummonResponse { summoner, agree } => {
-                        w.summon_response(summoner, agree)
-                    }
-                    ClientCommand::TalentWipeConfirm { trainer } => w.talent_wipe_confirm(trainer),
-                    ClientCommand::ForceLogout => w.player_logout(),
-                    ClientCommand::AreaSpiritHealerQueue { healer } => {
-                        w.area_spirit_healer_queue(healer)
-                    }
-                    ClientCommand::AreaSpiritHealerQuery { healer } => {
-                        w.area_spirit_healer_query(healer)
-                    }
-                    ClientCommand::BattlefieldPort { queue, accept } => {
-                        w.battlefield_port(queue, accept)
-                    }
-                    ClientCommand::RequestBattlefieldScoreData => {
-                        w.request_battlefield_score_data()
-                    }
-                    ClientCommand::LeaveBattlefield { queue } => w.leave_battlefield(queue),
-                    ClientCommand::HearthAndResurrect => w.hearth_and_resurrect(),
-                    ClientCommand::BattlefieldMgr(r) => {
-                        use benilla_ui::script::BattlefieldMgrRequest as R;
-                        match r {
-                            R::EntryInviteResponse { queue_id, accept } => {
-                                w.bf_mgr_entry_invite_response(queue_id as u32, accept)
-                            }
-                            R::QueueInviteResponse { queue_id, accept } => {
-                                w.bf_mgr_queue_invite_response(queue_id as u32, accept)
-                            }
-                            R::QueueRequest { queue_id } => w.bf_mgr_queue_request(queue_id as u32),
-                            R::ExitRequest { queue_id } => w.bf_mgr_exit_request(queue_id as u32),
-                        }
-                    }
-                    ClientCommand::ArenaTeam(c) => {
-                        use crate::net::ArenaTeamCommand as A;
-                        match c {
-                            A::Query { team_id } => w.arena_team_query(team_id),
-                            A::Roster { team_id } => w.arena_team_roster(team_id),
-                            A::Invite { team_id, name } => w.arena_team_invite(team_id, &name),
-                            A::Remove { team_id, name } => w.arena_team_remove(team_id, &name),
-                            A::Leader { team_id, name } => w.arena_team_leader(team_id, &name),
-                            A::Leave { team_id } => w.arena_team_leave(team_id),
-                            A::Disband { team_id } => w.arena_team_disband(team_id),
-                            A::Accept => w.arena_team_accept(),
-                            A::Decline => w.arena_team_decline(),
-                        }
-                    }
-                    ClientCommand::Lfg(request) => lfg_send(w, request),
-                    ClientCommand::Calendar(command) => w.calendar(&command),
-                    ClientCommand::TutorialFlag { id } => w.tutorial_flag(id),
-                    ClientCommand::TutorialClear => w.tutorial_clear(),
-                    ClientCommand::TutorialReset => w.tutorial_reset(),
-                    ClientCommand::BattlefieldList {
-                        bg_type,
-                        xp_disabled,
-                    } => w.battlefield_list(bg_type, xp_disabled),
-                    ClientCommand::RequestBattlefieldPositions => {
-                        w.request_battlefield_positions()
-                    }
-                    ClientCommand::TabardVendorActivate { npc } => w.tabard_vendor_activate(npc),
-                    ClientCommand::SaveGuildEmblem { vendor, design } => {
-                        w.save_guild_emblem(vendor, design)
-                    }
-                    ClientCommand::AlterAppearance { styles } => w.alter_appearance(styles),
-                    ClientCommand::BattlemasterHello { npc } => w.battlemaster_hello(npc),
-                    ClientCommand::BattlemasterJoin {
-                        battlemaster,
-                        bg_type,
-                        instance_id,
-                        as_group,
-                    } => w.battlemaster_join(battlemaster, bg_type, instance_id, as_group),
-                    ClientCommand::BattlemasterJoinArena {
-                        battlemaster,
-                        slot,
-                        as_group,
-                        rated,
-                    } => w.battlemaster_join_arena(battlemaster, slot, as_group, rated),
-                    ClientCommand::BattlefieldStatusRequest => w.battlefield_status(),
-                    ClientCommand::PetUnlearn { trainer } => w.pet_unlearn(trainer),
-                    ClientCommand::BankerActivate { guid } => w.banker_activate(guid),
-                    ClientCommand::SpellClick { guid } => w.spell_click(guid),
-                    ClientCommand::BuyBankSlot { guid } => w.buy_bank_slot(guid),
-                    ClientCommand::AutoBankItem { bag, slot } => w.autobank_item(bag, slot),
-                    ClientCommand::AutoStoreBankItem { bag, slot } => {
-                        w.autostore_bank_item(bag, slot)
-                    }
-                    ClientCommand::TrainerList { trainer } => w.trainer_list(trainer),
-                    ClientCommand::TrainerBuySpell { trainer, spell_id } => {
-                        w.trainer_buy_spell(trainer, spell_id)
-                    }
-                    ClientCommand::ListStabledPets { npc } => w.list_stabled_pets(npc),
-                    ClientCommand::StablePet { npc } => w.stable_pet(npc),
-                    ClientCommand::UnstablePet { npc, pet_number } => {
-                        w.unstable_pet(npc, pet_number)
-                    }
-                    ClientCommand::StableSwapPet { npc, pet_number } => {
-                        w.stable_swap_pet(npc, pet_number)
-                    }
-                    ClientCommand::BuyStableSlot { npc } => w.buy_stable_slot(npc),
-                    ClientCommand::LearnTalent { talent_id, rank } => {
-                        w.learn_talent(talent_id, rank)
-                    }
-                    ClientCommand::RemoveGlyph { socket } => w.remove_glyph(socket),
-                    ClientCommand::SetTitle { mask_id } => w.set_title(mask_id),
-                    ClientCommand::EquipmentSetSave(set) => {
-                        w.equipment_set_save(set.guid, set.id, &set.name, &set.icon, &set.items)
-                    }
-                    ClientCommand::EquipmentSetDelete { guid } => w.equipment_set_delete(guid),
-                    ClientCommand::EquipmentSetUse { slots } => w.equipment_set_use(&slots),
-                    ClientCommand::LearnPreviewTalents { talents } => {
-                        w.learn_preview_talents(&talents)
-                    }
-                    ClientCommand::PetLearnTalent {
-                        pet_guid,
-                        talent_id,
-                        rank,
-                    } => w.pet_learn_talent(pet_guid, talent_id, rank),
-                    ClientCommand::LearnPreviewTalentsPet { pet_guid, talents } => {
-                        w.learn_preview_talents_pet(pet_guid, &talents)
-                    }
-                    ClientCommand::UnlearnSkill { skill_id } => w.unlearn_skill(skill_id),
-                    ClientCommand::SetFactionAtWar {
-                        rep_list_id,
-                        at_war,
-                    } => w.set_faction_at_war(rep_list_id, at_war),
-                    ClientCommand::SetFactionInactive {
-                        rep_list_id,
-                        inactive,
-                    } => w.set_faction_inactive(rep_list_id, inactive),
-                    ClientCommand::SetWatchedFaction { rep_list_id } => {
-                        w.set_watched_faction(rep_list_id)
-                    }
-                    ClientCommand::GameObjUse { guid } => w.gameobj_use(guid),
-                    ClientCommand::AreaTrigger { trigger_id } => w.area_trigger(trigger_id),
-                    ClientCommand::GameObjectQuery { entry, guid } => w.gameobject_query(entry, guid),
-                    ClientCommand::PageTextQuery { page_id, guid } => {
-                        w.page_text_query(page_id, guid)
-                    }
-                    ClientCommand::CastSpellGameObject { spell_id, go_guid } => {
-                        w.cast_spell_gameobject(spell_id, go_guid)
-                    }
-                    ClientCommand::CastSpellItem {
-                        spell_id,
-                        item_guid,
-                    } => w.cast_spell_item(spell_id, item_guid),
-                    ClientCommand::CastSpellTradeItem { spell_id } => {
-                        w.cast_spell_trade_item(spell_id)
-                    }
-                    ClientCommand::CastSpellGlyph { spell_id } => w.cast_spell_glyph(spell_id),
-                    ClientCommand::LootMasterGive { guid, slot, target } => {
-                        w.loot_master_give(guid, slot, target)
-                    }
-                    ClientCommand::Loot { guid } => w.loot(guid),
-                    ClientCommand::AutostoreLootItem { slot } => w.autostore_loot_item(slot),
-                    ClientCommand::LootMoney => w.loot_money(),
-                    ClientCommand::LootRelease { guid } => w.loot_release(guid),
-                    ClientCommand::LootRoll {
-                        looted_target,
-                        item_slot,
-                        roll_type,
-                    } => w.loot_roll(looted_target, item_slot, roll_type),
-                    ClientCommand::QuestgiverQuery { npc, quest } => {
-                        w.questgiver_query_quest(npc, quest)
-                    }
-                    ClientCommand::QuestgiverAccept {
-                        npc,
-                        quest,
-                        start_cheat,
-                    } => w.questgiver_accept_quest(npc, quest, start_cheat),
-                    ClientCommand::QuestgiverComplete { npc, quest } => {
-                        w.questgiver_complete_quest(npc, quest)
-                    }
-                    ClientCommand::QuestgiverRequestReward { npc, quest } => {
-                        w.questgiver_request_reward(npc, quest)
-                    }
-                    ClientCommand::QuestgiverChooseReward { npc, quest, choice } => {
-                        w.questgiver_choose_reward(npc, quest, choice)
-                    }
-                    ClientCommand::QuestQuery { quest } => w.quest_query(quest),
-                    ClientCommand::QueryQuestsCompleted => w.query_quests_completed(),
-                    ClientCommand::QuestgiverStatusMultipleQuery => {
-                        w.questgiver_status_multiple_query()
-                    }
-                    ClientCommand::QuestPoiQuery { quests } => w.quest_poi_query(&quests),
-                    ClientCommand::QuestgiverStatusQuery { npc } => w.questgiver_status_query(npc),
-                    ClientCommand::QuestgiverHello { npc } => w.questgiver_hello(npc),
-                    ClientCommand::QuestlogRemove { slot } => w.questlog_remove_quest(slot),
-                    ClientCommand::PushQuestToParty { quest } => w.push_quest_to_party(quest),
-                    ClientCommand::QuestConfirmAccept { quest } => w.quest_confirm_accept(quest),
-                    ClientCommand::QuestPushResult { sharer, quest, msg } => {
-                        w.quest_push_result(sharer, quest, msg)
-                    }
-                    ClientCommand::GetMailList { mailbox } => w.get_mail_list(mailbox),
-                    ClientCommand::SendMail {
-                        mailbox,
-                        receiver,
-                        subject,
-                        body,
-                        stationery,
-                        package,
-                        items,
-                        money,
-                        cod,
-                    } => w.send_mail(
-                        mailbox, &receiver, &subject, &body, stationery, package, &items, money,
-                        cod,
-                    ),
-                    ClientCommand::MailTakeMoney { mailbox, mail_id } => {
-                        w.mail_take_money(mailbox, mail_id)
-                    }
-                    ClientCommand::MailTakeItem {
-                        mailbox,
-                        mail_id,
-                        item_guid_low,
-                    } => w.mail_take_item(mailbox, mail_id, item_guid_low),
-                    ClientCommand::MailMarkAsRead { mailbox, mail_id } => {
-                        w.mail_mark_as_read(mailbox, mail_id)
-                    }
-                    ClientCommand::MailReturnToSender {
-                        mailbox,
-                        mail_id,
-                        sender,
-                    } => w.mail_return_to_sender(mailbox, mail_id, sender),
-                    ClientCommand::SetTaxiBenchmarkMode { on } => w.set_taxi_benchmark_mode(on),
-                    ClientCommand::SkillBuyRank { lines } => w.skill_buy_rank(&lines),
-                    ClientCommand::SkillBuyStep { line } => w.skill_buy_step(line),
-                    ClientCommand::CancelTempEnchantment { slot } => {
-                        w.cancel_temp_enchantment(slot)
-                    }
-                    ClientCommand::AutoEquipItemSlot { item, slot } => {
-                        w.auto_equip_item_slot(item, slot)
-                    }
-                    ClientCommand::GrantLevel { friend } => w.grant_level(friend),
-                    ClientCommand::DeclineChannelInvite { name } => {
-                        w.decline_channel_invite(&name)
-                    }
-                    ClientCommand::OptOutOfLoot { on } => w.opt_out_of_loot(on),
-                    ClientCommand::ReportPvpAfk { guid } => w.report_pvp_afk(guid),
-                    ClientCommand::ComplainChat {
-                        sender,
-                        sender_word,
-                        chat_type,
-                        zone_channel,
-                        age_secs,
-                        description,
-                    } => w.complaint_chat(
-                        sender,
-                        sender_word,
-                        chat_type,
-                        zone_channel,
-                        age_secs,
-                        &description,
-                    ),
-                    ClientCommand::ComplainMail { sender, mail_id } => {
-                        w.complaint_mail(sender, mail_id)
-                    }
-                    ClientCommand::MailDelete {
-                        mailbox,
-                        mail_id,
-                        reason,
-                    } => w.mail_delete(mailbox, mail_id, reason),
-                    ClientCommand::MailCreateTextItem { mailbox, mail_id } => {
-                        w.mail_create_text_item(mailbox, mail_id)
-                    }
-                    ClientCommand::ItemTextQuery { item_guid } => w.item_text_query(item_guid),
-                    ClientCommand::QueryNextMailTime => w.query_next_mail_time(),
-                    // The auction house: the auctioneer guid rides on every verb.
-                    ClientCommand::AuctionHello { auctioneer } => w.auction_hello(auctioneer),
-                    ClientCommand::AuctionListItems { auctioneer, query } => {
-                        w.auction_list_items(auctioneer, &query)
-                    }
-                    ClientCommand::AuctionListOwnerItems {
-                        auctioneer,
-                        list_from,
-                    } => w.auction_list_owner_items(auctioneer, list_from),
-                    ClientCommand::AuctionListPendingSales { auctioneer } => {
-                        w.auction_list_pending_sales(auctioneer)
-                    }
-                    ClientCommand::AuctionListBidderItems {
-                        auctioneer,
-                        list_from,
-                        auction_ids,
-                    } => w.auction_list_bidder_items(auctioneer, list_from, &auction_ids),
-                    ClientCommand::AuctionSellItem {
-                        auctioneer,
-                        items,
-                        bid,
-                        buyout,
-                        etime_minutes,
-                    } => w.auction_sell_item(auctioneer, &items, bid, buyout, etime_minutes),
-                    ClientCommand::AuctionPlaceBid {
-                        auctioneer,
-                        auction_id,
-                        price,
-                    } => w.auction_place_bid(auctioneer, auction_id, price),
-                    ClientCommand::AuctionRemoveItem {
-                        auctioneer,
-                        auction_id,
-                    } => w.auction_remove_item(auctioneer, auction_id),
-                    ClientCommand::QueryTime => w.query_time(),
-                    // No reply is awaited.
-                    ClientCommand::Inspect { target } => w.inspect(target),
-                    // Answered on the same opcode.
-                    ClientCommand::InspectHonorStats { target } => w
-                        .inspect_honor_stats(target)
-                        .and_then(|()| w.inspect_arena_teams(target)),
-                    ClientCommand::QueryInspectAchievements { target } => {
-                        w.query_inspect_achievements(target)
-                    }
-                    ClientCommand::InitiateTrade { target } => w.initiate_trade(target),
-                    ClientCommand::BeginTrade => w.begin_trade(),
-                    ClientCommand::BusyTrade => w.busy_trade(),
-                    ClientCommand::IgnoreTrade => w.ignore_trade(),
-                    ClientCommand::AcceptTrade { their_state } => w.accept_trade(their_state),
-                    ClientCommand::UnacceptTrade => w.unaccept_trade(),
-                    ClientCommand::CancelTrade => w.cancel_trade(),
-                    ClientCommand::SetTradeGold { copper } => w.set_trade_gold(copper),
-                    ClientCommand::SetTradeItem {
-                        trade_slot,
-                        bag,
-                        slot,
-                    } => w.set_trade_item(trade_slot, bag, slot),
-                    ClientCommand::ClearTradeItem { trade_slot } => w.clear_trade_item(trade_slot),
-                    ClientCommand::Logout => w.logout_request(),
-                    ClientCommand::LogoutCancel => w.logout_cancel(),
-                    ClientCommand::OpeningCinematic => w.opening_cinematic(),
-                    ClientCommand::CompleteMovie => w.complete_movie(),
-                    ClientCommand::CompleteCinematic => w.complete_cinematic(),
-                    ClientCommand::NextCinematicCamera => w.next_cinematic_camera(),
-                    ClientCommand::MoveModeAck {
-                        guid,
-                        counter,
-                        mode,
-                        apply,
-                        flags,
-                        pos,
-                        orientation,
-                    } => w.move_mode_ack(guid, counter, mode, apply, flags, (pos, orientation)),
-                    ClientCommand::CollisionHeightAck {
-                        guid,
-                        counter,
-                        height,
-                        flags,
-                        pos,
-                        orientation,
-                    } => w.collision_height_ack(guid, counter, height, flags, (pos, orientation)),
-                    ClientCommand::KnockBackAck {
-                        guid,
-                        counter,
-                        launch,
-                        flags,
-                        pos,
-                        orientation,
-                        transport,
-                    } => {
-                        w.knock_back_ack(guid, counter, launch, flags, (pos, orientation), transport)
-                    }
-                    ClientCommand::RepopRequest => w.repop_request(),
-                    ClientCommand::CorpseQuery => w.corpse_query(),
-                    ClientCommand::UiTimeRequest => w.ui_time_request(),
-                    ClientCommand::AcceptLevelGrant { granter } => w.accept_level_grant(granter),
-                    ClientCommand::CorpseMapPositionQuery { transport } => {
-                        w.corpse_map_position_query(transport)
-                    }
-                    ClientCommand::ReclaimCorpse { corpse } => w.reclaim_corpse(corpse),
-                    ClientCommand::SelfRes => w.self_res(),
-                    ClientCommand::SpiritHealerActivate { npc } => w.spirit_healer_activate(npc),
-                    ClientCommand::ResurrectResponse { caster, accept } => {
-                        w.resurrect_response(caster, accept)
-                    }
-                    ClientCommand::GroupInvite { name, flags } => w.group_invite(&name, flags),
-                    ClientCommand::GroupAccept { roles } => w.group_accept(roles),
-                    ClientCommand::GroupDecline => w.group_decline(),
-                    ClientCommand::GroupUninvite { name } => w.group_uninvite(&name),
-                    ClientCommand::GroupUninviteGuid { guid, reason } => {
-                        w.group_uninvite_guid(guid, &reason)
-                    }
-                    ClientCommand::GroupSetLeader { guid } => w.group_set_leader(guid),
-                    ClientCommand::GroupLeave => w.group_disband(),
-                    ClientCommand::GroupRaidConvert => w.group_raid_convert(),
-                    ClientCommand::RequestPartyMemberStats { guid } => {
-                        w.request_party_member_stats(guid)
-                    }
-                    ClientCommand::LootMethod {
-                        method,
-                        master,
-                        threshold,
-                    } => w.loot_method(method, master, threshold),
-                    ClientCommand::SetRaidTarget { icon, guid } => w.raid_target_set(icon, guid),
-                    ClientCommand::RequestRaidTargets => w.raid_target_request(),
-                    ClientCommand::MinimapPing { x, y } => w.minimap_ping(x, y),
-                    ClientCommand::GroupChangeSubGroup { name, group } => {
-                        w.group_change_sub_group(&name, group)
-                    }
-                    ClientCommand::GroupSwapSubGroup { name, other } => {
-                        w.group_swap_sub_group(&name, &other)
-                    }
-                    ClientCommand::PartyAssignment {
-                        assignment,
-                        set,
-                        guid,
-                    } => w.party_assignment(assignment, set, guid),
-                    ClientCommand::SavedInstanceExtend {
-                        map,
-                        difficulty,
-                        extend,
-                    } => w.set_saved_instance_extend(map, difficulty, extend),
-                    ClientCommand::GroupAssistantLeader { guid, grant } => {
-                        w.group_assistant_leader(guid, grant)
-                    }
-                    ClientCommand::ReadyCheckStart => w.ready_check_start(),
-                    ClientCommand::ReadyCheckFinish => w.ready_check_finish(),
-                    ClientCommand::ReadyCheckAnswer { ready } => w.ready_check_answer(ready),
-                    ClientCommand::RequestRaidInfo => w.request_raid_info(),
-                    ClientCommand::ResetInstances => w.reset_instances(),
-                    ClientCommand::InstanceLockResponse { accept } => {
-                        w.instance_lock_response(accept)
-                    }
-                    ClientCommand::SetDungeonDifficulty { difficulty } => {
-                        w.set_dungeon_difficulty(difficulty)
-                    }
-                    ClientCommand::SetRaidDifficulty { difficulty } => {
-                        w.set_raid_difficulty(difficulty)
-                    }
-                    ClientCommand::DuelAccepted { arbiter } => w.duel_accepted(arbiter),
-                    ClientCommand::DuelCancelled { arbiter } => w.duel_cancelled(arbiter),
-                    ClientCommand::TogglePvp => w.toggle_pvp(),
-                    ClientCommand::SetPvp { state } => w.set_pvp(state),
-                    ClientCommand::ToggleHelm => w.toggle_helm(),
-                    ClientCommand::ToggleCloak => w.toggle_cloak(),
-                    ClientCommand::ContactList { mask } => w.contact_list(mask),
-                    ClientCommand::AddFriend { name, note } => w.add_friend(&name, &note),
-                    ClientCommand::DelFriend { guid } => w.del_friend(guid),
-                    ClientCommand::SetContactNotes { guid, note } => {
-                        w.set_contact_notes(guid, &note)
-                    }
-                    ClientCommand::AddIgnore { name } => w.add_ignore(&name),
-                    ClientCommand::DelIgnore { guid } => w.del_ignore(guid),
-                    ClientCommand::AddMute { name } => w.add_mute(&name),
-                    ClientCommand::DelMute { guid } => w.del_mute(guid),
-                    ClientCommand::Who { request } => w.who(&request),
-                    ClientCommand::ChatIgnored { guid } => w.chat_ignored(guid),
-                    ClientCommand::GuildQuery { guild_id } => w.guild_query(guild_id),
-                    ClientCommand::GuildCreate { name } => w.guild_create(&name),
-                    ClientCommand::GuildInvite { name } => w.guild_invite(&name),
-                    ClientCommand::GuildAccept => w.guild_accept(),
-                    ClientCommand::GuildDecline => w.guild_decline(),
-                    ClientCommand::GuildInfoRequest => w.guild_info(),
-                    ClientCommand::GuildEventLogQuery => w.guild_event_log_query(),
-                    ClientCommand::GuildBankMoneyWithdrawnRequest => w.guild_bank_money_withdrawn(),
-                    ClientCommand::GuildBank(send) => w.guild_bank(&send),
-                    ClientCommand::GuildPermissionsRequest => w.guild_permissions(),
-                    ClientCommand::GuildRosterRequest => w.guild_roster(),
-                    ClientCommand::GuildPromote { name } => w.guild_promote(&name),
-                    ClientCommand::GuildDemote { name } => w.guild_demote(&name),
-                    ClientCommand::GuildLeave => w.guild_leave(),
-                    ClientCommand::GuildRemove { name } => w.guild_remove(&name),
-                    ClientCommand::GuildDisband => w.guild_disband(),
-                    ClientCommand::GuildLeader { name } => w.guild_leader(&name),
-                    ClientCommand::GuildMotd { motd } => w.guild_motd(&motd),
-                    ClientCommand::GuildRank {
-                        rank_id,
-                        rights,
-                        name,
-                        gold_per_day,
-                        tabs,
-                    } => w.guild_rank(rank_id, rights, &name, gold_per_day, &tabs),
-                    ClientCommand::GuildAddRank { name } => w.guild_add_rank(&name),
-                    ClientCommand::GuildDelRank => w.guild_del_rank(),
-                    ClientCommand::GuildSetPublicNote { name, note } => {
-                        w.guild_set_public_note(&name, &note)
-                    }
-                    ClientCommand::GuildSetOfficerNote { name, note } => {
-                        w.guild_set_officer_note(&name, &note)
-                    }
-                    ClientCommand::GuildInfoText { text } => w.guild_info_text(&text),
-                    // Petitions: founding a guild.
-                    ClientCommand::PetitionShowList { npc } => w.petition_show_list(npc),
-                    ClientCommand::PetitionBuy { npc, name, index } => {
-                        w.petition_buy(npc, &name, index)
-                    }
-                    ClientCommand::PetitionShowSignatures { item } => {
-                        w.petition_show_signatures(item)
-                    }
-                    ClientCommand::PetitionSign { item, byte } => w.petition_sign(item, byte),
-                    ClientCommand::OfferPetition {
-                        team_size,
-                        item,
-                        player,
-                    } => w.offer_petition(team_size, item, player),
-                    ClientCommand::TurnInPetition { item } => w.turn_in_petition(item),
-                    ClientCommand::TurnInArenaPetition { item, banner } => {
-                        w.turn_in_arena_petition(item, banner)
-                    }
-                    ClientCommand::PetitionQuery { petition_id, item } => {
-                        w.petition_query(petition_id, item)
-                    }
-                    ClientCommand::PetitionRename { item, name } => w.petition_rename(item, &name),
-                    ClientCommand::PetitionDecline { item } => w.petition_decline(item),
-                    ClientCommand::TaxiNodeStatusQuery { guid } => w.taxi_node_status_query(guid),
-                    ClientCommand::TaxiQueryNodes { guid } => w.taxi_query_available_nodes(guid),
-                    ClientCommand::ActivateTaxi {
-                        guid,
-                        source_node,
-                        dest_node,
-                    } => w.activate_taxi(guid, source_node, dest_node),
-                    ClientCommand::ActivateTaxiExpress {
-                        guid,
-                        total_cost,
-                        nodes,
-                    } => w.activate_taxi_express(guid, total_cost, &nodes),
+        ClientCommand::Move {
+            kind,
+            flags,
+            pos,
+            orientation,
+            pitch,
+            fall_time,
+            jump,
+            transport,
+        } => w.send_movement(
+            kind.opcode(),
+            flags,
+            pos,
+            orientation,
+            pitch,
+            fall_time,
+            jump,
+            transport,
+        ),
+        ClientCommand::MoveSplineDone {
+            flags,
+            pos,
+            orientation,
+            spline_id,
+        } => w.move_spline_done(flags, pos, orientation, spline_id),
+        ClientCommand::MoveTimeSkipped { guid, lag_ms } => w.move_time_skipped(guid, lag_ms),
+        ClientCommand::TimeSyncResp { counter, client_ms } => w.time_sync_resp(counter, client_ms),
+        ClientCommand::ForceSpeedAck {
+            kind,
+            guid,
+            counter,
+            speed,
+            flags,
+            pos,
+            orientation,
+            pitch,
+            fall_time,
+            jump,
+            transport,
+        } => w.force_speed_change_ack(
+            kind,
+            guid,
+            counter,
+            speed,
+            flags,
+            pos,
+            orientation,
+            pitch,
+            fall_time,
+            jump,
+            transport,
+        ),
+        ClientCommand::Vehicle(v) => match v {
+            super::VehicleCommand::Empty(opcode) => w.request_vehicle(opcode),
+            super::VehicleCommand::Pitch {
+                opcode,
+                mover,
+                flags,
+                flags2,
+                pos,
+                orientation,
+                pitch,
+            } => w.move_pitch(opcode, mover, flags, flags2, pos, orientation, pitch),
+            super::VehicleCommand::SwitchSeat { vehicle, seat } => {
+                w.request_vehicle_switch_seat(vehicle, seat)
+            }
+            super::VehicleCommand::ByGuid { opcode, guid } => w.vehicle_guid(opcode, guid),
+            super::VehicleCommand::Controlled {
+                mover,
+                flags,
+                pos,
+                orientation,
+                seat,
+            } => w.controlled_vehicle(mover, flags, (pos, orientation), seat),
+            super::VehicleCommand::ProjectileHit {
+                caster,
+                spell,
+                cast_id,
+                at,
+            } => w.update_projectile_position(caster, spell, cast_id, at),
+        },
+        ClientCommand::SetActiveMover { guid } => w.set_active_mover(guid),
+        ClientCommand::NotActiveMover {
+            guid,
+            flags,
+            pos,
+            orientation,
+            fall_time,
+        } => w.move_not_active_mover(guid, flags, pos, orientation, fall_time),
+        ClientCommand::FarSight { engage } => w.far_sight(engage),
+        ClientCommand::TeleportAck { guid, counter } => w.teleport_ack(guid, counter),
+        ClientCommand::WorldportAck => w.worldport_ack(),
+        ClientCommand::SetSelection { guid } => w.set_selection(guid),
+        ClientCommand::GetMirrorImageData { guid } => w.get_mirror_image_data(guid),
+        ClientCommand::CancelAutoRepeat => w.cancel_auto_repeat(),
+        ClientCommand::CancelCast { spell_id } => w.cancel_cast(spell_id),
+        ClientCommand::CancelChannelling { spell_id } => w.cancel_channelling(spell_id),
+        ClientCommand::Chat {
+            kind,
+            target,
+            text,
+            language,
+        } => match kind.chat_type() {
+            Some(chat_type) => w.send_message_chat(chat_type, language, target.as_deref(), &text),
+            None => {
+                bevy::log::warn!("net: {kind:?} chat has no wire type on this client; not sent");
+                Ok(())
+            }
+        },
+        // The distribution is an enum, so its map to a chat type is total.
+        ClientCommand::AddonMessage { distribution, text } => {
+            w.send_addon_message(super::addon_wire_chat_type(distribution), &text)
+        }
+        ClientCommand::JoinChannel {
+            name,
+            password,
+            channel_id,
+            auto_joined,
+            voice,
+        } => w.join_channel(&name, &password, channel_id, auto_joined, voice),
+        ClientCommand::LeaveChannel { name, channel_id } => w.leave_channel(&name, channel_id),
+        ClientCommand::ChannelList { name } => w.channel_list(&name),
+        ClientCommand::SetChannelWatch { name } => w.set_channel_watch(&name),
+        ClientCommand::ChannelDisplayList { name } => w.channel_display_list(&name),
+        ClientCommand::RandomRoll { min, max } => w.random_roll(min, max),
+        ClientCommand::ChannelOwner { name } => w.channel_owner(&name),
+        ClientCommand::ChannelSetOwner { name, player } => w.channel_set_owner(&name, &player),
+        ClientCommand::ChannelPassword { name, password } => w.channel_password(&name, &password),
+        ClientCommand::ChannelModerator { name, player } => w.channel_moderator(&name, &player),
+        ClientCommand::ChannelUnmoderator { name, player } => w.channel_unmoderator(&name, &player),
+        ClientCommand::ChannelMute { name, player } => w.channel_mute(&name, &player),
+        ClientCommand::ChannelUnmute { name, player } => w.channel_unmute(&name, &player),
+        ClientCommand::ChannelInvite { name, player } => w.channel_invite(&name, &player),
+        ClientCommand::ChannelKick { name, player } => w.channel_kick(&name, &player),
+        ClientCommand::ChannelBan { name, player } => w.channel_ban(&name, &player),
+        ClientCommand::ChannelUnban { name, player } => w.channel_unban(&name, &player),
+        ClientCommand::ChannelAnnouncements { name } => w.channel_announcements(&name),
+        ClientCommand::ChannelModerate { name } => w.channel_moderate(&name),
+        ClientCommand::PlayedTime { show } => w.played_time(show),
+        ClientCommand::SocketGems { item, gems } => w.socket_gems(item, gems),
+        ClientCommand::ItemRefundInfo { item } => w.item_refund_info(item),
+        ClientCommand::ItemRefund { item } => w.item_refund(item),
+        ClientCommand::ReadItem { bag, slot } => w.read_item(bag, slot),
+        ClientCommand::ItemNameQuery { entry } => w.item_name_query(entry),
+        // Commands are written in order, so everything before it is out.
+        ClientCommand::Flush(done) => {
+            let _ = done.send(());
+            Ok(())
+        }
+        ClientCommand::AccountData(crate::account_data::Wire::Request { slot }) => {
+            w.request_account_data(slot)
+        }
+        ClientCommand::AccountData(crate::account_data::Wire::Upload { slot, time, bytes }) => {
+            bevy::log::info!(
+                "net: account data slot {slot} up ({} bytes, time {time})",
+                bytes.len()
+            );
+            w.update_account_data(slot, time, &bytes)
+        }
+        ClientCommand::NameQuery { guid } => w.name_query(guid),
+        ClientCommand::CreatureQuery { entry, guid } => w.creature_query(entry, guid),
+        ClientCommand::PetNameQuery { pet_number, guid } => w.pet_name_query(pet_number, guid),
+        ClientCommand::ItemQuery { entry, guid } => w.item_query(entry, guid),
+        ClientCommand::UseItem {
+            bag_index,
+            slot,
+            spell_id,
+            item_guid,
+            target,
+        } => w.use_item(bag_index, slot, spell_id, item_guid, target),
+        ClientCommand::OpenItem { bag_index, slot } => w.open_item(bag_index, slot),
+        ClientCommand::WrapItem {
+            gift_bag,
+            gift_slot,
+            item_bag,
+            item_slot,
+        } => w.wrap_item(gift_bag, gift_slot, item_bag, item_slot),
+        ClientCommand::AutoEquipItem { bag_index, slot } => w.auto_equip_item(bag_index, slot),
+        ClientCommand::SetAmmo { entry } => w.set_ammo(entry),
+        ClientCommand::SwapInvItem { src_slot, dst_slot } => w.swap_inv_item(src_slot, dst_slot),
+        ClientCommand::SwapItem {
+            dst_bag,
+            dst_slot,
+            src_bag,
+            src_slot,
+        } => w.swap_item(dst_bag, dst_slot, src_bag, src_slot),
+        ClientCommand::AutoStoreBagItem {
+            src_bag,
+            src_slot,
+            dst_bag,
+        } => w.auto_store_bag_item(src_bag, src_slot, dst_bag),
+        ClientCommand::SplitItem {
+            src_bag,
+            src_slot,
+            dst_bag,
+            dst_slot,
+            count,
+        } => w.split_item(src_bag, src_slot, dst_bag, dst_slot, count),
+        ClientCommand::DestroyItem {
+            bag_index,
+            slot,
+            count,
+        } => w.destroy_item(bag_index, slot, count),
+        ClientCommand::CastSpell { spell_id, target } => w.cast_spell(spell_id, target),
+        ClientCommand::CastSpellCorpse {
+            spell_id,
+            target,
+            corpse_guid,
+        } => w.cast_spell_corpse(spell_id, target, corpse_guid),
+        ClientCommand::CastSpellAtDest { spell_id, dest } => w.cast_spell_at_dest(spell_id, dest),
+        ClientCommand::CastSpellAtSource { spell_id, src } => w.cast_spell_at_source(spell_id, src),
+        ClientCommand::CancelAura { spell_id } => w.cancel_aura(spell_id),
+        ClientCommand::CancelMountAura => w.cancel_mount_aura(),
+        ClientCommand::DismissCritter { guid } => w.dismiss_critter(guid),
+        ClientCommand::SetActionButton { button, packed } => w.set_action_button(button, packed),
+        ClientCommand::TotemDestroyed { slot } => w.totem_destroyed(slot),
+        ClientCommand::SetActionBarToggles { toggles } => w.set_actionbar_toggles(toggles),
+        ClientCommand::PetAction {
+            pet_guid,
+            packed,
+            target_guid,
+        } => w.pet_action(pet_guid, packed, target_guid),
+        ClientCommand::PetCastSpell {
+            pet_guid,
+            spell_id,
+            target,
+        } => w.pet_cast_spell(pet_guid, spell_id, target),
+        ClientCommand::PetCastTrajectory {
+            pet_guid,
+            spell_id,
+            shot,
+            flags,
+            flags2,
+            pos,
+            orientation,
+        } => w.pet_cast_trajectory(pet_guid, spell_id, &shot, flags, flags2, pos, orientation),
+        ClientCommand::PetSetAction { pet_guid, entries } => w.pet_set_action(pet_guid, &entries),
+        ClientCommand::PetStopAttack { pet_guid } => w.pet_stop_attack(pet_guid),
+        ClientCommand::PetCancelAura { pet_guid, spell_id } => {
+            w.pet_cancel_aura(pet_guid, spell_id)
+        }
+        ClientCommand::PetSpellAutocast {
+            pet_guid,
+            spell_id,
+            enabled,
+        } => w.pet_spell_autocast(pet_guid, spell_id, enabled),
+        ClientCommand::PetAbandon { pet_guid } => w.pet_abandon(pet_guid),
+        ClientCommand::PetRename { pet_guid, name } => w.pet_rename(pet_guid, &name),
+        ClientCommand::RequestPetInfo => w.request_pet_info(),
+        ClientCommand::AttackSwing { guid } => w.attack_swing(guid),
+        ClientCommand::AttackStop => w.attack_stop(),
+        ClientCommand::SetSheathed { state } => w.set_sheathed(state),
+        ClientCommand::StandStateChange { state } => w.stand_state_change(state),
+        ClientCommand::MountSpecial => w.mount_special(),
+        ClientCommand::Emote { emote_id } => w.emote(emote_id),
+        ClientCommand::TextEmote {
+            text_id,
+            file_index,
+            target,
+        } => w.text_emote(text_id, file_index, target),
+        ClientCommand::GossipHello { guid } => w.gossip_hello(guid),
+        ClientCommand::GossipSelectOption {
+            guid,
+            menu_id,
+            option,
+            code,
+        } => w.gossip_select_option(guid, menu_id, option, code.as_deref()),
+        ClientCommand::NpcTextQuery { text_id, guid } => w.npc_text_query(text_id, guid),
+        ClientCommand::ListInventory { guid } => w.list_inventory(guid),
+        ClientCommand::BuyItem {
+            vendor,
+            entry,
+            slot,
+            count,
+        } => w.buy_item(vendor, entry, slot, count),
+        ClientCommand::BuyItemInSlot {
+            vendor,
+            entry,
+            slot,
+            bag_guid,
+            bag_slot,
+            count,
+        } => w.buy_item_in_slot(vendor, entry, slot, bag_guid, bag_slot, count),
+        ClientCommand::SellItem {
+            vendor,
+            item_guid,
+            count,
+        } => w.sell_item(vendor, item_guid, count),
+        ClientCommand::BuybackItem { vendor, slot } => w.buyback_item(vendor, slot),
+        ClientCommand::RepairItem {
+            vendor,
+            item_guid,
+            guild_bank,
+        } => w.repair_item(vendor, item_guid, guild_bank),
+        ClientCommand::GmTicketCreate {
+            map,
+            pos,
+            text,
+            need_response,
+            more_help,
+        } => w.gm_ticket_create(map, pos, &text, need_response, more_help),
+        ClientCommand::GmTicketUpdate { text } => w.gm_ticket_updatetext(&text),
+        ClientCommand::GmResponseResolve => w.gm_response_resolve(),
+        ClientCommand::GmTicketGet => w.gm_ticket_get(),
+        ClientCommand::GmTicketDelete => w.gm_ticket_delete(),
+        ClientCommand::GmTicketSystemStatus => w.gm_ticket_system_status(),
+        ClientCommand::GmReportLag { kind, map, pos } => w.gm_report_lag(kind, map, pos),
+        ClientCommand::GmSurveySubmit {
+            survey,
+            answers,
+            comment,
+        } => w.gm_survey_submit(survey, &answers, &comment),
+        ClientCommand::BinderActivate { binder } => w.binder_activate(binder),
+        ClientCommand::SummonResponse { summoner, agree } => w.summon_response(summoner, agree),
+        ClientCommand::TalentWipeConfirm { trainer } => w.talent_wipe_confirm(trainer),
+        ClientCommand::ForceLogout => w.player_logout(),
+        ClientCommand::AreaSpiritHealerQueue { healer } => w.area_spirit_healer_queue(healer),
+        ClientCommand::AreaSpiritHealerQuery { healer } => w.area_spirit_healer_query(healer),
+        ClientCommand::BattlefieldPort { queue, accept } => w.battlefield_port(queue, accept),
+        ClientCommand::RequestBattlefieldScoreData => w.request_battlefield_score_data(),
+        ClientCommand::LeaveBattlefield { queue } => w.leave_battlefield(queue),
+        ClientCommand::HearthAndResurrect => w.hearth_and_resurrect(),
+        ClientCommand::BattlefieldMgr(r) => {
+            use benilla_ui::script::BattlefieldMgrRequest as R;
+            match r {
+                R::EntryInviteResponse { queue_id, accept } => {
+                    w.bf_mgr_entry_invite_response(queue_id as u32, accept)
+                }
+                R::QueueInviteResponse { queue_id, accept } => {
+                    w.bf_mgr_queue_invite_response(queue_id as u32, accept)
+                }
+                R::QueueRequest { queue_id } => w.bf_mgr_queue_request(queue_id as u32),
+                R::ExitRequest { queue_id } => w.bf_mgr_exit_request(queue_id as u32),
+            }
+        }
+        ClientCommand::ArenaTeam(c) => {
+            use crate::net::ArenaTeamCommand as A;
+            match c {
+                A::Query { team_id } => w.arena_team_query(team_id),
+                A::Roster { team_id } => w.arena_team_roster(team_id),
+                A::Invite { team_id, name } => w.arena_team_invite(team_id, &name),
+                A::Remove { team_id, name } => w.arena_team_remove(team_id, &name),
+                A::Leader { team_id, name } => w.arena_team_leader(team_id, &name),
+                A::Leave { team_id } => w.arena_team_leave(team_id),
+                A::Disband { team_id } => w.arena_team_disband(team_id),
+                A::Accept => w.arena_team_accept(),
+                A::Decline => w.arena_team_decline(),
+            }
+        }
+        ClientCommand::Lfg(request) => lfg_send(w, request),
+        ClientCommand::Calendar(command) => w.calendar(&command),
+        ClientCommand::TutorialFlag { id } => w.tutorial_flag(id),
+        ClientCommand::TutorialClear => w.tutorial_clear(),
+        ClientCommand::TutorialReset => w.tutorial_reset(),
+        ClientCommand::BattlefieldList {
+            bg_type,
+            xp_disabled,
+        } => w.battlefield_list(bg_type, xp_disabled),
+        ClientCommand::RequestBattlefieldPositions => w.request_battlefield_positions(),
+        ClientCommand::TabardVendorActivate { npc } => w.tabard_vendor_activate(npc),
+        ClientCommand::SaveGuildEmblem { vendor, design } => w.save_guild_emblem(vendor, design),
+        ClientCommand::AlterAppearance { styles } => w.alter_appearance(styles),
+        ClientCommand::BattlemasterHello { npc } => w.battlemaster_hello(npc),
+        ClientCommand::BattlemasterJoin {
+            battlemaster,
+            bg_type,
+            instance_id,
+            as_group,
+        } => w.battlemaster_join(battlemaster, bg_type, instance_id, as_group),
+        ClientCommand::BattlemasterJoinArena {
+            battlemaster,
+            slot,
+            as_group,
+            rated,
+        } => w.battlemaster_join_arena(battlemaster, slot, as_group, rated),
+        ClientCommand::BattlefieldStatusRequest => w.battlefield_status(),
+        ClientCommand::PetUnlearn { trainer } => w.pet_unlearn(trainer),
+        ClientCommand::BankerActivate { guid } => w.banker_activate(guid),
+        ClientCommand::SpellClick { guid } => w.spell_click(guid),
+        ClientCommand::BuyBankSlot { guid } => w.buy_bank_slot(guid),
+        ClientCommand::AutoBankItem { bag, slot } => w.autobank_item(bag, slot),
+        ClientCommand::AutoStoreBankItem { bag, slot } => w.autostore_bank_item(bag, slot),
+        ClientCommand::TrainerList { trainer } => w.trainer_list(trainer),
+        ClientCommand::TrainerBuySpell { trainer, spell_id } => {
+            w.trainer_buy_spell(trainer, spell_id)
+        }
+        ClientCommand::ListStabledPets { npc } => w.list_stabled_pets(npc),
+        ClientCommand::StablePet { npc } => w.stable_pet(npc),
+        ClientCommand::UnstablePet { npc, pet_number } => w.unstable_pet(npc, pet_number),
+        ClientCommand::StableSwapPet { npc, pet_number } => w.stable_swap_pet(npc, pet_number),
+        ClientCommand::BuyStableSlot { npc } => w.buy_stable_slot(npc),
+        ClientCommand::LearnTalent { talent_id, rank } => w.learn_talent(talent_id, rank),
+        ClientCommand::RemoveGlyph { socket } => w.remove_glyph(socket),
+        ClientCommand::SetTitle { mask_id } => w.set_title(mask_id),
+        ClientCommand::EquipmentSetSave(set) => {
+            w.equipment_set_save(set.guid, set.id, &set.name, &set.icon, &set.items)
+        }
+        ClientCommand::EquipmentSetDelete { guid } => w.equipment_set_delete(guid),
+        ClientCommand::EquipmentSetUse { slots } => w.equipment_set_use(&slots),
+        ClientCommand::LearnPreviewTalents { talents } => w.learn_preview_talents(&talents),
+        ClientCommand::PetLearnTalent {
+            pet_guid,
+            talent_id,
+            rank,
+        } => w.pet_learn_talent(pet_guid, talent_id, rank),
+        ClientCommand::LearnPreviewTalentsPet { pet_guid, talents } => {
+            w.learn_preview_talents_pet(pet_guid, &talents)
+        }
+        ClientCommand::UnlearnSkill { skill_id } => w.unlearn_skill(skill_id),
+        ClientCommand::SetFactionAtWar {
+            rep_list_id,
+            at_war,
+        } => w.set_faction_at_war(rep_list_id, at_war),
+        ClientCommand::SetFactionInactive {
+            rep_list_id,
+            inactive,
+        } => w.set_faction_inactive(rep_list_id, inactive),
+        ClientCommand::SetWatchedFaction { rep_list_id } => w.set_watched_faction(rep_list_id),
+        ClientCommand::GameObjUse { guid } => w.gameobj_use(guid),
+        ClientCommand::AreaTrigger { trigger_id } => w.area_trigger(trigger_id),
+        ClientCommand::GameObjectQuery { entry, guid } => w.gameobject_query(entry, guid),
+        ClientCommand::PageTextQuery { page_id, guid } => w.page_text_query(page_id, guid),
+        ClientCommand::CastSpellGameObject { spell_id, go_guid } => {
+            w.cast_spell_gameobject(spell_id, go_guid)
+        }
+        ClientCommand::CastSpellItem {
+            spell_id,
+            item_guid,
+        } => w.cast_spell_item(spell_id, item_guid),
+        ClientCommand::CastSpellTradeItem { spell_id } => w.cast_spell_trade_item(spell_id),
+        ClientCommand::CastSpellGlyph { spell_id } => w.cast_spell_glyph(spell_id),
+        ClientCommand::LootMasterGive { guid, slot, target } => {
+            w.loot_master_give(guid, slot, target)
+        }
+        ClientCommand::Loot { guid } => w.loot(guid),
+        ClientCommand::AutostoreLootItem { slot } => w.autostore_loot_item(slot),
+        ClientCommand::LootMoney => w.loot_money(),
+        ClientCommand::LootRelease { guid } => w.loot_release(guid),
+        ClientCommand::LootRoll {
+            looted_target,
+            item_slot,
+            roll_type,
+        } => w.loot_roll(looted_target, item_slot, roll_type),
+        ClientCommand::QuestgiverQuery { npc, quest } => w.questgiver_query_quest(npc, quest),
+        ClientCommand::QuestgiverAccept {
+            npc,
+            quest,
+            start_cheat,
+        } => w.questgiver_accept_quest(npc, quest, start_cheat),
+        ClientCommand::QuestgiverComplete { npc, quest } => w.questgiver_complete_quest(npc, quest),
+        ClientCommand::QuestgiverRequestReward { npc, quest } => {
+            w.questgiver_request_reward(npc, quest)
+        }
+        ClientCommand::QuestgiverChooseReward { npc, quest, choice } => {
+            w.questgiver_choose_reward(npc, quest, choice)
+        }
+        ClientCommand::QuestQuery { quest } => w.quest_query(quest),
+        ClientCommand::QueryQuestsCompleted => w.query_quests_completed(),
+        ClientCommand::QuestgiverStatusMultipleQuery => w.questgiver_status_multiple_query(),
+        ClientCommand::QuestPoiQuery { quests } => w.quest_poi_query(&quests),
+        ClientCommand::QuestgiverStatusQuery { npc } => w.questgiver_status_query(npc),
+        ClientCommand::QuestgiverHello { npc } => w.questgiver_hello(npc),
+        ClientCommand::QuestlogRemove { slot } => w.questlog_remove_quest(slot),
+        ClientCommand::PushQuestToParty { quest } => w.push_quest_to_party(quest),
+        ClientCommand::QuestConfirmAccept { quest } => w.quest_confirm_accept(quest),
+        ClientCommand::QuestPushResult { sharer, quest, msg } => {
+            w.quest_push_result(sharer, quest, msg)
+        }
+        ClientCommand::GetMailList { mailbox } => w.get_mail_list(mailbox),
+        ClientCommand::SendMail {
+            mailbox,
+            receiver,
+            subject,
+            body,
+            stationery,
+            package,
+            items,
+            money,
+            cod,
+        } => w.send_mail(
+            mailbox, &receiver, &subject, &body, stationery, package, &items, money, cod,
+        ),
+        ClientCommand::MailTakeMoney { mailbox, mail_id } => w.mail_take_money(mailbox, mail_id),
+        ClientCommand::MailTakeItem {
+            mailbox,
+            mail_id,
+            item_guid_low,
+        } => w.mail_take_item(mailbox, mail_id, item_guid_low),
+        ClientCommand::MailMarkAsRead { mailbox, mail_id } => w.mail_mark_as_read(mailbox, mail_id),
+        ClientCommand::MailReturnToSender {
+            mailbox,
+            mail_id,
+            sender,
+        } => w.mail_return_to_sender(mailbox, mail_id, sender),
+        ClientCommand::SetTaxiBenchmarkMode { on } => w.set_taxi_benchmark_mode(on),
+        ClientCommand::SkillBuyRank { lines } => w.skill_buy_rank(&lines),
+        ClientCommand::SkillBuyStep { line } => w.skill_buy_step(line),
+        ClientCommand::CancelTempEnchantment { slot } => w.cancel_temp_enchantment(slot),
+        ClientCommand::AutoEquipItemSlot { item, slot } => w.auto_equip_item_slot(item, slot),
+        ClientCommand::GrantLevel { friend } => w.grant_level(friend),
+        ClientCommand::DeclineChannelInvite { name } => w.decline_channel_invite(&name),
+        ClientCommand::OptOutOfLoot { on } => w.opt_out_of_loot(on),
+        ClientCommand::ReportPvpAfk { guid } => w.report_pvp_afk(guid),
+        ClientCommand::ComplainChat {
+            sender,
+            sender_word,
+            chat_type,
+            zone_channel,
+            age_secs,
+            description,
+        } => w.complaint_chat(
+            sender,
+            sender_word,
+            chat_type,
+            zone_channel,
+            age_secs,
+            &description,
+        ),
+        ClientCommand::ComplainMail { sender, mail_id } => w.complaint_mail(sender, mail_id),
+        ClientCommand::MailDelete {
+            mailbox,
+            mail_id,
+            reason,
+        } => w.mail_delete(mailbox, mail_id, reason),
+        ClientCommand::MailCreateTextItem { mailbox, mail_id } => {
+            w.mail_create_text_item(mailbox, mail_id)
+        }
+        ClientCommand::ItemTextQuery { item_guid } => w.item_text_query(item_guid),
+        ClientCommand::QueryNextMailTime => w.query_next_mail_time(),
+        // The auction house: the auctioneer guid rides on every verb.
+        ClientCommand::AuctionHello { auctioneer } => w.auction_hello(auctioneer),
+        ClientCommand::AuctionListItems { auctioneer, query } => {
+            w.auction_list_items(auctioneer, &query)
+        }
+        ClientCommand::AuctionListOwnerItems {
+            auctioneer,
+            list_from,
+        } => w.auction_list_owner_items(auctioneer, list_from),
+        ClientCommand::AuctionListPendingSales { auctioneer } => {
+            w.auction_list_pending_sales(auctioneer)
+        }
+        ClientCommand::AuctionListBidderItems {
+            auctioneer,
+            list_from,
+            auction_ids,
+        } => w.auction_list_bidder_items(auctioneer, list_from, &auction_ids),
+        ClientCommand::AuctionSellItem {
+            auctioneer,
+            items,
+            bid,
+            buyout,
+            etime_minutes,
+        } => w.auction_sell_item(auctioneer, &items, bid, buyout, etime_minutes),
+        ClientCommand::AuctionPlaceBid {
+            auctioneer,
+            auction_id,
+            price,
+        } => w.auction_place_bid(auctioneer, auction_id, price),
+        ClientCommand::AuctionRemoveItem {
+            auctioneer,
+            auction_id,
+        } => w.auction_remove_item(auctioneer, auction_id),
+        ClientCommand::QueryTime => w.query_time(),
+        // No reply is awaited.
+        ClientCommand::Inspect { target } => w.inspect(target),
+        // Answered on the same opcode.
+        ClientCommand::InspectHonorStats { target } => w
+            .inspect_honor_stats(target)
+            .and_then(|()| w.inspect_arena_teams(target)),
+        ClientCommand::QueryInspectAchievements { target } => w.query_inspect_achievements(target),
+        ClientCommand::InitiateTrade { target } => w.initiate_trade(target),
+        ClientCommand::BeginTrade => w.begin_trade(),
+        ClientCommand::BusyTrade => w.busy_trade(),
+        ClientCommand::IgnoreTrade => w.ignore_trade(),
+        ClientCommand::AcceptTrade { their_state } => w.accept_trade(their_state),
+        ClientCommand::UnacceptTrade => w.unaccept_trade(),
+        ClientCommand::CancelTrade => w.cancel_trade(),
+        ClientCommand::SetTradeGold { copper } => w.set_trade_gold(copper),
+        ClientCommand::SetTradeItem {
+            trade_slot,
+            bag,
+            slot,
+        } => w.set_trade_item(trade_slot, bag, slot),
+        ClientCommand::ClearTradeItem { trade_slot } => w.clear_trade_item(trade_slot),
+        ClientCommand::Logout => w.logout_request(),
+        ClientCommand::LogoutCancel => w.logout_cancel(),
+        ClientCommand::OpeningCinematic => w.opening_cinematic(),
+        ClientCommand::CompleteMovie => w.complete_movie(),
+        ClientCommand::CompleteCinematic => w.complete_cinematic(),
+        ClientCommand::NextCinematicCamera => w.next_cinematic_camera(),
+        ClientCommand::MoveModeAck {
+            guid,
+            counter,
+            mode,
+            apply,
+            flags,
+            pos,
+            orientation,
+        } => w.move_mode_ack(guid, counter, mode, apply, flags, (pos, orientation)),
+        ClientCommand::CollisionHeightAck {
+            guid,
+            counter,
+            height,
+            flags,
+            pos,
+            orientation,
+        } => w.collision_height_ack(guid, counter, height, flags, (pos, orientation)),
+        ClientCommand::KnockBackAck {
+            guid,
+            counter,
+            launch,
+            flags,
+            pos,
+            orientation,
+            transport,
+        } => w.knock_back_ack(guid, counter, launch, flags, (pos, orientation), transport),
+        ClientCommand::RepopRequest => w.repop_request(),
+        ClientCommand::CorpseQuery => w.corpse_query(),
+        ClientCommand::UiTimeRequest => w.ui_time_request(),
+        ClientCommand::AcceptLevelGrant { granter } => w.accept_level_grant(granter),
+        ClientCommand::CorpseMapPositionQuery { transport } => {
+            w.corpse_map_position_query(transport)
+        }
+        ClientCommand::ReclaimCorpse { corpse } => w.reclaim_corpse(corpse),
+        ClientCommand::SelfRes => w.self_res(),
+        ClientCommand::SpiritHealerActivate { npc } => w.spirit_healer_activate(npc),
+        ClientCommand::ResurrectResponse { caster, accept } => w.resurrect_response(caster, accept),
+        ClientCommand::GroupInvite { name, flags } => w.group_invite(&name, flags),
+        ClientCommand::GroupAccept { roles } => w.group_accept(roles),
+        ClientCommand::GroupDecline => w.group_decline(),
+        ClientCommand::GroupUninvite { name } => w.group_uninvite(&name),
+        ClientCommand::GroupUninviteGuid { guid, reason } => w.group_uninvite_guid(guid, &reason),
+        ClientCommand::GroupSetLeader { guid } => w.group_set_leader(guid),
+        ClientCommand::GroupLeave => w.group_disband(),
+        ClientCommand::GroupRaidConvert => w.group_raid_convert(),
+        ClientCommand::RequestPartyMemberStats { guid } => w.request_party_member_stats(guid),
+        ClientCommand::LootMethod {
+            method,
+            master,
+            threshold,
+        } => w.loot_method(method, master, threshold),
+        ClientCommand::SetRaidTarget { icon, guid } => w.raid_target_set(icon, guid),
+        ClientCommand::RequestRaidTargets => w.raid_target_request(),
+        ClientCommand::MinimapPing { x, y } => w.minimap_ping(x, y),
+        ClientCommand::GroupChangeSubGroup { name, group } => {
+            w.group_change_sub_group(&name, group)
+        }
+        ClientCommand::GroupSwapSubGroup { name, other } => w.group_swap_sub_group(&name, &other),
+        ClientCommand::PartyAssignment {
+            assignment,
+            set,
+            guid,
+        } => w.party_assignment(assignment, set, guid),
+        ClientCommand::SavedInstanceExtend {
+            map,
+            difficulty,
+            extend,
+        } => w.set_saved_instance_extend(map, difficulty, extend),
+        ClientCommand::GroupAssistantLeader { guid, grant } => {
+            w.group_assistant_leader(guid, grant)
+        }
+        ClientCommand::ReadyCheckStart => w.ready_check_start(),
+        ClientCommand::ReadyCheckFinish => w.ready_check_finish(),
+        ClientCommand::ReadyCheckAnswer { ready } => w.ready_check_answer(ready),
+        ClientCommand::RequestRaidInfo => w.request_raid_info(),
+        ClientCommand::ResetInstances => w.reset_instances(),
+        ClientCommand::InstanceLockResponse { accept } => w.instance_lock_response(accept),
+        ClientCommand::SetDungeonDifficulty { difficulty } => w.set_dungeon_difficulty(difficulty),
+        ClientCommand::SetRaidDifficulty { difficulty } => w.set_raid_difficulty(difficulty),
+        ClientCommand::DuelAccepted { arbiter } => w.duel_accepted(arbiter),
+        ClientCommand::DuelCancelled { arbiter } => w.duel_cancelled(arbiter),
+        ClientCommand::TogglePvp => w.toggle_pvp(),
+        ClientCommand::SetPvp { state } => w.set_pvp(state),
+        ClientCommand::ToggleHelm => w.toggle_helm(),
+        ClientCommand::ToggleCloak => w.toggle_cloak(),
+        ClientCommand::ContactList { mask } => w.contact_list(mask),
+        ClientCommand::AddFriend { name, note } => w.add_friend(&name, &note),
+        ClientCommand::DelFriend { guid } => w.del_friend(guid),
+        ClientCommand::SetContactNotes { guid, note } => w.set_contact_notes(guid, &note),
+        ClientCommand::AddIgnore { name } => w.add_ignore(&name),
+        ClientCommand::DelIgnore { guid } => w.del_ignore(guid),
+        ClientCommand::AddMute { name } => w.add_mute(&name),
+        ClientCommand::DelMute { guid } => w.del_mute(guid),
+        ClientCommand::Who { request } => w.who(&request),
+        ClientCommand::ChatIgnored { guid } => w.chat_ignored(guid),
+        ClientCommand::GuildQuery { guild_id } => w.guild_query(guild_id),
+        ClientCommand::GuildCreate { name } => w.guild_create(&name),
+        ClientCommand::GuildInvite { name } => w.guild_invite(&name),
+        ClientCommand::GuildAccept => w.guild_accept(),
+        ClientCommand::GuildDecline => w.guild_decline(),
+        ClientCommand::GuildInfoRequest => w.guild_info(),
+        ClientCommand::GuildEventLogQuery => w.guild_event_log_query(),
+        ClientCommand::GuildBankMoneyWithdrawnRequest => w.guild_bank_money_withdrawn(),
+        ClientCommand::GuildBank(send) => w.guild_bank(&send),
+        ClientCommand::GuildPermissionsRequest => w.guild_permissions(),
+        ClientCommand::GuildRosterRequest => w.guild_roster(),
+        ClientCommand::GuildPromote { name } => w.guild_promote(&name),
+        ClientCommand::GuildDemote { name } => w.guild_demote(&name),
+        ClientCommand::GuildLeave => w.guild_leave(),
+        ClientCommand::GuildRemove { name } => w.guild_remove(&name),
+        ClientCommand::GuildDisband => w.guild_disband(),
+        ClientCommand::GuildLeader { name } => w.guild_leader(&name),
+        ClientCommand::GuildMotd { motd } => w.guild_motd(&motd),
+        ClientCommand::GuildRank {
+            rank_id,
+            rights,
+            name,
+            gold_per_day,
+            tabs,
+        } => w.guild_rank(rank_id, rights, &name, gold_per_day, &tabs),
+        ClientCommand::GuildAddRank { name } => w.guild_add_rank(&name),
+        ClientCommand::GuildDelRank => w.guild_del_rank(),
+        ClientCommand::GuildSetPublicNote { name, note } => w.guild_set_public_note(&name, &note),
+        ClientCommand::GuildSetOfficerNote { name, note } => w.guild_set_officer_note(&name, &note),
+        ClientCommand::GuildInfoText { text } => w.guild_info_text(&text),
+        // Petitions: founding a guild.
+        ClientCommand::PetitionShowList { npc } => w.petition_show_list(npc),
+        ClientCommand::PetitionBuy { npc, name, index } => w.petition_buy(npc, &name, index),
+        ClientCommand::PetitionShowSignatures { item } => w.petition_show_signatures(item),
+        ClientCommand::PetitionSign { item, byte } => w.petition_sign(item, byte),
+        ClientCommand::OfferPetition {
+            team_size,
+            item,
+            player,
+        } => w.offer_petition(team_size, item, player),
+        ClientCommand::TurnInPetition { item } => w.turn_in_petition(item),
+        ClientCommand::TurnInArenaPetition { item, banner } => {
+            w.turn_in_arena_petition(item, banner)
+        }
+        ClientCommand::PetitionQuery { petition_id, item } => w.petition_query(petition_id, item),
+        ClientCommand::PetitionRename { item, name } => w.petition_rename(item, &name),
+        ClientCommand::PetitionDecline { item } => w.petition_decline(item),
+        ClientCommand::TaxiNodeStatusQuery { guid } => w.taxi_node_status_query(guid),
+        ClientCommand::TaxiQueryNodes { guid } => w.taxi_query_available_nodes(guid),
+        ClientCommand::ActivateTaxi {
+            guid,
+            source_node,
+            dest_node,
+        } => w.activate_taxi(guid, source_node, dest_node),
+        ClientCommand::ActivateTaxiExpress {
+            guid,
+            total_cost,
+            nodes,
+        } => w.activate_taxi_express(guid, total_cost, &nodes),
     }
 }
 

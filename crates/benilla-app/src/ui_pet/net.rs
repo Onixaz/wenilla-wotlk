@@ -68,7 +68,8 @@ fn on_action_feedback(
         // A refused target refunds the spell's start cooldown and refreshes the pet's
         // (`0x5d4e42`, `0x5d4e83` -> `0x804780`).
         if matches!(reason, 2 | 3) {
-            bar.cooldowns.clear_gcd(spell, bevy::platform::time::Instant::now());
+            bar.cooldowns
+                .clear_gcd(spell, bevy::platform::time::Instant::now());
         }
     }
 }
@@ -86,7 +87,8 @@ fn on_cast_failed(
     {
         bar.pending_cast = None;
         // The start cooldown the press armed clears, then the pet bar refreshes (`0x806d41`).
-        bar.cooldowns.clear_gcd(spell_id, bevy::platform::time::Instant::now());
+        bar.cooldowns
+            .clear_gcd(spell_id, bevy::platform::time::Instant::now());
         pet_cast_failed(spell_id, reason, arg, &mut errors);
     }
 }
