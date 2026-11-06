@@ -13,6 +13,9 @@ use super::DoodadAnimHost;
 /// Reaping starts below this slot headroom: room for the eager lanes and a stream-in burst.
 pub(crate) const REAP_LOW_WATER: usize = 256;
 
+// A reaped host wakes into the headroom between the bodies' reserve and the low-water mark.
+const _: () = assert!(crate::rig_palette::BODY_RESERVE < REAP_LOW_WATER);
+
 /// Demotions per frame under pressure: enough to outpace a stream-in without a one-frame spike.
 const REAP_PER_FRAME: usize = 64;
 
@@ -31,6 +34,8 @@ pub(crate) struct LazyRig {
 
 /// A part's static and skinned meshes, swapped by promote and demote and kept resident here.
 #[derive(Component)]
+// Sparse: only lazily skinned doodad parts carry it, and a column would split their tables.
+#[component(storage = "SparseSet")]
 pub(crate) struct SkinnedTwin {
     pub(crate) skinned: Handle<Mesh>,
     pub(crate) stat: Handle<Mesh>,
@@ -59,8 +64,12 @@ pub(super) fn promote_lazy_rig(
     pose: Option<&crate::rig_anim::RigPose>,
     parts: &mut TwinParts,
 ) -> bool {
+    // Bodies' reserve or a full table: the gate retries while drawn.
+    if !palettes.room_beyond_bodies() {
+        return false;
+    }
     let Some(rig) = RigSkin::allocate_bones(palettes, lazy.bones, lazy.ibp.clone()) else {
-        return false; // table full: the gate retries while drawn
+        return false;
     };
     let slot = rig.slot;
     if let (Some(ibp), Some(pose)) = (ibps.get(&lazy.ibp), pose) {
@@ -298,7 +307,17 @@ mod tests {
             "full table ⇒ denied, static mesh"
         );
 
-        let freed = hoard[0].slot;
+        // Free the bodies' reserve: a doodad still waits.
+        let reserve = crate::rig_palette::BODY_RESERVE;
+        for skin in &hoard[..reserve] {
+            app.world_mut()
+                .resource_mut::<RigPalettes>()
+                .free(skin.slot);
+        }
+        app.update();
+        assert_eq!(rig_slot(&app, host), None, "the reserve is the bodies'");
+
+        let freed = hoard[reserve].slot;
         app.world_mut().resource_mut::<RigPalettes>().free(freed);
         app.update();
         assert!(rig_slot(&app, host).is_some(), "room ⇒ the retry lands");

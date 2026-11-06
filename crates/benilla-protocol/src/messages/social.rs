@@ -394,6 +394,57 @@ fn cstring_body(s: &str) -> Vec<u8> {
     body
 }
 
+/// `CMSG_COMPLAIN` reporting a mail (`0x56faf0`): `u8 0`, the sender's guid, `u32 0`, the mail's
+/// id, `u32 0`.
+pub fn complaint_mail(sender: u64, message_id: u32) -> Vec<u8> {
+    let mut body = Vec::with_capacity(21);
+    body.push(0);
+    body.extend_from_slice(&sender.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&message_id.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body
+}
+
+/// `CMSG_COMPLAIN` reporting a chat line (`0x50dfd0`): type 1, the sender, the `u32` that
+/// followed the sender in its `SMSG_MESSAGECHAT`, the wire chat type, the zone channel id, the
+/// line's age in seconds and its description text.
+pub fn complaint_chat(
+    sender: u64,
+    sender_word: u32,
+    chat_type: u32,
+    zone_channel: u32,
+    age_secs: u32,
+    description: &str,
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(26 + description.len());
+    body.push(1);
+    body.extend_from_slice(&sender.to_le_bytes());
+    body.extend_from_slice(&sender_word.to_le_bytes());
+    body.extend_from_slice(&chat_type.to_le_bytes());
+    body.extend_from_slice(&zone_channel.to_le_bytes());
+    body.extend_from_slice(&age_secs.to_le_bytes());
+    body.extend_from_slice(description.as_bytes());
+    body.push(0);
+    body
+}
+
+/// `SMSG_COMPLAIN_RESULT` (`0x6e3e94`): result 1 turns the complaint system off; reason 12 shows
+/// in the calendar, any other in chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComplaintResult {
+    pub result: u8,
+    pub reason: u8,
+}
+
+/// AzerothCore sends the result byte alone; the reference's read past the end leaves the reason
+/// unset, so a missing one takes the chat arm, here 0.
+pub fn read_complaint_result(r: &mut &[u8]) -> io::Result<ComplaintResult> {
+    let result = read_u8(r)?;
+    let reason = if r.is_empty() { 0 } else { read_u8(r)? };
+    Ok(ComplaintResult { result, reason })
+}
+
 fn push_cstring(body: &mut Vec<u8>, s: &str) {
     body.extend_from_slice(s.as_bytes());
     body.push(0);

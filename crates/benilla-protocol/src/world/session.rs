@@ -58,11 +58,17 @@ impl std::error::Error for WardenRequired {}
 
 /// The packets the glue acts on that can arrive on the link before the world stream starts: the
 /// server's cache version (sent after the authentication), which the `.wdb` files are checked
-/// against, and the account's account-data times and bytes, which the character screen asks for.
-const GLUE_KEPT: [u16; 3] = [
+/// against, and the account's account-data times and bytes, the realm split state and the paid
+/// character services' results, which the character screen asks for.
+const GLUE_KEPT: [u16; 8] = [
     opcode::SMSG_CLIENTCACHE_VERSION,
     opcode::SMSG_ACCOUNT_DATA_TIMES,
     opcode::SMSG_UPDATE_ACCOUNT_DATA,
+    opcode::SMSG_REALM_SPLIT,
+    opcode::SMSG_CHAR_RENAME,
+    opcode::SMSG_CHAR_CUSTOMIZE,
+    opcode::SMSG_CHAR_FACTION_CHANGE,
+    opcode::SMSG_SET_PLAYER_DECLINED_NAMES_RESULT,
 ];
 
 /// An authenticated world-server session with header encryption active.
@@ -317,6 +323,23 @@ impl WorldSession {
                 self.glue_events
                     .push(SessionEvent::AccountDataUpdate(u.clone()));
             }
+            ServerPacket::RealmSplit(s) => {
+                self.glue_events.push(SessionEvent::RealmSplit(s.clone()));
+            }
+            ServerPacket::CharRename(r) => {
+                self.glue_events.push(SessionEvent::CharRename(r.clone()))
+            }
+            ServerPacket::CharCustomize(r) => {
+                self.glue_events
+                    .push(SessionEvent::CharCustomize(r.clone()));
+            }
+            ServerPacket::CharFactionChange(r) => {
+                self.glue_events
+                    .push(SessionEvent::CharFactionChange(r.clone()));
+            }
+            ServerPacket::DeclinedNamesResult(r) => {
+                self.glue_events.push(SessionEvent::DeclinedNamesResult(*r));
+            }
             _ => {}
         }
     }
@@ -325,6 +348,65 @@ impl WorldSession {
     /// them next ([`Self::take_glue_events`]), as nothing here waits on a reply.
     pub fn ready_for_account_data_times(&mut self) -> Result<()> {
         self.send(opcode::CMSG_READY_FOR_ACCOUNT_DATA_TIMES, &[])
+    }
+
+    /// `CMSG_REALM_SPLIT` with `state`, then its answer read off the link, kept for
+    /// [`Self::take_glue_events`]: the character screen asks as it shows, with nothing after it to
+    /// read the answer in.
+    pub async fn realm_split_async(&mut self, state: u32) -> Result<()> {
+        self.send(opcode::CMSG_REALM_SPLIT, &messages::realm_split(state))?;
+        loop {
+            if let Some(ServerPacket::RealmSplit(_)) = self.recv_parsed().await? {
+                return Ok(());
+            }
+        }
+    }
+
+    /// A paid character service at character select: the request, then its answer read off the
+    /// link and kept for [`Self::take_glue_events`], as a create waits for its result. A
+    /// declension waits for nothing: AzerothCore drops it unanswered while declined names are off,
+    /// and a later read keeps an answer that does come. Returns a success's guid and name, which
+    /// the world entry that may follow logs in under.
+    pub async fn char_service_async(
+        &mut self,
+        opcode: u16,
+        body: &[u8],
+    ) -> Result<Option<(u64, String)>> {
+        if opcode == opcode::CMSG_SET_PLAYER_DECLINED_NAMES {
+            self.send(opcode, body)?;
+            return Ok(None);
+        }
+        let answer = match opcode {
+            opcode::CMSG_CHAR_RENAME => opcode::SMSG_CHAR_RENAME,
+            opcode::CMSG_CHAR_CUSTOMIZE => opcode::SMSG_CHAR_CUSTOMIZE,
+            opcode::CMSG_CHAR_FACTION_CHANGE | opcode::CMSG_CHAR_RACE_CHANGE => {
+                opcode::SMSG_CHAR_FACTION_CHANGE
+            }
+            _ => return Err(anyhow!("{opcode:#x} is no character service")),
+        };
+        self.send(opcode, body)?;
+        loop {
+            let renamed = |r: &messages::CharChangeResult| {
+                r.applied
+                    .as_ref()
+                    .filter(|_| r.result == 0)
+                    .map(|a| (a.guid, a.name.clone()))
+            };
+            match self.recv_parsed().await? {
+                Some(ServerPacket::CharRename(r)) if answer == opcode::SMSG_CHAR_RENAME => {
+                    return Ok(r.renamed.filter(|_| r.result == 0));
+                }
+                Some(ServerPacket::CharCustomize(r)) if answer == opcode::SMSG_CHAR_CUSTOMIZE => {
+                    return Ok(renamed(&r));
+                }
+                Some(ServerPacket::CharFactionChange(r))
+                    if answer == opcode::SMSG_CHAR_FACTION_CHANGE =>
+                {
+                    return Ok(renamed(&r));
+                }
+                _ => {}
+            }
+        }
     }
 
     /// `CMSG_REQUEST_ACCOUNT_DATA`; the slot's bytes are kept as the times are.
@@ -361,7 +443,7 @@ impl WorldSession {
                 .map_err(|e| anyhow!("parsing SMSG_CHAR_ENUM: {e}")),
             // Kept for every login on the link; a body that does not parse is skipped.
             opcode::SMSG_ADDON_INFO => {
-                if let Ok(ServerPacket::AddonInfo { statuses }) =
+                if let Ok(ServerPacket::AddonInfo { statuses, .. }) =
                     messages::parse_server(opcode, &body)
                 {
                     self.link.addon_info = Some(statuses);
@@ -390,7 +472,7 @@ impl WorldSession {
         let packet = recv_packet(&mut self.stream, Some(&mut self.crypto.decrypter)).await?;
         self.keep_glue(&packet);
         // `SMSG_ADDON_INFO` can reach any of the handshake's read loops, so it is caught here.
-        if let ServerPacket::AddonInfo { statuses } = &packet {
+        if let ServerPacket::AddonInfo { statuses, .. } = &packet {
             self.link.addon_info = Some(statuses.clone());
         }
         Ok(packet)

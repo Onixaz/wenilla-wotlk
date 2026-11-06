@@ -284,7 +284,10 @@ mod tests {
                     duration: Duration::from_secs(600), // far from ending during the test
                     id: 77,
                     grounded: true,
+                    catmull_rom: false,
+                    end_facing: benilla_protocol::MonsterMoveFacing::None,
                     run_mode,
+                    cycle: None,
                 },
                 twist,
                 Embodied,

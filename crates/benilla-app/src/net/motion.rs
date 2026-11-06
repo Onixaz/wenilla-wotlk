@@ -15,12 +15,15 @@ mod spline;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use facing::drive_display_facing;
 pub(in crate::net) use facing::resolve_facing;
 pub(in crate::net) use facing::DisplayFacing;
 pub(crate) use facing::FacingStep;
-pub(crate) use modes::UnitMoveModes;
+pub(crate) use facing::{
+    apply_walk_end_facing, bearing as facing_bearing, drive_display_facing, FacingHold,
+    WalkEndFacing,
+};
 pub(in crate::net) use modes::ROOT_APPLY_WIPE;
+pub(crate) use modes::{SwimFlyTransition, UnitMoveModes};
 pub(crate) use relay::{PendingMove, RelayMove};
 pub(crate) use remote::jump_seed;
 pub(crate) use remote::RemoteMotion;

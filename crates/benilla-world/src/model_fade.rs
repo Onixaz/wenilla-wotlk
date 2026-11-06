@@ -214,6 +214,7 @@ pub const TEARDOWN_MIN_ALPHA: f32 = 0.01;
 /// `+0x180` is `obj+0x100 · obj+0xf4` for a game object and the distance fade for a doodad), for
 /// the consumers that cannot read a `MeshTag`: particles and ribbons. Missing reads `1.0`.
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
+#[component(storage = "SparseSet")]
 pub struct ModelAlpha(pub f32);
 
 /// A fade the game declares on an instance root (an aura's ramp, stealth, a ghost form); the engine
@@ -868,12 +869,21 @@ pub(crate) fn apply_despawn_fade(
             }
             if any {
                 df.started = now;
+                trace_fade(parent, "arm", now);
             } else {
                 commands.entity(parent).try_despawn();
             }
         } else if now - df.started >= APPEAR_FADE_SECS {
+            trace_fade(parent, "end", now - df.started);
             commands.entity(parent).try_despawn();
         }
+    }
+}
+
+/// One `fade` trace line, the frame clock's seconds beside the trace's wall stamp.
+fn trace_fade(unit: Entity, what: &str, secs: f32) {
+    if benilla_assets::trace::enabled_for("fade") {
+        benilla_assets::trace::line("fade", &format!("{unit:?} {what} {secs:.3}"));
     }
 }
 

@@ -5,8 +5,10 @@ use benilla_protocol::messages::TaxiMask;
 use benilla_protocol::{SessionEvent, SessionEventKind};
 use bevy::prelude::*;
 
+use super::routing::TaxiCatalogs;
 use super::TaxiState;
 use crate::net::{GuidIndex, NetHandlerApp};
+use crate::ui_gossip::GossipState;
 
 /// Register the taxi handlers and the session-end listener.
 pub(super) fn register(app: &mut App) {
@@ -18,14 +20,28 @@ pub(super) fn register(app: &mut App) {
         .net_handler(K::Disconnected, on_session_end);
 }
 
-fn on_nodes_shown(In(ev): In<SessionEvent>, mut taxi: ResMut<TaxiState>) {
+fn on_nodes_shown(
+    In(ev): In<SessionEvent>,
+    mut taxi: ResMut<TaxiState>,
+    mut gossip: ResMut<GossipState>,
+    catalogs: Option<Res<TaxiCatalogs>>,
+) {
     if let SessionEvent::TaxiNodesShown {
         flightmaster,
         nearest_node,
-        known_mask,
+        mut known_mask,
     } = ev
     {
-        taxi_nodes_shown(flightmaster, nearest_node, known_mask, &mut taxi);
+        if let Some(catalogs) = catalogs {
+            known_mask.resize(catalogs.mask_words());
+        }
+        taxi_nodes_shown(
+            flightmaster,
+            nearest_node,
+            known_mask,
+            &mut taxi,
+            &mut gossip,
+        );
     }
 }
 
@@ -41,9 +57,13 @@ fn on_activate_reply(In(ev): In<SessionEvent>, mut taxi: ResMut<TaxiState>) {
     }
 }
 
-fn on_new_path(In(ev): In<SessionEvent>, mut taxi: ResMut<TaxiState>) {
+fn on_new_path(
+    In(ev): In<SessionEvent>,
+    mut taxi: ResMut<TaxiState>,
+    mut gossip: ResMut<GossipState>,
+) {
     if let SessionEvent::NewTaxiPath = ev {
-        taxi_new_path(&mut taxi);
+        taxi_new_path(&mut taxi, &mut gossip);
     }
 }
 
@@ -52,14 +72,22 @@ fn on_session_end(In(_): In<SessionEvent>, mut taxi: ResMut<TaxiState>) {
     taxi.clear_session();
 }
 
-/// `SMSG_SHOWTAXINODES` opens the map.
+/// `SMSG_SHOWTAXINODES` opens the map, unless fewer than two nodes are known: then the reference
+/// shows `ERR_TAXINOPATHS` and closes the gossip menu instead (`0x6d61b5`).
 fn taxi_nodes_shown(
     flightmaster: u64,
     nearest_node: u32,
     known_mask: TaxiMask,
     taxi: &mut TaxiState,
+    gossip: &mut GossipState,
 ) {
-    debug!("net: taxi map on {flightmaster:#x} — nearest node {nearest_node}");
+    let known = known_mask.count();
+    debug!("net: taxi map on {flightmaster:#x} — nearest node {nearest_node}, {known} known");
+    if known < 2 {
+        taxi.no_paths = true;
+        gossip.clear();
+        return;
+    }
     taxi.open(flightmaster, nearest_node, known_mask);
 }
 
@@ -82,9 +110,43 @@ fn taxi_activate_reply(code: u32, taxi: &mut TaxiState) {
     taxi.reply = Some(code);
 }
 
-/// `SMSG_NEW_TAXI_PATH`, an empty body: vmangos sends it only on a first visit, beside a `known`
-/// node status for the flight master (`SendLearnNewTaxiNode`, `TaxiHandler.cpp:117`).
-fn taxi_new_path(taxi: &mut TaxiState) {
+/// `SMSG_NEW_TAXI_PATH`, an empty body, sent on a first visit: stage `ERR_NEWTAXIPATH` (`0x6e3054`)
+/// and close the gossip menu, as the zero-guid gossip setter does (`0x6e3063`).
+fn taxi_new_path(taxi: &mut TaxiState, gossip: &mut GossipState) {
     debug!("net: taxi — first-visit node learned (SMSG_NEW_TAXI_PATH)");
     taxi.discovered = true;
+    gossip.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two known nodes open the map; one shows `ERR_TAXINOPATHS` and closes the gossip menu.
+    #[test]
+    fn fewer_than_two_known_nodes_refuse_the_map() {
+        let mut taxi = TaxiState::default();
+        let mut gossip = GossipState::default();
+        gossip.npc = Some(0x42);
+        taxi_nodes_shown(0x42, 2, TaxiMask(vec![0b10]), &mut taxi, &mut gossip);
+        assert!(taxi.open.is_none() && taxi.no_paths);
+        assert_eq!(gossip.npc, None, "the gossip npc is cleared");
+
+        let mut taxi = TaxiState::default();
+        let mut mask = TaxiMask(vec![0b10]);
+        mask.set(400);
+        taxi_nodes_shown(0x42, 2, mask, &mut taxi, &mut gossip);
+        assert!(!taxi.no_paths);
+        assert!(taxi.open.as_ref().unwrap().known.is_known(400));
+    }
+
+    #[test]
+    fn a_new_taxi_path_closes_the_gossip_menu() {
+        let mut taxi = TaxiState::default();
+        let mut gossip = GossipState::default();
+        gossip.npc = Some(0x42);
+        taxi_new_path(&mut taxi, &mut gossip);
+        assert!(taxi.discovered);
+        assert_eq!(gossip.npc, None);
+    }
 }

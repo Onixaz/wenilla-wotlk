@@ -6,9 +6,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use benilla_assets::coords::{bevy_to_wow, wow_to_bevy};
-use benilla_protocol::{CreateSpline, EntityKind, SplineArc};
+use benilla_protocol::{CreateSpline, EntityKind, MonsterMoveFacing, SplineArc, SplineCycle};
 use bevy::prelude::*;
-use bevy::tasks::{ComputeTaskPool, ParallelSliceMut};
 use bevy::utils::Parallel;
 
 use crate::entities::CollisionHeight;
@@ -44,6 +43,39 @@ pub(crate) struct Spline {
     /// `SPLINEFLAG_ORIENTATION_FIXED` (`0x4000`): the facing is not taken from the path tangent
     /// (`0x98cbd8`), so a knockback flies backwards.
     pub(crate) facing_fixed: bool,
+    /// Catmull-Rom evaluation, else straight segments: `flags & 0x42000` (`0x6f15c3`, `0x98c7b0`).
+    pub(crate) catmull_rom: bool,
+    /// The facing the unit takes when the walk ends (`0x6eb0b0`'s done branch).
+    pub(crate) end_facing: MonsterMoveFacing,
+    /// `SPLINEFLAG_CYCLIC`: the walk loops ([`Spline::wrap`]) and never ends; `None` runs once.
+    pub(crate) cycle: Option<Cycle>,
+}
+
+/// A looping [`Spline`]'s state (`0x98ca00`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Cycle {
+    /// `SPLINEFLAG_ENTER_CYCLE`: the first wrap drops the path's entry (`0x98c940`).
+    pub(crate) enter: bool,
+    /// The Catmull-Rom control before the path; without one the first point doubles.
+    pub(crate) lead: Option<[f32; 3]>,
+    /// The Catmull-Rom control past the path; without one the last point doubles.
+    pub(crate) tail: Option<[f32; 3]>,
+    /// The running lap's duration modifier (`spline+0x204`).
+    pub(crate) duration_mod: f32,
+    /// The next lap's, adopted at the wrap (`spline+0x208`).
+    pub(crate) duration_mod_next: f32,
+}
+
+impl From<SplineCycle> for Cycle {
+    fn from(c: SplineCycle) -> Self {
+        Self {
+            enter: c.enter,
+            lead: None,
+            tail: c.tail,
+            duration_mod: 1.0,
+            duration_mod_next: 1.0,
+        }
+    }
 }
 
 /// The id of a spline the server ended with a stop, owed in `CMSG_MOVE_SPLINE_DONE`. vmangos arms
@@ -65,7 +97,69 @@ impl Spline {
                 (dx * dx + dy * dy + dz * dz).sqrt()
             })
             .sum();
-        length / self.duration.as_secs_f32().max(1e-3)
+        length / self.lap().as_secs_f32().max(1e-3)
+    }
+
+    /// One lap's length: the duration under its modifier, rounded to ms (`0x98ca5b`).
+    pub(crate) fn lap(&self) -> Duration {
+        match &self.cycle {
+            Some(c) => {
+                let ms = self.duration.as_millis() as f32 * c.duration_mod;
+                Duration::from_millis((ms + 0.5) as u64)
+            }
+            None => self.duration,
+        }
+    }
+
+    /// Whether the walk is over: no lap left, or a one-shot past its lap (`0x98ca97`, `0x98cac7`).
+    fn finished(&self, now: Instant) -> bool {
+        let lap = self.lap();
+        lap.is_zero() || (self.cycle.is_none() && now.saturating_duration_since(self.start) >= lap)
+    }
+
+    /// Runs off the laps `now` has passed, each adopting the next modifier (`0x98cad5`).
+    pub(super) fn wrap(&mut self, now: Instant) {
+        loop {
+            let lap = self.lap();
+            if lap.is_zero() || now.saturating_duration_since(self.start) < lap {
+                return;
+            }
+            self.start += lap;
+            let Some(cycle) = self.cycle.as_mut() else {
+                return;
+            };
+            // The entry drops out, the point before the new start its lead, both modifiers at 1.
+            if std::mem::take(&mut cycle.enter) {
+                cycle.duration_mod_next = 1.0;
+                if self.points.len() > 2 {
+                    self.points.remove(0);
+                    cycle.lead = Some(self.points[self.points.len() - 2]);
+                }
+            }
+            cycle.duration_mod = std::mem::replace(&mut cycle.duration_mod_next, 1.0);
+        }
+    }
+
+    /// `SMSG_FLIGHT_SPLINE_SYNC`: the next lap's modifier, toward the server (`0x98b5d0`).
+    pub(crate) fn sync_next_lap(&mut self, progress: f32, now: Instant) {
+        let elapsed_ms = now.saturating_duration_since(self.start).as_secs_f32() * 1000.0;
+        let duration_ms = self.duration.as_millis() as f32;
+        if let Some(cycle) = self.cycle.as_mut() {
+            cycle.duration_mod_next =
+                next_lap_modifier(progress, elapsed_ms, duration_ms, cycle.duration_mod);
+        }
+    }
+
+    /// Elapsed over the lap, clamped to `0..=1`; past a cyclic lap's end it reads on (`0x98ccc2`).
+    fn progress(&self, now: Instant) -> f32 {
+        let t = now.saturating_duration_since(self.start).as_secs_f32()
+            / self.lap().as_secs_f32().max(1e-3);
+        let t = if self.cycle.is_some() && t > 1.0 {
+            t - 1.0
+        } else {
+            t
+        };
+        t.clamp(0.0, 1.0)
     }
 
     /// The arc's height over the path at `now` (`0x987d20`): `(T − s)·a/2·e −
@@ -102,17 +196,13 @@ impl Spline {
 
     /// Elapsed over duration, clamped to `0..=1`; the inspector's motion line reads it.
     pub(crate) fn elapsed_frac(&self) -> f32 {
-        (Instant::now()
-            .saturating_duration_since(self.start)
-            .as_secs_f32()
-            / self.duration.as_secs_f32().max(1e-3))
-        .clamp(0.0, 1.0)
+        self.progress(Instant::now())
     }
 
     /// Raw-WoW position, facing (`None` when vertical) and pitch `asin(dz/len)` at `now`, at
     /// constant speed. Segments are located by chord length here in both modes; the reference uses
-    /// the chord on a ground path only and a flying segment's Catmull-Rom length in 20 steps. The
-    /// evaluator lerps a ground path and runs a uniform Catmull-Rom on a flying one.
+    /// the chord on a linear path only and a Catmull-Rom segment's length in 20 steps. The evaluator
+    /// lerps a linear path and runs a uniform Catmull-Rom on a [`Spline::catmull_rom`] one.
     pub(crate) fn sample(&self, now: Instant) -> ([f32; 3], Option<f32>, f32) {
         let pts = self.points.as_slice();
         if pts.len() < 2 {
@@ -127,10 +217,8 @@ impl Spline {
         if total <= f32::EPSILON {
             return (pts[0], None, 0.0);
         }
-        let frac = (now.saturating_duration_since(self.start).as_secs_f32()
-            / self.duration.as_secs_f32().max(1e-3))
-        .clamp(0.0, 1.0);
-        let mut want = frac * total;
+        let ends = self.cycle.as_ref().map_or([None; 2], |c| [c.lead, c.tail]);
+        let mut want = self.progress(now) * total;
         for (i, &len) in lengths.iter().enumerate() {
             if want <= len || i + 1 == lengths.len() {
                 let t = if len > f32::EPSILON {
@@ -138,7 +226,7 @@ impl Spline {
                 } else {
                     0.0
                 };
-                let (pos, dir) = if self.grounded {
+                let (pos, dir) = if !self.catmull_rom {
                     let (a, b) = (pts[i], pts[i + 1]);
                     let pos = [
                         a[0] + (b[0] - a[0]) * t,
@@ -148,7 +236,7 @@ impl Spline {
                     let dir = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
                     (pos, dir)
                 } else {
-                    catmull_rom(pts, i, t)
+                    catmull_rom(pts, ends, i, t)
                 };
                 let (dx, dy, dz) = (dir[0], dir[1], dir[2]);
                 let facing = (!self.facing_fixed && dx * dx + dy * dy > 1e-6).then(|| dy.atan2(dx));
@@ -197,13 +285,24 @@ impl Spline {
     }
 }
 
-/// Uniform Catmull-Rom position and `d/du` tangent on `pts[i] → pts[i+1]` at `u ∈ [0,1]`, the ends
-/// duplicated as the 1.12 client stores them, so the curve passes every waypoint.
-fn catmull_rom(pts: &[[f32; 3]], i: usize, u: f32) -> ([f32; 3], [f32; 3]) {
-    let p0 = pts[i.saturating_sub(1)];
+/// Uniform Catmull-Rom position and tangent on `pts[i] → pts[i+1]`; a missing end control doubles.
+fn catmull_rom(
+    pts: &[[f32; 3]],
+    ends: [Option<[f32; 3]>; 2],
+    i: usize,
+    u: f32,
+) -> ([f32; 3], [f32; 3]) {
+    let p0 = match i {
+        0 => ends[0].unwrap_or(pts[0]),
+        _ => pts[i - 1],
+    };
     let p1 = pts[i];
     let p2 = pts[i + 1];
-    let p3 = pts[(i + 2).min(pts.len() - 1)];
+    let p3 = pts
+        .get(i + 2)
+        .copied()
+        .or(ends[1])
+        .unwrap_or(pts[pts.len() - 1]);
     let (u2, u3) = (u * u, u * u * u);
     let mut pos = [0.0f32; 3];
     let mut dir = [0.0f32; 3];
@@ -231,6 +330,8 @@ pub(in crate::net) fn monster_move_spline(
     deck: Option<u64>,
     arc: Option<SplineArc>,
     facing_fixed: bool,
+    end_facing: MonsterMoveFacing,
+    cycle: Option<SplineCycle>,
 ) -> Option<Spline> {
     if stop || duration_ms == 0 || path.len() < 2 {
         return None;
@@ -240,28 +341,37 @@ pub(in crate::net) fn monster_move_spline(
         start: Instant::now(),
         duration: Duration::from_millis(u64::from(duration_ms)),
         id: spline_id,
-        // `grounded` also picks the sampler (lerp or Catmull-Rom); the clamp skips a deck path on
-        // `deck`.
+        // `flying` is the decoder's `Flying | Catmullrom`; the clamp skips a deck path on `deck`.
         grounded: !flying,
+        catmull_rom: flying,
+        end_facing,
         run_mode,
         deck,
         arc,
         facing_fixed,
+        cycle: cycle.map(Cycle::from),
     })
 }
 
 /// The [`Spline`] a unit is already riding in its create block, back-dated by
 /// [`CreateSpline::time_passed_ms`]; `None` for a degenerate path, a zero duration, a finished
-/// ride, or anything under `WOW_CREATE_SPLINE=off`.
+/// one-shot, or anything under `WOW_CREATE_SPLINE=off`.
 pub(in crate::net) fn create_spline(spline: CreateSpline) -> Option<Spline> {
     if !create_spline_enabled()
         || spline.duration_ms == 0
         || spline.path.len() < 2
-        || spline.time_passed_ms >= spline.duration_ms
+        || (!spline.cyclic && spline.time_passed_ms >= spline.duration_ms)
     {
         return None;
     }
     let passed = Duration::from_millis(u64::from(spline.time_passed_ms));
+    let cycle = spline.cyclic.then_some(Cycle {
+        enter: spline.enter_cycle,
+        lead: Some(spline.phantoms[0]),
+        tail: Some(spline.phantoms[1]),
+        duration_mod: spline.duration_mods[0],
+        duration_mod_next: spline.duration_mods[1],
+    });
     Some(Spline {
         points: spline.path,
         // `checked_sub`: a spline older than the monotonic clock's origin would panic on `-`.
@@ -271,11 +381,14 @@ pub(in crate::net) fn create_spline(spline: CreateSpline) -> Option<Spline> {
         duration: Duration::from_millis(u64::from(spline.duration_ms)),
         id: spline.id,
         grounded: !spline.flying,
+        catmull_rom: spline.catmull_rom,
+        end_facing: spline.final_facing,
         run_mode: spline.run_mode,
         // The create block's spline tail names no transport; its path is in world coordinates.
         deck: None,
         arc: spline.arc,
         facing_fixed: spline.facing_fixed,
+        cycle,
     })
 }
 
@@ -299,10 +412,12 @@ pub(in crate::net) fn trace_create_spline(guid: u64, spline: Option<&CreateSplin
     benilla_assets::trace::line(
         "csp",
         &format!(
-            "{guid:#x} nodes={} len={length:.2} left={left:.2} t={}/{} world{}{}{}",
+            "{guid:#x} nodes={} len={length:.2} left={left:.2} t={}/{} world {} end={:?}{}{}{}",
             s.path.len(),
             s.time_passed_ms,
             s.duration_ms,
+            if s.catmull_rom { "catmull" } else { "linear" },
+            s.final_facing,
             if s.flying { " flying" } else { "" },
             if s.cyclic { " cyclic" } else { "" },
             if create_spline_enabled() {
@@ -365,7 +480,7 @@ pub(in crate::net) fn sample_splines(
     mut commands: Commands,
     mut q: Query<(
         Entity,
-        &Spline,
+        &mut Spline,
         &mut Transform,
         Has<CreatureSwimming>,
         // For the `spl` trace only; the sampler never gates on it.
@@ -383,20 +498,41 @@ pub(in crate::net) fn sample_splines(
     if tick {
         *trace_next = time.elapsed_secs() + SPL_TRACE_SECS;
     }
-    for (entity, spline, mut t, swimming, guid, rider) in &mut q {
+    for (entity, mut spline, mut t, swimming, guid, rider) in &mut q {
+        // Written only on a wrap: `Mut` stays clean for a walker.
+        if spline.cycle.is_some() && now.saturating_duration_since(spline.start) >= spline.lap() {
+            spline.wrap(now);
+            if tracing {
+                benilla_assets::trace::line(
+                    "spl",
+                    &format!(
+                        "{:#x} WRAP lap={:.3} nodes={} mods={:?}",
+                        guid.map_or(0, |g| g.0),
+                        spline.lap().as_secs_f32(),
+                        spline.points.len(),
+                        spline.cycle.map(|c| [c.duration_mod, c.duration_mod_next]),
+                    ),
+                );
+            }
+        }
         let (wow_pos, facing, pitch) = spline.sample(now);
         // A deck path's sample is the rider's transport-local pose, composed later this frame.
         if let Some(deck) = spline.deck {
             // Written as a world pose it would sit near the map origin, so a missing or mismatched
             // rider freezes the unit for the frame instead.
+            let done = spline.finished(now);
             if let Some(mut rider) = rider.filter(|r| r.transport_guid == deck) {
                 rider.local_pos = wow_pos;
                 if let Some(f) = facing {
                     rider.local_orientation = f;
                 }
+                // A deck path's end angle is deck-local, like its points.
+                if let (true, MonsterMoveFacing::Angle(a)) = (done, spline.end_facing) {
+                    rider.local_orientation = a;
+                }
             }
-            if now.saturating_duration_since(spline.start) >= spline.duration {
-                commands.entity(entity).remove::<Spline>();
+            if done {
+                commands.entity(entity).try_remove::<Spline>();
             }
             continue;
         }
@@ -423,19 +559,46 @@ pub(in crate::net) fn sample_splines(
             };
         }
         if let Some(was) = was {
-            trace_ride(guid.map_or(0, |g| g.0), spline, wow_pos, was, now);
+            trace_ride(guid.map_or(0, |g| g.0), &spline, wow_pos, was, now);
         }
         // A finished path drops its spline: `creature_anim` reads the spline's presence as moving.
-        if now.saturating_duration_since(spline.start) >= spline.duration {
+        if spline.finished(now) {
             if tracing {
                 benilla_assets::trace::line(
                     "spl",
                     &format!("{:#x} DONE — spline dropped", guid.map_or(0, |g| g.0)),
                 );
             }
-            commands.entity(entity).remove::<Spline>();
+            // try_: a streamed unit can despawn in the same frame, before the commands apply.
+            commands.entity(entity).try_remove::<Spline>();
+            if !matches!(spline.end_facing, MonsterMoveFacing::None) {
+                commands
+                    .entity(entity)
+                    .try_insert(super::facing::WalkEndFacing(spline.end_facing));
+            }
         }
     }
+}
+
+/// `0x98b5d0`: the progress gap, wrapped into half a lap, re-times the next lap within `0.5..=2`.
+pub(super) fn next_lap_modifier(
+    progress: f32,
+    elapsed_ms: f32,
+    duration_ms: f32,
+    modifier: f32,
+) -> f32 {
+    let lap = duration_ms * modifier;
+    if lap < 0.01 {
+        return 1.0;
+    }
+    let mut delta = progress - elapsed_ms / lap;
+    if delta > 0.5 {
+        delta -= 1.0;
+    }
+    if delta < -0.5 {
+        delta += 1.0;
+    }
+    ((duration_ms - (delta * duration_ms).trunc()) / duration_ms).clamp(0.5, 2.0)
 }
 
 /// How often the `spl` tag samples a live ride; one second keeps a busy zone off the trace mutex.
@@ -450,14 +613,15 @@ fn trace_ride(guid: u64, spline: &Spline, pos: [f32; 3], was: [f32; 3], now: Ins
     benilla_assets::trace::line(
         "spl",
         &format!(
-            "{guid:#x} t={elapsed:.1}/{:.1} pos=[{:.2},{:.2},{:.2}] was={drift:.3} spd={:.2} nodes={} {}",
-            spline.duration.as_secs_f32(),
+            "{guid:#x} t={elapsed:.1}/{:.1} pos=[{:.2},{:.2},{:.2}] was={drift:.3} spd={:.2} nodes={} {}{}",
+            spline.lap().as_secs_f32(),
             pos[0],
             pos[1],
             pos[2],
             spline.speed(),
             spline.points.len(),
             if spline.grounded { "ground" } else { "flying" },
+            if spline.cycle.is_some() { " cyclic" } else { "" },
         ),
     );
 }
@@ -651,7 +815,7 @@ pub(in crate::net) fn ground_clamp_creatures(
         }
     }
     drop(gated);
-    casts.par_chunk_map_mut(ComputeTaskPool::get(), CLAMP_BATCH, |_, chunk| {
+    benilla_world::fanout::for_each_chunk_mut(&mut casts, CLAMP_BATCH, |chunk| {
         let mut s = stats.borrow_local_mut();
         for row in chunk.iter_mut() {
             if let Some(first) = clamp_unit(&world, &points, &capsule.0, epoch, legacy, row, &mut s)
@@ -1016,6 +1180,7 @@ pub(crate) struct CreatureSwimming;
 
 /// The last ground clamp this unit took: its seat and the cast gate's inputs, each compared by bit.
 #[derive(Component, Clone, Copy)]
+#[component(storage = "SparseSet")]
 pub(crate) struct GroundClamped {
     /// Where the last cast stood.
     xz: [f32; 2],
@@ -1448,7 +1613,10 @@ mod tests {
             duration: Duration::from_secs(10),
             id: 7,
             grounded,
+            catmull_rom: !grounded,
+            end_facing: benilla_protocol::MonsterMoveFacing::None,
             run_mode: true,
+            cycle: None,
         };
         let now = Instant::now();
         (spline, now)
@@ -1532,6 +1700,167 @@ mod tests {
         );
     }
 
+    /// The sampler follows the spline's mode, not its Flying bit: a ground walk sent Catmull-Rom
+    /// (`0x40000`) curves, and stays terrain-clamped (`0x6f15c3`).
+    #[test]
+    fn a_catmull_rom_ground_walk_curves() {
+        let pts = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 10.0, 0.0]];
+        let (mut s, now) = spline_at(pts, true, 0.25);
+        assert!(s.sample(now).0[1].abs() < 1e-4, "linear stays on the chord");
+        s.catmull_rom = true;
+        assert!(s.sample(now).0[1].abs() > 0.1, "Catmull-Rom bends off it");
+        assert!(s.grounded);
+    }
+
+    /// A create spline's mode is `Flying | Catmullrom`, and its final facing rides to the walk.
+    #[test]
+    fn a_create_spline_keeps_its_mode_and_final_facing() {
+        let s = create_spline(CreateSpline {
+            path: vec![[0.0, 0.0, 0.0], [20.0, 0.0, 0.0]],
+            id: 7,
+            time_passed_ms: 0,
+            duration_ms: 12_000,
+            flying: false,
+            cyclic: false,
+            enter_cycle: false,
+            duration_mods: [1.0, 1.0],
+            phantoms: [[0.0; 3]; 2],
+            run_mode: true,
+            arc: None,
+            facing_fixed: false,
+            final_facing: MonsterMoveFacing::Angle(2.0),
+            catmull_rom: true,
+        })
+        .expect("a live walk");
+        assert!(s.catmull_rom && s.grounded);
+        assert!(matches!(s.end_facing, MonsterMoveFacing::Angle(a) if a == 2.0));
+    }
+
+    /// A walk that ends hands its final facing on; one with none leaves nothing.
+    #[test]
+    fn a_finished_walk_leaves_its_final_facing() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_systems(Update, sample_splines);
+        let walk = |end_facing| {
+            let (mut s, _) = spline_at(vec![[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]], true, 2.0);
+            s.end_facing = end_facing;
+            s
+        };
+        let faced = app
+            .world_mut()
+            .spawn((Transform::default(), walk(MonsterMoveFacing::Angle(1.0))))
+            .id();
+        let plain = app
+            .world_mut()
+            .spawn((Transform::default(), walk(MonsterMoveFacing::None)))
+            .id();
+        app.update();
+        let w = app.world();
+        assert!(w.get::<Spline>(faced).is_none(), "the walk is over");
+        assert!(matches!(
+            w.get::<super::super::facing::WalkEndFacing>(faced).map(|f| f.0),
+            Some(MonsterMoveFacing::Angle(a)) if a == 1.0
+        ));
+        assert!(w
+            .get::<super::super::facing::WalkEndFacing>(plain)
+            .is_none());
+    }
+
+    /// A cyclic path never ends: the spline stays and no end facing is owed.
+    #[test]
+    fn a_cyclic_walk_outlives_its_lap() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_systems(Update, sample_splines);
+        let (mut s, _) = spline_at(vec![[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]], true, 2.0);
+        s.end_facing = MonsterMoveFacing::Angle(1.0);
+        s.cycle = Some(super::Cycle {
+            enter: false,
+            lead: None,
+            tail: None,
+            duration_mod: 1.0,
+            duration_mod_next: 1.0,
+        });
+        let start = s.start;
+        let e = app.world_mut().spawn((Transform::default(), s)).id();
+        app.update();
+        let w = app.world();
+        let s = w.get::<Spline>(e).expect("the loop runs on");
+        assert!(s.start > start, "the wrap moved its start up");
+        assert!(w.get::<super::super::facing::WalkEndFacing>(e).is_none());
+    }
+
+    /// A create block's cyclic ride keeps its wire modifiers and controls, and past its lap wraps.
+    #[test]
+    fn a_created_cyclic_ride_past_its_lap_still_rides() {
+        let s = create_spline(CreateSpline {
+            path: vec![[0.0, 0.0, 0.0], [5.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            id: 1,
+            time_passed_ms: 6_000,
+            duration_ms: 5_000,
+            flying: true,
+            cyclic: true,
+            enter_cycle: false,
+            duration_mods: [1.5, 0.75],
+            phantoms: [[5.0, 0.0, 0.0], [5.0, 5.0, 0.0]],
+            run_mode: true,
+            arc: None,
+            facing_fixed: false,
+            final_facing: MonsterMoveFacing::None,
+            catmull_rom: true,
+        })
+        .expect("a loop is never finished");
+        let c = s.cycle.expect("cyclic");
+        assert_eq!(c.lead, Some([5.0, 0.0, 0.0]));
+        assert_eq!(c.tail, Some([5.0, 5.0, 0.0]));
+        assert_eq!((c.duration_mod, c.duration_mod_next), (1.5, 0.75));
+        assert_eq!(s.lap(), Duration::from_millis(7_500));
+    }
+
+    /// A walk that ends in the frame its unit despawns, the despawn applied first, does not panic
+    /// (#924); neither does the end-facing pass on a unit despawned the same way.
+    #[test]
+    fn a_walk_ending_as_its_unit_despawns_does_not_panic() {
+        use super::super::facing::{apply_walk_end_facing, WalkEndFacing};
+        use bevy::ecs::schedule::ScheduleBuildSettings;
+        #[derive(Resource)]
+        struct Doomed(Vec<Entity>);
+        fn despawn(mut commands: Commands, doomed: Res<Doomed>) {
+            for &e in &doomed.0 {
+                commands.entity(e).despawn();
+            }
+        }
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<crate::net::GuidIndex>()
+            .add_systems(
+                Update,
+                (despawn, sample_splines, apply_walk_end_facing).chain(),
+            );
+        // One sync point at the schedule's end applies the despawn ahead of the walk's commands.
+        app.edit_schedule(Update, |s| {
+            s.set_build_settings(ScheduleBuildSettings {
+                auto_insert_apply_deferred: false,
+                ..default()
+            });
+        });
+        let (mut walk, _) = spline_at(vec![[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]], true, 2.0);
+        walk.end_facing = MonsterMoveFacing::Angle(1.0);
+        let walking = app.world_mut().spawn((Transform::default(), walk)).id();
+        let facing = app
+            .world_mut()
+            .spawn((
+                Transform::default(),
+                WalkEndFacing(MonsterMoveFacing::Angle(1.0)),
+            ))
+            .id();
+        app.insert_resource(Doomed(vec![walking, facing]));
+        app.update();
+        assert!(app.world().get_entity(walking).is_err());
+        assert!(app.world().get_entity(facing).is_err());
+    }
+
     /// A straight climb pitches by the tangent (45° here) and never banks: θ = 2·acos(1) = 0.
     #[test]
     fn a_straight_climb_pitches_by_the_tangent_and_never_banks() {
@@ -1574,9 +1903,14 @@ mod tests {
             duration_ms: 12_000,
             flying: false,
             cyclic: false,
+            enter_cycle: false,
+            duration_mods: [1.0, 1.0],
+            phantoms: [[0.0; 3]; 2],
             run_mode: true,
             arc: None,
             facing_fixed: false,
+            final_facing: benilla_protocol::MonsterMoveFacing::None,
+            catmull_rom: false,
         })
         .expect("a live walk");
         let (pos, facing, _) = s.sample(Instant::now());
@@ -1598,9 +1932,14 @@ mod tests {
             duration_ms,
             flying: false,
             cyclic: false,
+            enter_cycle: false,
+            duration_mods: [1.0, 1.0],
+            phantoms: [[0.0; 3]; 2],
             run_mode: true,
             arc: None,
             facing_fixed: false,
+            final_facing: benilla_protocol::MonsterMoveFacing::None,
+            catmull_rom: false,
         };
         let straight = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]];
         assert!(create_spline(spline(5_000, 5_000, straight.clone())).is_none());
@@ -1825,7 +2164,10 @@ mod server_moved_players {
             duration: Duration::from_secs(4),
             id: 77,
             grounded: true,
+            catmull_rom: false,
+            end_facing: benilla_protocol::MonsterMoveFacing::None,
             run_mode: true,
+            cycle: None,
         });
     }
 
@@ -1905,7 +2247,10 @@ mod server_moved_players {
             duration: Duration::from_secs(4),
             id: 78,
             grounded: false,
+            catmull_rom: true,
+            end_facing: benilla_protocol::MonsterMoveFacing::None,
             run_mode: true,
+            cycle: None,
         });
         clamp(&mut app);
         assert_eq!(y_of(&app, body), RIM_Z, "a flight owns its own altitude");
@@ -2229,7 +2574,10 @@ mod inside_a_hull {
             duration: Duration::from_secs(secs),
             id,
             grounded: true,
+            catmull_rom: false,
+            end_facing: benilla_protocol::MonsterMoveFacing::None,
             run_mode: true,
+            cycle: None,
         });
     }
 

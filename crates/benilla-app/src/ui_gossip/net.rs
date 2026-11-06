@@ -13,6 +13,7 @@ pub(super) fn register(app: &mut App) {
     use SessionEventKind as K;
     app.net_handler(K::GossipMenu, on_gossip_menu)
         .net_handler(K::NpcGreeting, on_npc_greeting)
+        .net_handler(K::NpcTextMiss, on_npc_text_miss)
         .net_handler(K::GossipComplete, on_gossip_complete)
         .net_handler(K::Disconnected, on_session_end);
 }
@@ -40,13 +41,15 @@ fn on_npc_greeting(
     }
 }
 
-fn on_gossip_complete(
-    In(ev): In<SessionEvent>,
-    mut gossip: ResMut<GossipState>,
-    mut quest: ResMut<QuestGiver>,
-) {
+fn on_npc_text_miss(In(ev): In<SessionEvent>, mut gossip: ResMut<GossipState>) {
+    if let SessionEvent::NpcTextMiss { text_id } = ev {
+        gossip.text_missing(text_id);
+    }
+}
+
+fn on_gossip_complete(In(ev): In<SessionEvent>, mut gossip: ResMut<GossipState>) {
     if let SessionEvent::GossipComplete = ev {
-        gossip_complete(&mut gossip, &mut quest);
+        gossip_complete(&mut gossip);
     }
 }
 
@@ -105,9 +108,37 @@ fn npc_greeting(
     gossip.text_arrived(text_id, blocks, npc_gender);
 }
 
-/// `SMSG_GOSSIP_COMPLETE` ends the whole interaction, so the quest window closes with the menu.
-pub(crate) fn gossip_complete(gossip: &mut GossipState, quest: &mut QuestGiver) {
+/// `SMSG_GOSSIP_COMPLETE` closes the menu alone (`0x58a852`): the zero-guid gossip setter leaves an
+/// open quest-giver dialog standing (`0x58a570`).
+pub(crate) fn gossip_complete(gossip: &mut GossipState) {
     debug!("net: gossip complete — closing the menu");
     gossip.clear();
+}
+
+/// The menu and the quest-giver dialog both close.
+pub(crate) fn end_interaction(gossip: &mut GossipState, quest: &mut QuestGiver) {
+    gossip.clear();
     quest.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gossip_complete_leaves_the_quest_dialog_open() {
+        let mut gossip = GossipState {
+            npc: Some(0x42),
+            ..Default::default()
+        };
+        let mut quest = QuestGiver::default();
+        quest.npc = Some(0x42);
+        gossip_complete(&mut gossip);
+        assert_eq!(gossip.npc, None);
+        assert_eq!(quest.npc, Some(0x42), "the quest-giver dialog stays");
+
+        gossip.npc = Some(0x42);
+        end_interaction(&mut gossip, &mut quest);
+        assert_eq!((gossip.npc, quest.npc), (None, None));
+    }
 }

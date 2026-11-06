@@ -69,6 +69,9 @@ pub(super) fn control(
         MessageReader<crate::net::SelfCreateMover>,
         // The driven body's guid and own modes, for the hand-over (`wire_in`).
         Query<(&crate::net::Guid, Option<&crate::net::UnitMoveModes>), With<Embodied>>,
+        // The one auto-move cell, follow or a Click to Move walk, which a knockback clears.
+        ResMut<super::follow::FollowState>,
+        ResMut<super::approach::Approach>,
     ),
     mut commands: Commands,
     mut player: ResMut<Player>,
@@ -79,7 +82,11 @@ pub(super) fn control(
     mut body: BodyQuery,
     window: Single<(&mut Window, &mut CursorOptions), With<PrimaryWindow>>,
     // A press starts a look and arms a click test, which the release settles on time and travel.
-    mut world_clicks: (MessageWriter<WorldClick>, MessageWriter<WorldRightClick>),
+    mut world_clicks: (
+        MessageWriter<WorldClick>,
+        MessageWriter<WorldDropClick>,
+        MessageWriter<WorldRightClick>,
+    ),
     mut click_test: (
         Local<Option<camera::PressGesture>>,
         Local<Option<camera::PressGesture>>,
@@ -127,7 +134,7 @@ pub(super) fn control(
         },
         ..*pointer.3
     };
-    let dt = time.delta_secs();
+    let dt = super::mover::move_step(&time).as_secs_f32();
     // Free fly reads no keys while an EditBox is `typing` (not the per-key `consumed`, a binding's
     // concern); `binds` applied that gate when it latched, and the dev chords ignore it.
     let typing = ui_capture.typing;
@@ -157,7 +164,7 @@ pub(super) fn control(
                 .ok()
                 .and_then(|(_, _, _, _, _, store, ..)| store)
                 .is_some_and(|s| s.0.unit_flags() & 0x0010_0000 != 0),
-            track: player.server_riding,
+            track: player.server_riding || player.auto_forward || player.auto_turning,
             fear: player.control_lost,
             facing: player.face_yaw,
             mounted: body
@@ -248,6 +255,7 @@ pub(super) fn control(
         click_consumed.0,
         &mut world_clicks.0,
         &mut world_clicks.1,
+        &mut world_clicks.2,
         left_click,
         right_click,
         look_cfg,
@@ -320,6 +328,15 @@ pub(super) fn control(
             .ok()
             .map(|(g, m)| (g.0, m.map_or(0, |m| m.0))),
     );
+
+    // A teleport ends the auto-move and closes the loot (`0x72d2d0` calls `0x72aec0(1, 0)`).
+    if std::mem::take(&mut player.teleported) {
+        if speed_capsule.12.stop() || speed_capsule.13.active() {
+            move_trace::auto_move("teleport", player.pos, player.pos);
+        }
+        speed_capsule.13.stop();
+        net.14 .0 = true;
+    }
 
     let flat = |v: Vec3| Vec3::new(v.x, 0.0, v.z).normalize_or_zero();
 
@@ -540,7 +557,9 @@ pub(super) fn control(
         // press is the same take-off. Each edge reports and then resyncs (`0x7413f0`).
         let now = time.elapsed_secs();
         let feet = player.pos;
-        let edge = if fly_press {
+        // The auto-move's take-off for a steep goal is the same edge (`0x731e0f`).
+        let auto_take_off = std::mem::take(&mut player.auto_take_off);
+        let edge = if fly_press || auto_take_off {
             Some(flight::Edge::TakeOff)
         } else {
             flight::status(
@@ -605,6 +624,16 @@ pub(super) fn control(
         // The knockback: horizontal `(cos, sin) · xy_speed` in absolute world XY, vertical
         // `−zspeed`, since the wire's take-off speed is down-positive, as in the jump tail.
         let knockback = player.take_knockback();
+        // A knockback opens with the movement-start teardown (`0x72d1be`-`0x72d236`): the auto-move
+        // ends (AUTOFOLLOW_END for a follow) and the loot window closes as on a step,
+        // `CloseLoot(1, 1, 0)`.
+        if knockback.is_some() {
+            if speed_capsule.12.stop() {
+                info!("follow: ended by a knockback");
+            }
+            speed_capsule.13.stop();
+            net.14 .0 = true;
+        }
         let knock_launch = knockback.map(|k| {
             let (c, sn, xy) = (k.launch.cos_angle, k.launch.sin_angle, k.launch.xy_speed);
             wow_to_bevy([c * xy, sn * xy, -k.launch.zspeed])
@@ -887,7 +916,8 @@ pub(super) fn control(
         let wire_transport = movement_net::wire_transport(&player);
         // A held frame is simulation time skipped; the mover named is the one we drive.
         let skip = movement_net::SkipClock {
-            dt,
+            dt: time.delta_secs(),
+            skipped: time.delta_secs() - dt,
             held: player.settling,
             mover: player.foreign_mover.or(self_guid),
         };

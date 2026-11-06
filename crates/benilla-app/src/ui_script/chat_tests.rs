@@ -252,7 +252,7 @@ fn chat_box_arrows_edit_and_history_recalls() {
 fn chat_click_dismisses_a_stuck_spell_but_not_an_item() {
     benilla_formats::wow_data_or_skip!();
     use benilla_ui::script::{
-        ContainerSlot, ContainerState, SpellBookState, SpellSlotView, SpellTabView,
+        ContainerSlot, ContainerState, SpellBookState, SpellSlotView, SpellTabView, WorldPick,
     };
     let mut s = chat_frame();
     s.set_spellbook(SpellBookState {
@@ -301,8 +301,11 @@ fn chat_click_dismisses_a_stuck_spell_but_not_an_item() {
         "a drag release over the chat keeps carrying"
     );
 
+    // The chat body takes no click, so it lands on the world, whose legs the app runs.
+    assert!(s.hit_test(cx, cy).is_none_or(|hit| s.is_world_frame(hit)));
     s.mouse_button(cx, cy, "LeftButton", true);
     s.mouse_button(cx, cy, "LeftButton", false);
+    s.world_drop_click(WorldPick::Terrain);
     assert!(s.errors().is_empty(), "{:?}", s.errors());
     assert!(
         s.cursor_payload().is_none(),
@@ -350,6 +353,7 @@ fn chat_click_dismisses_a_stuck_spell_but_not_an_item() {
     assert!(s.cursor_item().is_some(), "fixture: the item is held");
     s.mouse_button(cx, cy, "LeftButton", true);
     s.mouse_button(cx, cy, "LeftButton", false);
+    s.world_drop_click(WorldPick::Terrain);
     assert!(
         s.cursor_item().is_some(),
         "a chat click never touches an item payload"
@@ -382,6 +386,7 @@ fn chat_type_info_matches_the_host_color_table() {
         ("TEXT_EMOTE", K::TextEmote, 12),
         ("SYSTEM", K::System, 1),
         ("MONSTER_SAY", K::MonsterSay, 13),
+        ("MONSTER_PARTY", K::MonsterParty, 14),
         ("MONSTER_YELL", K::MonsterYell, 15),
         ("MONSTER_EMOTE", K::MonsterEmote, 17),
         ("MONSTER_WHISPER", K::MonsterWhisper, 16),
@@ -402,9 +407,11 @@ fn chat_type_info_matches_the_host_color_table() {
         ("RAID_LEADER", K::RaidLeader, 40),
         ("RAID_WARNING", K::RaidWarning, 41),
         ("RAID_BOSS_EMOTE", K::RaidBossEmote, 42),
+        ("RAID_BOSS_WHISPER", K::RaidBossWhisper, 43),
         ("FILTERED", K::Filtered, 44),
         ("BATTLEGROUND", K::Battleground, 45),
         ("BATTLEGROUND_LEADER", K::BattlegroundLeader, 46),
+        ("RESTRICTED", K::Restricted, 47),
         ("BG_SYSTEM_NEUTRAL", K::BgSystemNeutral, 37),
         ("BG_SYSTEM_ALLIANCE", K::BgSystemAlliance, 38),
         ("BG_SYSTEM_HORDE", K::BgSystemHorde, 39),
@@ -415,6 +422,7 @@ fn chat_type_info_matches_the_host_color_table() {
         ("TRADESKILLS", K::Tradeskills, 31),
         ("PET_INFO", K::PetInfo, 32),
         ("OPENING", K::Opening, 30),
+        ("TARGETICONS", K::TargetIcons, 53),
     ];
     assert_eq!(PAIRS.len(), K::ALL.len(), "every kind is listed");
 

@@ -568,6 +568,11 @@ impl ObjectFields {
     pub fn player_release_timer_running(&self) -> bool {
         self.get_u32(FIELD_PLAYER_FIELD_BYTES).unwrap_or(0) & 0x08 != 0
     }
+    /// `PLAYER_FIELD_BYTES` byte 0 bit `0x10`: no release window, so the timer reads 0 at once
+    /// (`0x6dc096`).
+    pub fn player_no_release_window(&self) -> bool {
+        self.get_u32(FIELD_PLAYER_FIELD_BYTES).unwrap_or(0) & 0x10 != 0
+    }
     /// `PLAYER_FIELD_BYTES` byte 2 (private, field 1222): the four extra action bars' toggles, bits
     /// `0x01..0x08` (`Player.h:360-363`), read by `GetActionBarToggles` at
     /// `[[player+0xe68]+0x102a]`. The client never writes it and no event fires when it moves.
@@ -587,6 +592,12 @@ impl ObjectFields {
     /// (`HonorMgr.cpp:900`), 0 unranked, 1-4 negative, 5 up positive, indexing `PVP_RANK_*`;
     /// the drawn rank is `rank > 4 ? rank - 4 : -rank` (`HonorMgr.cpp:991`).
     pub fn player_pvp_rank(&self) -> Option<u8> {
+        self.get_u32(FIELD_PLAYER_BYTES_3)
+            .map(|b| ((b >> 24) & 0xff) as u8)
+    }
+    /// `PLAYER_BYTES_3` byte 3 as 12340 reads it: the arena team side, which a player streamed
+    /// into an arena is compared against our own to make it an opponent (`0x6e830f`).
+    pub fn player_arena_faction(&self) -> Option<u8> {
         self.get_u32(FIELD_PLAYER_BYTES_3)
             .map(|b| ((b >> 24) & 0xff) as u8)
     }
@@ -773,6 +784,11 @@ impl ObjectFields {
     /// reference's test in `GetInventoryItemCount` and in `PutItemInBag`.
     pub fn is_container(&self) -> bool {
         self.get_u32(FIELD_OBJECT_TYPE).unwrap_or(0) & 0x4 != 0
+    }
+
+    /// `OBJECT_FIELD_TYPE`'s unit bit `0x8`, a player included: the object-pointer type mask 8.
+    pub fn is_unit(&self) -> bool {
+        self.get_u32(FIELD_OBJECT_TYPE).unwrap_or(0) & 0x8 != 0
     }
 
     /// The object's class from `OBJECT_FIELD_TYPE`, for updates with no `TypeId`; the player bit

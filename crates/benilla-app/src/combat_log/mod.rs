@@ -41,6 +41,7 @@ impl Plugin for CombatLogPlugin {
         use SessionEventKind as K;
         app.init_resource::<entries::PendingEntries>()
             .init_resource::<entries::CombatLogClock>()
+            .init_resource::<entries::CombatLogBackdate>()
             .add_message::<crate::net::EnteredWorldMessage>()
             .add_message::<entries::CombatLogFired>()
             .add_message::<SpellCastFailedLog>()
@@ -59,7 +60,8 @@ impl Plugin for CombatLogPlugin {
                     .chain()
                     .in_set(crate::ui_script::UiFeed),
             );
-        app.net_handler(K::AttackerState, on_attacker_state)
+        app.net_handler(K::CombatLogBackdate, on_backdate)
+            .net_handler(K::AttackerState, on_attacker_state)
             .net_handler(K::SpellDamageLog, on_spell_damage_log)
             .net_handler(K::PeriodicAuraLog, on_periodic_aura_log)
             .net_handler(K::SpellHealLog, on_spell_heal_log)
@@ -76,6 +78,7 @@ impl Plugin for CombatLogPlugin {
             .net_handler(K::SpellLogExecute, on_spell_log_execute)
             .net_handler(K::EnvironmentalDamageLog, on_environmental_damage_log)
             .net_handler(K::BuildingDamage, on_building_damage)
+            .net_handler(K::DestroyedOnDeath, on_destroyed_on_death)
             .net_handler(K::SpellStart, on_spell_start)
             .net_handler(K::SpellGo, on_spell_go)
             .net_handler(K::AuraUpdate, on_aura_update)
@@ -83,6 +86,12 @@ impl Plugin for CombatLogPlugin {
             .net_handler(K::ExplorationXp, on_exploration_xp)
             .net_handler(K::LevelUp, on_level_up)
             .net_handler(K::PvpCredit, on_pvp_credit);
+    }
+}
+
+fn on_backdate(In(ev): In<SessionEvent>, mut backdate: ResMut<entries::CombatLogBackdate>) {
+    if let SessionEvent::CombatLogBackdate { ms } = ev {
+        backdate.0 = ms;
     }
 }
 
@@ -198,6 +207,12 @@ fn on_environmental_damage_log(In(ev): In<SessionEvent>, mut log: Log) {
 fn on_building_damage(In(ev): In<SessionEvent>, mut log: Log) {
     if let SessionEvent::BuildingDamage(b) = ev {
         log.building_damage(&b);
+    }
+}
+
+fn on_destroyed_on_death(In(ev): In<SessionEvent>, mut log: Log) {
+    if let SessionEvent::DestroyedOnDeath(guid) = ev {
+        log.destroyed_on_death(guid);
     }
 }
 
@@ -343,9 +358,27 @@ struct Progress<'w, 's> {
     center: MessageWriter<'w, CombatTextEvent>,
 }
 
-fn on_xp_gain(In(ev): In<SessionEvent>, mut p: Progress) {
+fn on_xp_gain(
+    In(ev): In<SessionEvent>,
+    mut p: Progress,
+    rest_states: Option<Res<crate::ui_unit::RestStates>>,
+) {
     if let SessionEvent::XpGain(x) = ev {
-        progress::xp_gain(x, &p.index, &p.self_guid, &mut p.text, &mut p.chat);
+        let me = p.self_guid.0.and_then(|g| p.index.0.get(&g).copied());
+        let line = progress::xp_line(
+            &x,
+            p.self_guid.0,
+            me.and_then(|e| p.stores.get(e).ok()),
+            |guid| {
+                p.index
+                    .0
+                    .get(&guid)
+                    .and_then(|&e| p.stores.get(e).ok())
+                    .is_some_and(|s| s.0.is_unit())
+            },
+            rest_states.as_deref(),
+        );
+        progress::xp_gain(x, me, line, &mut p.text, &mut p.chat);
     }
 }
 
@@ -370,9 +403,13 @@ fn on_exploration_xp(
     }
 }
 
-fn on_level_up(In(ev): In<SessionEvent>, mut p: Progress) {
+fn on_level_up(
+    In(ev): In<SessionEvent>,
+    mut chat: ResMut<ChatLog>,
+    mut tutorials: Option<MessageWriter<crate::tutorial::TutorialEvent>>,
+) {
     if let SessionEvent::LevelUp(lv) = ev {
-        progress::level_up(lv, &mut p.chat);
+        progress::level_up(lv, &mut chat, tutorials.as_mut());
     }
 }
 

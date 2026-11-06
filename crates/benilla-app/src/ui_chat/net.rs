@@ -1,5 +1,5 @@
 //! The chat window's packet handlers: the spoken line, and the notices and answers that print as
-//! chat. `SMSG_NOTIFICATION` and `SMSG_AREA_TRIGGER_MESSAGE` are `UIErrorsFrame` toasts instead,
+//! chat. `SMSG_NOTIFICATION` and `SMSG_AREA_TRIGGER_MESSAGE` are mostly `UIErrorsFrame` toasts,
 //! queued on [`UiErrorTexts`].
 
 use benilla_protocol::messages::{ChatMessage, CHAT_MSG_WHISPER};
@@ -8,20 +8,23 @@ use bevy::prelude::*;
 
 use super::{Broadcast, ChatEvent, ChatEventKind, ChatLog};
 use crate::net::{ClientCommand, NetCommands, NetHandlerApp, PlayedTimeAnswer, ServerSaidMessage};
-use crate::ui_action::{UiErrorKeys, UiErrorTexts};
+use crate::ui_action::{UiError, UiErrorKeys, UiErrorTexts};
 use crate::ui_social::SocialState;
+use benilla_ui::messages::MsgKind;
 
 /// Register the chat window's handlers and its session-end listener.
 pub(super) fn register(app: &mut App) {
     use SessionEventKind as K;
     app.net_handler(K::Chat, on_chat)
         .net_handler(K::ChannelList, on_channel_list)
+        .net_handler(K::ChannelUserList, on_channel_user_list)
         .net_handler(K::ChatPlayerNotFound, on_whisper_refusal)
         .net_handler(K::ChatWrongFaction, on_whisper_refusal)
+        .net_handler(K::ChatNotInParty, on_chat_not_in_party)
         .net_handler(K::ZoneUnderAttack, on_broadcast)
         .net_handler(K::DefenseMessage, on_broadcast)
         .net_handler(K::ServerMessage, on_broadcast)
-        .net_handler(K::ChatRestricted, on_broadcast)
+        .net_handler(K::ChatRestricted, on_chat_restricted)
         .net_handler(K::Notification, on_toast)
         .net_handler(K::AreaTriggerMessage, on_toast)
         .net_handler(K::PlayedTime, on_played_time)
@@ -81,6 +84,43 @@ fn on_channel_list(
     });
 }
 
+/// `SMSG_USERLIST_ADD`, `_REMOVE` and `_UPDATE`: the watched channel's roster follows its members.
+fn on_channel_user_list(
+    In(ev): In<SessionEvent>,
+    script: Option<NonSendMut<benilla_ui::script::UiScript>>,
+    names: Option<Res<crate::names::NameCache>>,
+    commands: Option<Res<NetCommands>>,
+) {
+    use benilla_protocol::messages::ChannelUserListKind as K;
+    let (SessionEvent::ChannelUserList(u), Some(mut script)) = (ev, script) else {
+        return;
+    };
+    debug!(
+        "chat: user list {:?} {:?} {:#x} flags {:#04x}",
+        u.kind, u.channel, u.guid, u.member_flags
+    );
+    match u.kind {
+        K::Add => script.channel_user_added(
+            &u.channel,
+            u.guid,
+            u.member_flags,
+            u.channel_flags,
+            |guid| {
+                let (Some(names), Some(commands)) = (names.as_deref(), commands.as_deref()) else {
+                    return None;
+                };
+                names
+                    .answer(crate::names::NameKey::Player(guid), guid, commands)
+                    .map(|name| name.map(str::to_string))
+            },
+        ),
+        K::Remove => script.channel_user_removed(&u.channel, u.guid, u.channel_flags),
+        K::Update => {
+            script.channel_user_updated(&u.channel, u.guid, u.member_flags, u.channel_flags)
+        }
+    }
+}
+
 /// The channel pane's roster waits on the name cache (`0x4ffe30`): each answer that has landed is
 /// handed over, and the last one fires the roster's events.
 pub(super) fn feed_channel_roster_names(
@@ -107,6 +147,24 @@ fn on_whisper_refusal(In(ev): In<SessionEvent>, mut errors: ResMut<UiErrorKeys>)
     }
 }
 
+/// `SMSG_CHAT_NOT_IN_PARTY` (`0x6e397b`): the party and battleground-party types say not in a
+/// group, the raid types not in a raid, any other nothing.
+fn not_in_party_key(chat_type: u32) -> Option<&'static str> {
+    match chat_type {
+        2 | 51 => Some("ERR_NOT_IN_GROUP"),
+        3 | 39 | 40 => Some("ERR_NOT_IN_RAID"),
+        _ => None,
+    }
+}
+
+fn on_chat_not_in_party(In(ev): In<SessionEvent>, mut errors: ResMut<UiErrorKeys>) {
+    if let SessionEvent::ChatNotInParty { chat_type } = ev {
+        errors
+            .0
+            .extend(not_in_party_key(chat_type).map(UiError::key));
+    }
+}
+
 /// The four world broadcasts, parked for [`super::broadcast`]'s resolve pass.
 fn on_broadcast(In(ev): In<SessionEvent>, mut chat_log: ResMut<ChatLog>) {
     let b = match ev {
@@ -115,27 +173,47 @@ fn on_broadcast(In(ev): In<SessionEvent>, mut chat_log: ResMut<ChatLog>) {
         SessionEvent::ServerMessage { message_type, text } => {
             Broadcast::Server { message_type, text }
         }
-        SessionEvent::ChatRestricted => Broadcast::ChatRestricted,
         _ => return,
     };
     broadcast(b, &mut chat_log);
 }
 
-fn on_toast(In(ev): In<SessionEvent>, mut errors: ResMut<UiErrorTexts>) {
+/// `SMSG_CHAT_RESTRICTED` (`0x6e3cb9`): the kind picks its line through `0x6e44d0`; past 3,
+/// nothing (`0x6e3ccb`).
+fn chat_restricted_key(kind: u8) -> Option<&'static str> {
+    Some(match kind {
+        0 => "ERR_CHAT_RESTRICTED",
+        1 => "ERR_CHAT_THROTTLED",
+        2 => "ERR_USER_SQUELCHED",
+        3 => "ERR_YELL_RESTRICTED",
+        _ => return None,
+    })
+}
+
+fn on_chat_restricted(In(ev): In<SessionEvent>, mut errors: ResMut<UiErrorKeys>) {
+    if let SessionEvent::ChatRestricted { kind } = ev {
+        errors.0.extend(chat_restricted_key(kind).map(UiError::key));
+    }
+}
+
+fn on_toast(
+    In(ev): In<SessionEvent>,
+    mut errors: ResMut<UiErrorTexts>,
+    mut chat_log: ResMut<ChatLog>,
+) {
     match ev {
-        SessionEvent::Notification { text } => notification(text, &mut errors),
+        SessionEvent::Notification { text } => notification(&text, &mut errors, &mut chat_log),
         SessionEvent::AreaTriggerMessage { text } => area_trigger_message(text, &mut errors),
         _ => {}
     }
 }
 
-/// Print the `/played` breakdown, and fill the mailbox `feed::played_time_bridge` fires as
-/// `TIME_PLAYED_MSG`.
+/// Fill the mailbox `feed::played_time_bridge` fires as `TIME_PLAYED_MSG`, whose stock handler
+/// prints the chat lines; the breakdown goes to the console (`0x401400`-`0x40144c`), the log here.
 fn on_played_time(
     In(ev): In<SessionEvent>,
     mut answer: ResMut<PlayedTimeAnswer>,
     mut clock: ResMut<crate::net::PlayedClock>,
-    mut chat_log: ResMut<ChatLog>,
 ) {
     if let SessionEvent::PlayedTime { total, level, show } = ev {
         debug!("net: played time {total} s (level {level} s, shown {show})");
@@ -143,23 +221,46 @@ fn on_played_time(
         // Only a shown answer prints and fires `TIME_PLAYED_MSG` (`0x4013f6`).
         if show {
             answer.0 = Some((total, level));
-            played_time(total, level, &mut chat_log);
+            info!(
+                "console: total time played {}, this level {}",
+                played_breakdown(total),
+                played_breakdown(level)
+            );
         }
     }
 }
 
-fn on_channel_notify(In(ev): In<SessionEvent>, mut chat_log: ResMut<ChatLog>) {
+fn on_channel_notify(
+    In(ev): In<SessionEvent>,
+    mut chat_log: ResMut<ChatLog>,
+    social: Res<SocialState>,
+) {
     if let SessionEvent::ChannelNotify {
         notice,
         channel,
         tail,
     } = ev
     {
+        // An invite from an ignored or non-player guid is dropped whole (`0x50e76b`,
+        // `0x50e778`-`0x50e798`).
+        if notice == benilla_protocol::messages::channel_notice::INVITE {
+            if let benilla_protocol::messages::ChannelNoticeTail::Actor(g) = tail {
+                let player = g >> 60 == 0 && g & 0xf07f_ffff_ffff_ffff != 0;
+                if social.is_ignored(g) || !player {
+                    return;
+                }
+            }
+        }
         chat_log.push_channel_notice(notice, channel, &tail);
     }
 }
 
-fn on_random_roll(In(ev): In<SessionEvent>, mut chat_log: ResMut<ChatLog>) {
+/// `MSG_RANDOM_ROLL` (`0x6e37af`): an ignored roller's roll shows nothing (`0x6e3801`).
+fn on_random_roll(
+    In(ev): In<SessionEvent>,
+    mut chat_log: ResMut<ChatLog>,
+    social: Res<SocialState>,
+) {
     if let SessionEvent::RandomRoll {
         min,
         max,
@@ -167,6 +268,10 @@ fn on_random_roll(In(ev): In<SessionEvent>, mut chat_log: ResMut<ChatLog>) {
         guid,
     } = ev
     {
+        if social.is_ignored(guid) {
+            debug!("net: roll by ignored {guid:#x} dropped");
+            return;
+        }
         chat_log.push_roll(min, max, roll, guid);
     }
 }
@@ -223,14 +328,24 @@ fn chat(
         );
     }
     // An ignored speaker is dropped silently (the ignore list); a dropped whisper also
-    // sends `CMSG_CHAT_IGNORED`, so the sender hears "is ignoring you".
+    // sends `CMSG_CHAT_IGNORED`, so the sender hears "is ignoring you". Whisper echoes, ignore
+    // notices and restricted lines still post (`0x50c195`-`0x50c19d`).
     if social.is_ignored(m.sender_guid) {
         if m.chat_type == CHAT_MSG_WHISPER {
             let _ = net_commands.0.send(ClientCommand::ChatIgnored {
                 guid: m.sender_guid,
             });
         }
-        return;
+        use benilla_protocol::messages as msg;
+        if ![
+            msg::CHAT_MSG_WHISPER_INFORM,
+            msg::CHAT_MSG_IGNORED,
+            msg::CHAT_MSG_RESTRICTED,
+        ]
+        .contains(&m.chat_type)
+        {
+            return;
+        }
     }
     chat_log.push_wire(m);
 }
@@ -262,13 +377,73 @@ fn chat_wrong_faction(errors: &mut crate::ui_action::UiErrorKeys) {
         .push(crate::ui_action::UiError::key("ERR_CHAT_WRONG_FACTION"));
 }
 
-/// `SMSG_NOTIFICATION` (`0x1cb`): the red `UIErrorsFrame` line, `UI_ERROR_MESSAGE` from
-/// `(text, 1)`, never a chat line. vmangos sends `.gm on` as both a system line and a notification
-/// (`Objects/Player.cpp:2676-2677`).
-fn notification(text: String, errors: &mut UiErrorTexts) {
-    // The reference also logs it to the console.
-    info!("net: notification — {text}");
-    errors.error(text);
+/// Where one `SMSG_NOTIFICATION` text shows, after `0x401280`'s control prefix.
+#[derive(Debug, PartialEq, Eq)]
+struct NoticeRoute<'a> {
+    text: &'a str,
+    /// The error-display line and its flag: red for colour 3, else yellow.
+    toast: Option<MsgKind>,
+    /// A chat line of this 3.3.5a chat type.
+    chat: Option<i32>,
+}
+
+/// `0x4012ac`-`0x401328`: a leading `"DEBUGACTION: "` is cut; with no `~` next the text is the red
+/// line alone. After a `~`, `>` drops the line, `#` drops it and adds a chat line, and `^N` sets
+/// the chat type and the console colour to digit N, the line red only for N = 3.
+fn notice_route(text: &str) -> NoticeRoute<'_> {
+    let text = text.strip_prefix("DEBUGACTION: ").unwrap_or(text);
+    let Some(mut rest) = text.strip_prefix('~') else {
+        return NoticeRoute {
+            text,
+            toast: Some(MsgKind::Error),
+            chat: None,
+        };
+    };
+    let (mut toast, mut chat) = (true, false);
+    if let Some(r) = rest.strip_prefix('>') {
+        toast = false;
+        rest = r;
+    }
+    if let Some(r) = rest.strip_prefix('#') {
+        (toast, chat) = (false, true);
+        rest = r;
+    }
+    let (mut chat_type, mut color) = (0, 3);
+    if let Some(r) = rest.strip_prefix('^') {
+        let digit = r.bytes().next().map_or(0, |b| i32::from(b as i8));
+        (chat_type, color) = (digit - 0x30, digit - 0x30);
+        rest = r.char_indices().nth(1).map_or("", |(i, _)| &r[i..]);
+    }
+    NoticeRoute {
+        text: rest,
+        toast: toast.then_some(if color == 3 {
+            MsgKind::Error
+        } else {
+            MsgKind::Info
+        }),
+        chat: chat.then_some(chat_type),
+    }
+}
+
+/// `SMSG_NOTIFICATION` (`0x401280`): the error-display line, the console and a chat line as the
+/// text's prefix says ([`notice_route`]). vmangos sends `.gm on` as both a system line and a
+/// notification (`Objects/Player.cpp:2676-2677`).
+fn notification(text: &str, errors: &mut UiErrorTexts, chat_log: &mut ChatLog) {
+    let route = notice_route(text);
+    info!("net: notification — {}", route.text);
+    match route.toast {
+        Some(MsgKind::Error) => errors.error(route.text.to_string()),
+        Some(_) => errors.info(route.text.to_string()),
+        None => {}
+    }
+    let kind = route
+        .chat
+        .and_then(|t| u8::try_from(t).ok())
+        .and_then(benilla_protocol::messages::wotlk_chat_type_shared)
+        .and_then(super::event::kind_of_wire);
+    if let Some(kind) = kind {
+        chat_log.push_event(ChatEvent::text_only(kind, route.text.to_string()));
+    }
 }
 
 /// An area trigger's refusal (`SMSG_AREA_TRIGGER_MESSAGE`, `0x2b8`): the yellow `UIErrorsFrame`
@@ -285,21 +460,12 @@ fn broadcast(b: Broadcast, chat_log: &mut ChatLog) {
     chat_log.push_broadcast(b);
 }
 
-/// The `/played` answer as two system lines, in English, shaped like `TIME_PLAYED_TOTAL` and
-/// `TIME_PLAYED_LEVEL` over `TIME_DAYHOURMINUTESECOND` (`GlobalStrings.lua:4243-4247`).
-fn played_time(total: u32, level: u32, chat_log: &mut ChatLog) {
-    for (label, secs) in [
-        ("Total time played", total),
-        ("Time played this level", level),
-    ] {
-        let (d, rem) = (secs / 86_400, secs % 86_400);
-        let (h, rem) = (rem / 3_600, rem % 3_600);
-        let (m, sec) = (rem / 60, rem % 60);
-        chat_log.push_event(ChatEvent::text_only(
-            ChatEventKind::System,
-            format!("{label}: {d} days, {h} hours, {m} minutes, {sec} seconds"),
-        ));
-    }
+/// One played time as days, hours, minutes and seconds, for the console line.
+fn played_breakdown(secs: u32) -> String {
+    let (d, rem) = (secs / 86_400, secs % 86_400);
+    let (h, rem) = (rem / 3_600, rem % 3_600);
+    let (m, sec) = (rem / 60, rem % 60);
+    format!("{d}d {h}h {m}m {sec}s")
 }
 
 #[cfg(test)]
@@ -320,6 +486,8 @@ mod tests {
             text: text.to_string(),
             chat_tag: 0,
             achievement: 0,
+            wire_type: 0,
+            sender_word: 0,
         }
     }
 
@@ -434,7 +602,8 @@ mod tests {
         );
 
         let mut errors = UiErrorTexts::default();
-        notification("GM mode is ON".to_string(), &mut errors);
+        let mut log = ChatLog::default();
+        notification("GM mode is ON", &mut errors, &mut log);
         assert_eq!(
             errors.0,
             [(
@@ -442,6 +611,90 @@ mod tests {
                 benilla_ui::messages::MsgKind::Error
             )],
             "the SendNotification half is the RED toast, never a second line"
+        );
+        assert_eq!(log.pending_len(), 0);
+    }
+
+    /// `0x4012ac`-`0x401371`: each prefix's surfaces, with the prefix cut from the text.
+    #[test]
+    fn a_notification_prefix_picks_its_surfaces() {
+        let route = |toast, chat, text| NoticeRoute { text, toast, chat };
+        let (red, yellow) = (Some(MsgKind::Error), Some(MsgKind::Info));
+        assert_eq!(notice_route("plain"), route(red, None, "plain"));
+        assert_eq!(
+            notice_route("DEBUGACTION: ~#hi"),
+            route(None, Some(0), "hi")
+        );
+        assert_eq!(notice_route("~>quiet"), route(None, None, "quiet"));
+        assert_eq!(notice_route("~>#both"), route(None, Some(0), "both"));
+        assert_eq!(notice_route("~^1info"), route(yellow, None, "info"));
+        assert_eq!(notice_route("~^3red"), route(red, None, "red"));
+        assert_eq!(notice_route("~#^1say"), route(None, Some(1), "say"));
+        assert_eq!(notice_route("~text"), route(red, None, "text"));
+        assert_eq!(notice_route("x~text"), route(red, None, "x~text"));
+    }
+
+    /// A `#` line lands in chat as its 3.3.5a type's lane, beside no toast.
+    #[test]
+    fn a_hash_notification_writes_a_chat_line_of_its_type() {
+        let mut errors = UiErrorTexts::default();
+        let mut log = ChatLog::default();
+        notification("~#^1hello", &mut errors, &mut log);
+        notification("~#plain system", &mut errors, &mut log);
+        notification("~#^/", &mut errors, &mut log);
+        assert!(errors.0.is_empty());
+        assert_eq!(
+            log.pending_len(),
+            2,
+            "type 1 (say) and type 0 (system); -1 has no lane"
+        );
+    }
+
+    /// `0x6e44d0`: kinds 0-3 each take their line, and past 3 nothing shows.
+    #[test]
+    fn a_chat_restriction_shows_its_kinds_line() {
+        assert_eq!(chat_restricted_key(0), Some("ERR_CHAT_RESTRICTED"));
+        assert_eq!(chat_restricted_key(1), Some("ERR_CHAT_THROTTLED"));
+        assert_eq!(chat_restricted_key(2), Some("ERR_USER_SQUELCHED"));
+        assert_eq!(chat_restricted_key(3), Some("ERR_YELL_RESTRICTED"));
+        assert_eq!(chat_restricted_key(4), None);
+    }
+
+    /// `0x6e397b`: the party types say not in a group, the raid types not in a raid.
+    #[test]
+    fn a_line_outside_the_group_names_the_group_it_needed() {
+        for t in [2, 51] {
+            assert_eq!(not_in_party_key(t), Some("ERR_NOT_IN_GROUP"), "type {t}");
+        }
+        for t in [3, 39, 40] {
+            assert_eq!(not_in_party_key(t), Some("ERR_NOT_IN_RAID"), "type {t}");
+        }
+        for t in [0, 1, 4, 44, 52] {
+            assert_eq!(not_in_party_key(t), None, "type {t}");
+        }
+    }
+
+    /// `0x6e3801`: a roll from an ignored player never queues; any other does.
+    #[test]
+    fn an_ignored_players_roll_is_dropped() {
+        let mut world = World::new();
+        world.insert_resource(ChatLog::default());
+        let mut social = SocialState::default();
+        social.set_ignores_for_test(vec![0x21]);
+        world.insert_resource(social);
+        for guid in [0x21, 0x22] {
+            let ev = SessionEvent::RandomRoll {
+                min: 1,
+                max: 100,
+                roll: 42,
+                guid,
+            };
+            world.run_system_once_with(on_random_roll, ev).unwrap();
+        }
+        assert_eq!(
+            world.resource::<ChatLog>().pending_len(),
+            1,
+            "only 0x22's roll queues"
         );
     }
 

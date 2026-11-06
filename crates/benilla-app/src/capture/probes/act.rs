@@ -98,7 +98,7 @@ impl Plugin for ProbeKeyPlugin {
                     Some((at, hold)) => (at, hold.trim().parse::<f32>().ok()?),
                     None => (rest, PROBE_KEY_TAP_SECS),
                 };
-                match (probe_key_by_name(key.trim()), at.trim().parse::<f32>()) {
+                match (probe_input_by_name(key.trim()), at.trim().parse::<f32>()) {
                     (Some(key), Ok(at)) => Some(ProbeKeyTap {
                         key,
                         at,
@@ -126,6 +126,23 @@ impl Plugin for ProbeKeyPlugin {
 
 /// Default hold: several frames for a held-key reader, still a tap.
 const PROBE_KEY_TAP_SECS: f32 = 0.25;
+
+/// What a [`ProbeKeyPlugin`] tap presses.
+#[derive(Clone, Copy, Debug)]
+enum ProbeInput {
+    Key(KeyCode),
+    /// A mouse button, aimed by `WOW_HOVER_PROBE`, as the window has no OS cursor.
+    Button(MouseButton),
+}
+
+/// A tap's name: `MouseLeft`, `MouseRight`, or a key.
+fn probe_input_by_name(name: &str) -> Option<ProbeInput> {
+    match name {
+        "MouseLeft" => Some(ProbeInput::Button(MouseButton::Left)),
+        "MouseRight" => Some(ProbeInput::Button(MouseButton::Right)),
+        _ => probe_key_by_name(name).map(ProbeInput::Key),
+    }
+}
 
 /// The key names [`ProbeKeyPlugin`] accepts.
 fn probe_key_by_name(name: &str) -> Option<KeyCode> {
@@ -155,7 +172,11 @@ fn probe_key_by_name(name: &str) -> Option<KeyCode> {
         "Shift" => KeyCode::ShiftLeft,
         // The cost pill's toggle, dev chord + `P` (`perf::hud::toggle_hud`); it starts hidden.
         "P" => KeyCode::KeyP,
-        // Text editing: `EditBox` has no Lua deletion API, so caret and deletion need real keys.
+        // Text editing: `EditBox` has no Lua deletion API, so caret and deletion need real keys,
+        // alone or under a held `Ctrl`.
+        "K" => KeyCode::KeyK,
+        "N" => KeyCode::KeyN,
+        "U" => KeyCode::KeyU,
         "Backspace" => KeyCode::Backspace,
         "Delete" => KeyCode::Delete,
         "Left" => KeyCode::ArrowLeft,
@@ -180,7 +201,7 @@ struct ProbeKeys {
 }
 
 struct ProbeKeyTap {
-    key: KeyCode,
+    key: ProbeInput,
     at: f32,
     /// Seconds held: the spec's `:<hold>`, else [`PROBE_KEY_TAP_SECS`].
     hold: f32,
@@ -195,6 +216,7 @@ fn fire_probe_key(
     time: ProbeClock,
     self_player: Query<(), With<crate::net::SelfPlayer>>,
     mut keys: ResMut<ButtonInput<KeyCode>>,
+    mut buttons: ResMut<ButtonInput<MouseButton>>,
     mut events: MessageWriter<bevy::input::keyboard::KeyboardInput>,
     mut hold: ResMut<benilla_world::modkeys::SyntheticHold>,
 ) {
@@ -221,12 +243,22 @@ fn fire_probe_key(
                 "probe-key: {:?} down ({now:.1}s, hold {:.2}s)",
                 tap.key, tap.hold
             );
-            keys.press(tap.key);
-            synth(tap.key, bevy::input::ButtonState::Pressed);
+            match tap.key {
+                ProbeInput::Key(key) => {
+                    keys.press(key);
+                    synth(key, bevy::input::ButtonState::Pressed);
+                }
+                ProbeInput::Button(button) => buttons.press(button),
+            }
             tap.pressed = true;
         } else if tap.pressed && !tap.released && now >= tap.at + tap.hold {
-            keys.release(tap.key);
-            synth(tap.key, bevy::input::ButtonState::Released);
+            match tap.key {
+                ProbeInput::Key(key) => {
+                    keys.release(key);
+                    synth(key, bevy::input::ButtonState::Released);
+                }
+                ProbeInput::Button(button) => buttons.release(button),
+            }
             tap.released = true;
         }
     }
@@ -237,7 +269,10 @@ fn fire_probe_key(
         .taps
         .iter()
         .filter(|t| t.pressed && !t.released)
-        .map(|t| t.key)
+        .filter_map(|t| match t.key {
+            ProbeInput::Key(key) => Some(key),
+            ProbeInput::Button(_) => None,
+        })
         .collect();
     if hold.0 != held {
         hold.0 = held;
@@ -276,11 +311,15 @@ static PROBE_INTERACTS: std::sync::atomic::AtomicU32 = std::sync::atomic::Atomic
 /// `ProbeInteract(entry)`'s GameObject entry, 0 for none: a right-click on the nearest one.
 static PROBE_INTERACT_GO: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// `ProbeWalkBy(dx, dy, dz)`'s offset in WoW axes: a ground right-click that far from the player.
+static PROBE_WALK_BY: std::sync::Mutex<Option<[f32; 3]>> = std::sync::Mutex::new(None);
+
 /// Runs the queued `ProbeInteract()` presses on the selection, or on the nearest GameObject of
-/// the entry `ProbeInteract(entry)` named.
+/// the entry `ProbeInteract(entry)` named, and a `ProbeWalkBy` as the ground leg's walk.
 fn fire_probe_interacts(
     selection: Res<crate::target::Selection>,
     mut out: MessageWriter<crate::target::Interact>,
+    mut auto: crate::player::AutoMove,
     objects: Query<(
         Entity,
         &crate::net::NetEntity,
@@ -289,6 +328,12 @@ fn fire_probe_interacts(
     )>,
     me: Query<&Transform, With<crate::net::SelfPlayer>>,
 ) {
+    let walk_by = PROBE_WALK_BY.lock().ok().and_then(|mut w| w.take());
+    if let (Some(by), Some(at)) = (walk_by, me.iter().next().map(|t| t.translation)) {
+        let goal = at + benilla_assets::coords::wow_to_bevy(by);
+        let armed = auto.walk_to_ground(goal);
+        info!("probe-interact: ground right-click at {goal} ({by:?} away), armed {armed}");
+    }
     let go = PROBE_INTERACT_GO.swap(0, std::sync::atomic::Ordering::Relaxed);
     if go != 0 {
         let Some(at) = me.iter().next().map(|t| t.translation) else {
@@ -329,6 +374,10 @@ fn fire_probe_interacts(
     }
 }
 
+/// `ProbePaste(text)` calls not yet run, each the host's Ctrl+V with `text` on the clipboard, so a
+/// run leaves the OS clipboard alone.
+static PROBE_PASTES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 #[derive(Resource, Default)]
 struct ProbeLua {
     chunk: String,
@@ -343,6 +392,8 @@ struct ProbeLua {
     /// The VM session `ProbeLog` is installed in; `0` matches none, since
     /// [`benilla_ui::script::UiScript::session`] counts from 1.
     logged_vm: u64,
+    /// The last `probe-caret:` line's window focus and focused box's caret.
+    caret: Option<(bool, Option<bool>)>,
 }
 
 /// Whether this entry's chunk is due. The first fire is run-relative (`WOW_PROBE_LUA_AT`, which
@@ -358,9 +409,21 @@ fn probe_lua_due(probe: &ProbeLua, now: f32) -> bool {
     }
 }
 
-/// Installs `ProbeLog(text)` and `ProbeInteract([goEntry])` into the live VM, per VM, while a chunk
-/// is set.
+/// Installs the `Probe*` Lua verbs into the live VM, per VM, while a chunk is set.
 fn install_probe_log(script: &benilla_ui::script::UiScript) {
+    match script.lua().create_function(|_, text: String| {
+        if let Ok(mut pastes) = PROBE_PASTES.lock() {
+            pastes.push(text);
+        }
+        Ok(())
+    }) {
+        Ok(f) => {
+            if let Err(e) = script.lua().globals().set("ProbePaste", f) {
+                error!("probe-lua: installing ProbePaste: {e}");
+            }
+        }
+        Err(e) => error!("probe-lua: creating ProbePaste: {e}"),
+    }
     match script.lua().create_function(|_, go: Option<u32>| {
         match go {
             Some(entry) => PROBE_INTERACT_GO.store(entry, std::sync::atomic::Ordering::Relaxed),
@@ -376,6 +439,21 @@ fn install_probe_log(script: &benilla_ui::script::UiScript) {
             }
         }
         Err(e) => error!("probe-lua: creating ProbeInteract: {e}"),
+    }
+    match script
+        .lua()
+        .create_function(|_, (dx, dy, dz): (f32, f32, f32)| {
+            if let Ok(mut walk) = PROBE_WALK_BY.lock() {
+                *walk = Some([dx, dy, dz]);
+            }
+            Ok(())
+        }) {
+        Ok(f) => {
+            if let Err(e) = script.lua().globals().set("ProbeWalkBy", f) {
+                error!("probe-lua: installing ProbeWalkBy: {e}");
+            }
+        }
+        Err(e) => error!("probe-lua: creating ProbeWalkBy: {e}"),
     }
     match script.lua().create_function(|_, text: String| {
         info!("probe-log: {text}");
@@ -398,11 +476,12 @@ fn fire_probe_lua(
     self_player: Query<(), With<crate::net::SelfPlayer>>,
     state: Res<State<crate::char_select::ClientState>>,
     entry_ui_pending: Option<Res<crate::ui_script::PendingEntryUiLoad>>,
+    windows: Query<&Window>,
 ) {
     if probe.chunk.is_empty() {
         return;
     }
-    let Some(script) = script else {
+    let Some(mut script) = script else {
         // Between the world-entry edge and the entry load the boot VM is parked
         // (`ui_script::ParkedBootVm`): not an entry yet.
         probe.was_ready = false;
@@ -426,6 +505,26 @@ fn fire_probe_lua(
     if probe.logged_vm != script.session() {
         install_probe_log(&script);
         probe.logged_vm = script.session();
+    }
+    let pastes = PROBE_PASTES
+        .lock()
+        .map(|mut p| std::mem::take(&mut *p))
+        .unwrap_or_default();
+    for text in pastes {
+        info!("probe-paste: {text:?} consumed={}", script.paste(&text));
+    }
+    // The caret no chunk can read, one line per change, with the window's focus beside it.
+    let window = windows.iter().any(|w| w.focused);
+    let caret = (
+        window,
+        script.focused_editbox_text_ui().map(|ui| ui.caret_on),
+    );
+    if probe.caret != Some(caret) {
+        probe.caret = Some(caret);
+        info!(
+            "probe-caret: {now:.2}s window_focused={window} caret_on={:?}",
+            caret.1
+        );
     }
     if !probe_lua_due(&probe, now) {
         return;

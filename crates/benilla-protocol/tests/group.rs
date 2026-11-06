@@ -287,8 +287,15 @@ fn group_list_party_two_members_master_loot() {
             lfg_status,
             lfg_slot,
             battleground,
+            group_guid,
+            counter,
         } => {
             assert_eq!(*group_type, 0);
+            assert_eq!(
+                (*group_guid, *counter),
+                (0x1f50_0000_0000_0001, 1),
+                "the group and its counter, which tell a stale list apart (`0x6d88ed`)"
+            );
             assert!(!battleground);
             assert!(!lfg_restricted);
             assert_eq!(
@@ -493,10 +500,12 @@ fn party_command_result_wire() {
             operation,
             member,
             result,
+            value,
         } => {
             assert_eq!(*operation, party_operation::INVITE);
             assert_eq!(member, "Bob");
             assert_eq!(*result, party_result::ALREADY_IN_GROUP);
+            assert_eq!(*value, 0);
         }
         other => panic!("expected PartyCommandResult, got {}", other.name()),
     }
@@ -508,17 +517,19 @@ fn party_command_result_wire() {
     let mut body = party_operation::LEAVE.to_le_bytes().to_vec();
     body.push(0); // empty cstring: no member named
     body.extend_from_slice(&party_result::IGNORING_YOU.to_le_bytes());
-    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&(-5i32).to_le_bytes()); // signed, as `0x6cc107` tests it
     let p = messages::parse_server(opcode::SMSG_PARTY_COMMAND_RESULT, &body).unwrap();
     match &p {
         ServerPacket::PartyCommandResult {
             operation,
             member,
             result,
+            value,
         } => {
             assert_eq!(*operation, party_operation::LEAVE);
             assert!(member.is_empty());
             assert_eq!(*result, party_result::IGNORING_YOU);
+            assert_eq!(*value, -5);
         }
         other => panic!("expected PartyCommandResult, got {}", other.name()),
     }
@@ -735,9 +746,30 @@ fn party_member_stats_offline_miss_is_status_only() {
         ServerPacket::PartyMemberStats { guid, full, info } => {
             assert_eq!(*guid, 0x5C);
             assert!(*full);
+            assert!(!info.arena_opponent);
             assert_eq!(info.status, Some(member_status::OFFLINE.into()));
             assert_eq!(info.cur_hp, None);
         }
+        other => panic!("expected PartyMemberStats, got {}", other.name()),
+    }
+}
+
+/// `_FULL`'s leading byte (`0x6cf9d2`): any nonzero value marks an arena opponent; the plain
+/// opcode has no such byte.
+#[test]
+fn party_member_stats_full_keeps_the_arena_byte() {
+    let body = hx(concat!("02", "015c", "01000000", "0100"));
+    match parse_stats(opcode::SMSG_PARTY_MEMBER_STATS_FULL, &body) {
+        ServerPacket::PartyMemberStats { guid, info, .. } => {
+            assert_eq!(guid, 0x5C);
+            assert!(info.arena_opponent);
+            assert_eq!(info.status, Some(1));
+        }
+        other => panic!("expected PartyMemberStats, got {}", other.name()),
+    }
+    let body = hx(concat!("015c", "01000000", "0100"));
+    match parse_stats(opcode::SMSG_PARTY_MEMBER_STATS, &body) {
+        ServerPacket::PartyMemberStats { info, .. } => assert!(!info.arena_opponent),
         other => panic!("expected PartyMemberStats, got {}", other.name()),
     }
 }
@@ -764,26 +796,47 @@ fn minimap_ping_inbound_wire() {
     }
 }
 
-/// `MSG_RAID_TARGET_UPDATE` from the server (Group.cpp:132-147): mode 0 carries one icon, mode 1
-/// the full list, possibly empty.
+/// `MSG_RAID_TARGET_UPDATE` from the server (`0x5743b0`): mode 0 names the setter, then the
+/// changed pairs; mode 1 the full list, possibly empty, with no setter.
 #[test]
 fn raid_target_update_smsg_shapes() {
-    let mut body = vec![0u8, 3]; // mode 0 (delta), icon 3
+    let mut body = vec![0u8]; // mode 0 (delta)
+    body.extend_from_slice(&0x0700_0000_0000_0042u64.to_le_bytes()); // the setter (`0x574441`)
+    body.push(3);
     body.extend_from_slice(&0x99u64.to_le_bytes());
-    let p = messages::parse_server(opcode::MSG_RAID_TARGET_UPDATE, &body).unwrap();
+    let (p, tail) =
+        messages::parse_server_with_tail(opcode::MSG_RAID_TARGET_UPDATE, &body).unwrap();
+    assert_eq!(tail, 0, "every byte read");
     match &p {
-        ServerPacket::RaidTargetSet { icon, guid } => {
-            assert_eq!(*icon, 3);
-            assert_eq!(*guid, 0x99);
+        ServerPacket::RaidTargetSet { setter, marks } => {
+            assert_eq!(*setter, 0x0700_0000_0000_0042);
+            assert_eq!(marks, &vec![(3u8, 0x99u64)]);
         }
         other => panic!("expected RaidTargetSet, got {}", other.name()),
     }
     match decode(p).as_slice() {
         [SessionEvent::RaidTargetSet {
-            icon: 3,
-            guid: 0x99,
-        }] => {}
+            setter: 0x0700_0000_0000_0042,
+            marks,
+        }] => assert_eq!(marks, &vec![(3u8, 0x99u64)]),
         other => panic!("raid target set decode: {other:?}"),
+    }
+
+    // The pairs run to the end of the body; a clear is a zero target.
+    let mut body = vec![0u8];
+    body.extend_from_slice(&0x42u64.to_le_bytes());
+    for (icon, target) in [(7u8, 0x55u64), (3, 0)] {
+        body.push(icon);
+        body.extend_from_slice(&target.to_le_bytes());
+    }
+    match messages::parse_server(opcode::MSG_RAID_TARGET_UPDATE, &body).unwrap() {
+        ServerPacket::RaidTargetSet {
+            setter: 0x42,
+            marks,
+        } => {
+            assert_eq!(marks, vec![(7, 0x55), (3, 0)]);
+        }
+        other => panic!("expected RaidTargetSet, got {}", other.name()),
     }
 
     let mut body = vec![1u8]; // mode 1 (full list), 2 entries
@@ -810,33 +863,90 @@ fn raid_target_update_smsg_shapes() {
     }
 }
 
-/// `MSG_RAID_READY_CHECK` from the server: empty when a check starts (Group.cpp:94-96), a full
-/// guid and state for a member's answer (126-130).
+/// The ready check's three server packets: the start names its initiator (`0x574d50`), an answer
+/// is a guid and a ready byte that may be absent (`0x5744f0`), the close is empty (`0x572560`).
 #[test]
 fn ready_check_smsg_shapes() {
-    let p = messages::parse_server(opcode::MSG_RAID_READY_CHECK, &[]).unwrap();
-    assert!(matches!(p, ServerPacket::ReadyCheckRequest));
+    let p = messages::parse_server(opcode::MSG_RAID_READY_CHECK, &0x88u64.to_le_bytes()).unwrap();
+    assert!(matches!(
+        p,
+        ServerPacket::ReadyCheckStarted { initiator: 0x88 }
+    ));
     assert!(matches!(
         decode(p).as_slice(),
-        [SessionEvent::ReadyCheckRequest]
+        [SessionEvent::ReadyCheckStarted { initiator: 0x88 }]
     ));
 
-    let mut body = 0x88u64.to_le_bytes().to_vec();
+    let mut body = 0x99u64.to_le_bytes().to_vec();
     body.push(1);
-    let p = messages::parse_server(opcode::MSG_RAID_READY_CHECK, &body).unwrap();
-    match &p {
-        ServerPacket::ReadyCheckAnswer { guid, ready } => {
-            assert_eq!(*guid, 0x88);
-            assert_eq!(*ready, 1);
-        }
-        other => panic!("expected ReadyCheckAnswer, got {}", other.name()),
-    }
-    match decode(p).as_slice() {
-        [SessionEvent::ReadyCheckAnswer {
-            guid: 0x88,
-            ready: 1,
-        }] => {}
-        other => panic!("ready check answer decode: {other:?}"),
+    let p = messages::parse_server(opcode::MSG_RAID_READY_CHECK_CONFIRM, &body).unwrap();
+    assert!(matches!(
+        decode(p).as_slice(),
+        [SessionEvent::ReadyCheckConfirm {
+            guid: 0x99,
+            ready: true
+        }]
+    ));
+    let p = messages::parse_server(opcode::MSG_RAID_READY_CHECK_CONFIRM, &body[..8]).unwrap();
+    assert!(
+        matches!(
+            p,
+            ServerPacket::ReadyCheckConfirm {
+                guid: 0x99,
+                ready: false
+            }
+        ),
+        "no byte reads as not ready"
+    );
+
+    let p = messages::parse_server(opcode::MSG_RAID_READY_CHECK_FINISHED, &[]).unwrap();
+    assert!(matches!(
+        decode(p).as_slice(),
+        [SessionEvent::ReadyCheckFinished]
+    ));
+}
+
+/// The bodiless notices and the two squelch reads (`0x6cbe80`, `0x5725a0`, `0x5725c0`, `0x572610`),
+/// the invite withdrawal's name (`0x6cbd10`) and the summon withdrawal (`0x6cbcf0`).
+#[test]
+fn group_notice_smsg_shapes() {
+    let read = |op: u16, body: &[u8]| {
+        let (p, tail) = messages::parse_server_with_tail(op, body).unwrap();
+        assert_eq!(tail, 0, "{op:#x} reads every byte");
+        decode(p)
+    };
+    assert!(matches!(
+        read(opcode::SMSG_GROUPACTION_THROTTLED, &[]).as_slice(),
+        [SessionEvent::GroupActionThrottled]
+    ));
+    assert!(matches!(
+        read(opcode::SMSG_RAID_READY_CHECK_ERROR, &[]).as_slice(),
+        [SessionEvent::ReadyCheckError]
+    ));
+    assert!(matches!(
+        read(opcode::SMSG_SUMMON_CANCEL, &[]).as_slice(),
+        [SessionEvent::SummonCancel]
+    ));
+    assert!(matches!(
+        read(opcode::MSG_NOTIFY_PARTY_SQUELCH, &2u32.to_le_bytes()).as_slice(),
+        [SessionEvent::PartySquelch { silenced: true }]
+    ));
+    assert!(matches!(
+        read(opcode::MSG_NOTIFY_PARTY_SQUELCH, &0u32.to_le_bytes()).as_slice(),
+        [SessionEvent::PartySquelch { silenced: false }]
+    ));
+    let mut body = 0x77u64.to_le_bytes().to_vec();
+    body.extend_from_slice(&1u32.to_le_bytes());
+    assert!(matches!(
+        read(opcode::SMSG_ECHO_PARTY_SQUELCH, &body).as_slice(),
+        [SessionEvent::EchoPartySquelch {
+            guid: 0x77,
+            silenced: true
+        }]
+    ));
+    match read(opcode::SMSG_GROUP_CANCEL, b"Bob\0").as_slice() {
+        [SessionEvent::GroupCancel { inviter }] => assert_eq!(inviter, "Bob"),
+        other => panic!("group cancel decode: {other:?}"),
     }
 }
 

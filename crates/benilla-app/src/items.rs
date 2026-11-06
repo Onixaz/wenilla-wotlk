@@ -311,6 +311,7 @@ fn enchant_lines_quiet(
                 negative: id < 0,
                 charges,
                 remaining_ms,
+                use_spell: enchants.0.use_spell(id.unsigned_abs()),
                 prismatic_sockets: enchants.0.prismatic_sockets(id.unsigned_abs()),
                 condition: enchants.0.condition(id.unsigned_abs()).map(condition_view),
                 gem_item: enchants.0.gem_item(id.unsigned_abs()).unwrap_or(0),
@@ -737,6 +738,7 @@ pub(crate) fn test_template(name: &str) -> ItemInfo {
         gem_properties: 0,
         flags2: 0,
         required_disenchant_skill: -1,
+        item_limit_category: 0,
     }
 }
 

@@ -243,6 +243,7 @@ impl World {
                 guid,
                 position,
                 orientation,
+                ..
             } => {
                 if let Some(t) = self.tracked.get_mut(guid) {
                     t.position = *position;
@@ -267,6 +268,15 @@ impl World {
                     "server game-time {hours:02}:{minutes:02}  (timescale {timescale} game-min/sec)"
                 );
             }
+            SessionEvent::GameTimeSet(c) => {
+                println!("server game-time set {:02}:{:02}", c.hours, c.minutes);
+            }
+            SessionEvent::GameTimeSync(c) => {
+                println!("server game-time sync {:02}:{:02}", c.hours, c.minutes);
+            }
+            SessionEvent::GameSpeed { timescale } => {
+                println!("server game speed {timescale} game-min/sec");
+            }
             SessionEvent::PlayerName { guid, name, .. } => {
                 println!("SMSG_NAME_QUERY_RESPONSE: guid {guid} → '{name}'");
                 self.player_name_answer = Some(name.clone());
@@ -283,7 +293,7 @@ impl World {
                 );
                 self.spell_book = Some(spell_ids.clone());
             }
-            SessionEvent::ActionButtons { buttons } => {
+            SessionEvent::ActionButtons { buttons, .. } => {
                 println!("SMSG_ACTION_BUTTONS: {} occupied slot(s)", buttons.len());
                 for b in buttons.iter().take(12) {
                     println!(
@@ -411,7 +421,9 @@ impl World {
             SessionEvent::AttackStart { attacker, victim } => {
                 println!("SMSG_ATTACKSTART: {attacker:#x} → {victim:#x}");
             }
-            SessionEvent::AttackStop { attacker, victim } => {
+            SessionEvent::AttackStop {
+                attacker, victim, ..
+            } => {
                 println!("SMSG_ATTACKSTOP: {attacker:#x} → {victim:#x}");
             }
             SessionEvent::AttackerState(s) => {

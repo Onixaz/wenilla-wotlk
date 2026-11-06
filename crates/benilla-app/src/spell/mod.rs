@@ -17,6 +17,7 @@ mod cast_send;
 pub(crate) mod cast_target;
 pub(crate) mod combo;
 pub(crate) mod cooldowns;
+mod dest_loc;
 pub(crate) mod group_relation;
 mod inflight;
 pub(crate) mod learn_place;
@@ -155,13 +156,22 @@ impl Plugin for SpellPlugin {
             .init_resource::<multicast::MultiCastLists>()
             .add_systems(
                 Update,
-                multicast::run_refill.after(WorldStage::Net).before(UiFeed),
+                (
+                    // The player's init puts the stored table on before the totem refill reads
+                    // the bar.
+                    net::put_action_table_on_init,
+                    multicast::run_refill,
+                )
+                    .chain()
+                    .after(WorldStage::Net)
+                    .before(UiFeed),
             )
             .add_systems(
                 Startup,
                 load_summon_slots.after(benilla_assets::AssetSet::Open),
             );
         net::register(app);
+        dest_loc::register(app);
         combo::register(app);
     }
 }

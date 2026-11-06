@@ -39,27 +39,6 @@ const LEVEL_UP_EFFECT: &str = "HARDCODED Unit Level Up";
 
 /// The mount cloud, hardcoded index 6: row 1185, the druid-morph puff.
 const MOUNT_POOF_EFFECT: &str = "HARDCODED Mount Poof";
-/// The meeting-stone join, hardcoded index 0xc, spawned on the local player by the `SMSG 0x295`
-/// status-1 arm.
-const MEETING_STONE_JOIN_EFFECT: &str = "HARDCODED Meeting Stone Join";
-
-/// The meeting-stone join visual on `entity`: a one-shot at `0x13`.
-pub(crate) fn meeting_stone_join_fx(visuals: &SpellVisuals, entity: Entity) -> Option<SpellKitFx> {
-    let (effect, path) = visuals.0.hardcoded_effect(MEETING_STONE_JOIN_EFFECT)?;
-    Some(SpellKitFx::Begin {
-        entity,
-        spell_id: 0,
-        persistent: false,
-        class: FxClass::Hold,
-        stage: FxStage::OneShot,
-        effects: vec![FxSlot {
-            tag: HARDCODED_FX_ATTACH,
-            effect,
-            path: path.to_string(),
-            scale: 1.0,
-        }],
-    })
-}
 
 /// `SpellVisual.dbc` × `SpellVisualKit.dbc`; absent without client data.
 #[derive(Resource)]
@@ -549,22 +528,83 @@ fn play_kit_at(
     }
 }
 
-/// `SpellVisual` column 24 at a GO's dest point, deferred to when a missile of the spell's speed
-/// would land there: the reference queues it on the caster stamped `now + distance / speed`
-/// (`0x80efb6`, `0x80e7f3`).
+/// `SpellVisual` column 24 at a dest point, deferred: for a GO, to when a missile of the spell's
+/// speed would land there, the reference queueing it on the caster stamped
+/// `now + distance / speed` (`0x80efb6`, `0x80e7f3`); for a dest-location notify, by its delay.
 #[derive(Message, Clone, Copy, Debug, PartialEq)]
 pub(crate) struct DelayedAreaKit {
-    pub(crate) caster: Entity,
     pub(crate) kit_id: u32,
     pub(crate) pos: Vec3,
-    /// `Spell.dbc` Speed, yards per second, above 0.
-    pub(crate) speed: f32,
+    pub(crate) wait: AreaKitWait,
 }
 
-/// How long a [`DelayedAreaKit`] waits: the caster-to-point distance over the speed, at once
-/// with no caster position.
-fn area_kit_delay(caster: Option<Vec3>, pos: Vec3, speed: f32) -> f32 {
-    caster.map_or(0.0, |c| c.distance(pos) / speed)
+/// How long a [`DelayedAreaKit`] waits.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum AreaKitWait {
+    /// The flight from the caster at `Spell.dbc` Speed, yards per second, above 0: at once with no
+    /// caster position.
+    Flight { caster: Entity, speed: f32 },
+    /// The flight from a fixed point at Speed.
+    FlightFrom { from: Vec3, speed: f32 },
+    /// A fixed wait, in seconds.
+    Secs(f32),
+}
+
+/// How long a [`DelayedAreaKit`] waits: the source-to-point distance over the speed, at once
+/// with no source.
+fn area_kit_delay(from: Option<Vec3>, pos: Vec3, speed: f32) -> f32 {
+    from.map_or(0.0, |c| c.distance(pos) / speed)
+}
+
+/// `SMSG_NOTIFY_DEST_LOC_SPELL_CAST`'s visuals (`0x8022d0`), no caster needed: the instant-area kit
+/// (column 23) at the dest position at once, then the impact-area kit (column 24) when a missile
+/// of the spell's speed from the source lands, or after the packet's delay with no missile
+/// (`0x802700`).
+///
+/// Deviation: the missile itself is not drawn (`0x8024ef`), as benilla's missiles fly from a unit;
+/// its landing kit keeps the flight time.
+pub(super) fn play_dest_loc_casts(
+    mut casts: MessageReader<super::DestLocCast>,
+    spells: Option<Res<crate::ui_action::Spells>>,
+    visuals: Option<Res<SpellVisuals>>,
+    mut sounds: MessageWriter<SpellKitSound>,
+    mut shakes: MessageWriter<SpellKitShake>,
+    mut bursts: MessageWriter<crate::entities::dest_fx::GroundBurst>,
+    mut delayed: MessageWriter<DelayedAreaKit>,
+) {
+    let (Some(spells), Some(visuals)) = (spells.as_deref(), visuals.as_deref()) else {
+        casts.clear();
+        return;
+    };
+    for c in casts.read() {
+        let Some(stages) = resolve_stages(spells, &visuals.0, c.spell_id, || None) else {
+            continue;
+        };
+        if let Some(kit) = visuals.0.kit(stages.instant_area_kit) {
+            play_kit_at(
+                kit,
+                c.dest,
+                &visuals.0,
+                &mut sounds,
+                &mut shakes,
+                &mut bursts,
+            );
+        }
+        if visuals.0.kit(stages.impact_area_kit).is_none() {
+            continue;
+        }
+        let speed = spells.catalog.get(c.spell_id).map_or(0.0, |d| d.speed);
+        let missile = stages.missile_gate != 0 && stages.missile_model != 0 && speed > 0.0;
+        delayed.write(DelayedAreaKit {
+            kit_id: stages.impact_area_kit,
+            pos: c.dest,
+            wait: if missile {
+                AreaKitWait::FlightFrom { from: c.src, speed }
+            } else {
+                AreaKitWait::Secs(c.delay_ms as f32 / 1000.0)
+            },
+        });
+    }
 }
 
 /// Queue each [`DelayedAreaKit`] and play the due ones at their point ([`play_kit_at`]).
@@ -580,8 +620,15 @@ pub(super) fn play_delayed_area_kits(
 ) {
     let now = time.elapsed_secs();
     for q in queued.read() {
-        let from = casters.get(q.caster).ok().map(|g| g.translation());
-        pending.push((now + area_kit_delay(from, q.pos, q.speed), q.kit_id, q.pos));
+        let wait = match q.wait {
+            AreaKitWait::Flight { caster, speed } => {
+                let from = casters.get(caster).ok().map(|g| g.translation());
+                area_kit_delay(from, q.pos, speed)
+            }
+            AreaKitWait::FlightFrom { from, speed } => area_kit_delay(Some(from), q.pos, speed),
+            AreaKitWait::Secs(secs) => secs,
+        };
+        pending.push((now + wait, q.kit_id, q.pos));
     }
     if pending.is_empty() {
         return;
@@ -942,10 +989,12 @@ pub(super) fn route_cast_visuals(
                 if let Some(kit) = visuals.0.kit(s.impact_area_kit) {
                     if display.speed > 0.0 {
                         delayed.write(DelayedAreaKit {
-                            caster: go.caster,
                             kit_id: s.impact_area_kit,
                             pos: dest,
-                            speed: display.speed,
+                            wait: AreaKitWait::Flight {
+                                caster: go.caster,
+                                speed: display.speed,
+                            },
                         });
                     } else {
                         play_kit_at(kit, dest, &visuals.0, out.sounds, out.shakes, bursts);
@@ -1578,10 +1627,22 @@ pub(super) fn earn_effect_plays(
             .is_some_and(|a| a.flags & 0x4 == 0)
 }
 
+/// `SMSG_TITLE_EARNED`'s earn effect, hardcoded index 9 (`0x50c681`, name at `0xa329dc`).
+const TITLE_EFFECT: &str = "HARDCODED Reputation";
+
 /// The earn effect on `entity` (`0x5b30d5`-`0x5b311e`): a one-shot at `0x13` (`[0xa32b20]`),
 /// replacing an earlier one through the same-slot replace (`0x6f8a60`).
 pub(crate) fn achievement_earn_fx(visuals: &SpellVisuals, entity: Entity) -> Option<SpellKitFx> {
-    let (effect, path) = visuals.0.hardcoded_effect(ACHIEVEMENT_EFFECT)?;
+    hardcoded_one_shot(visuals, entity, ACHIEVEMENT_EFFECT)
+}
+
+/// The earned title's effect on our player, the same one-shot (`0x50c643`-`0x50c690`).
+pub(crate) fn title_earn_fx(visuals: &SpellVisuals, entity: Entity) -> Option<SpellKitFx> {
+    hardcoded_one_shot(visuals, entity, TITLE_EFFECT)
+}
+
+fn hardcoded_one_shot(visuals: &SpellVisuals, entity: Entity, name: &str) -> Option<SpellKitFx> {
+    let (effect, path) = visuals.0.hardcoded_effect(name)?;
     Some(SpellKitFx::Begin {
         entity,
         spell_id: 0,

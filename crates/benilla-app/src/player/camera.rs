@@ -12,6 +12,7 @@ use super::camera_dynamics::{DynamicsInput, HeadBob, SmartPivot, TerrainTilt};
 use super::camera_zoom::{ZoomLimit, CAM_DISTANCE_MAX_RANGE};
 use crate::creature_anim::wrap_pi;
 use crate::net::Embodied;
+use crate::target::WorldDropClick;
 use benilla_assets::materials::WowModelMaterial;
 use benilla_world::interact::{WorldClick, WorldRightClick, WorldRightPress};
 use benilla_world::model_fade::{
@@ -38,6 +39,8 @@ pub(super) struct PressGesture {
     /// Accumulated |Δyaw| and |Δpitch| this press has asked the camera for, radians.
     yaw_travel: f32,
     pitch_travel: f32,
+    /// The UI claimed the press for a payload drop: the click settles as a [`WorldDropClick`].
+    drop: bool,
 }
 
 impl PressGesture {
@@ -46,6 +49,7 @@ impl PressGesture {
             at: now,
             yaw_travel: 0.0,
             pitch_travel: 0.0,
+            drop: false,
         }
     }
 
@@ -264,6 +268,10 @@ pub(super) mod follow_cmd {
     pub(in crate::player) const AUTORUN: u32 = 0x1000;
     /// The union of bits 20, 21 and 23, which the reference folds into the camera's `Track` flag.
     pub(in crate::player) const TRACK: u32 = 0x100000;
+    /// The auto-move's turn and pitch bits: `Track` to the camera, but outside the head bob's mask.
+    pub(in crate::player) const TRACK_TURN: u32 = 0x0100_0000;
+    /// A `/follow` with `autoInteract` off: its `Track` reads as `Move` (`0x602760`); no input bit.
+    pub(in crate::player) const TRACK_AS_MOVE: u32 = 0x4000_0000;
     /// External control, the reference's `[cam+0x90] & 0x1000`: not an input-control bit, carried
     /// so one word holds every edge that arms.
     pub(in crate::player) const FEAR: u32 = 0x2000_0000;
@@ -309,6 +317,7 @@ impl FollowInput {
     fn state(&self, stopping: bool) -> FollowState {
         let mf = self.command;
         let held = |bits: u32| mf & bits != 0;
+        let tracked = held(follow_cmd::TRACK | follow_cmd::TRACK_TURN);
         if held(follow_cmd::FEAR) {
             FollowState::Fear
         } else if held(follow_cmd::TURN_BITS) || held(follow_cmd::RIGHT_MOUSE) {
@@ -319,9 +328,10 @@ impl FollowInput {
             FollowState::Strafe
         } else if held(follow_cmd::MOVE_BITS)
             || (held(follow_cmd::RIGHT_MOUSE) && held(follow_cmd::LEFT_MOUSE))
+            || (tracked && held(follow_cmd::TRACK_AS_MOVE))
         {
             FollowState::Move
-        } else if held(follow_cmd::TRACK) {
+        } else if tracked {
             FollowState::Track
         } else if stopping {
             FollowState::Stop
@@ -332,7 +342,9 @@ impl FollowInput {
 
     /// The tracking style whenever the word holds `Track` or `Fear`, even if another state wins.
     fn style(&self) -> FollowStyle {
-        if self.command & (follow_cmd::TRACK | follow_cmd::FEAR) != 0 {
+        let tracked = self.command & (follow_cmd::TRACK | follow_cmd::TRACK_TURN) != 0
+            && self.command & follow_cmd::TRACK_AS_MOVE == 0;
+        if tracked || self.command & follow_cmd::FEAR != 0 {
             self.cfg.tracking_style
         } else {
             self.cfg.style
@@ -829,6 +841,7 @@ impl FlyCam {
 /// vertex box's Z extent; `0.0` for a display with no bounds. Stamped on every modeled unit at
 /// attach; [`model_pivot_height`] makes it the world pivot.
 #[derive(Component, Clone, Copy)]
+#[component(storage = "SparseSet")]
 pub(crate) struct CameraPivot {
     pub height_local: f32,
     /// How far that height drops while swimming, model-local before scale
@@ -851,9 +864,10 @@ pub(super) fn run_look_session(
     window: &mut Window,
     cursor_opts: &mut CursorOptions,
     inspect_enabled: bool,
-    // A left press the UI consumed as a cursor-payload world drop, which must not also select.
+    // A left press the UI claimed for a cursor-payload world drop, which must not also select.
     click_consumed: bool,
     world_click: &mut MessageWriter<WorldClick>,
+    world_drop_click: &mut MessageWriter<WorldDropClick>,
     world_right_click: &mut MessageWriter<WorldRightClick>,
     left_click: &mut Option<PressGesture>,
     right_click: &mut Option<PressGesture>,
@@ -904,6 +918,9 @@ pub(super) fn run_look_session(
             if let Some(test) = test {
                 if test.is_click(now) {
                     match active {
+                        LookButton::Left if test.drop => {
+                            world_drop_click.write(WorldDropClick);
+                        }
                         LookButton::Left => {
                             world_click.write(WorldClick);
                         }
@@ -940,10 +957,12 @@ pub(super) fn run_look_session(
             // Left-drag orbits, engaged on the press like right; the select settles at the release.
             // While the inspector is armed, left belongs to it.
             engage_look(rig, LookButton::Left, focused, window, cursor_opts);
-            // A cursor-payload world drop still orbits but must not also select.
+            // A cursor-payload world drop still orbits, and takes the same click test.
             *right_click = None;
-            *left_click = (!click_consumed && !rig.world_mouse.turn() && !disarmed)
-                .then(|| PressGesture::new(now));
+            *left_click = (!rig.world_mouse.turn() && !disarmed).then(|| PressGesture {
+                drop: click_consumed,
+                ..PressGesture::new(now)
+            });
         }
     }
 
@@ -1506,7 +1525,9 @@ fn apply_self_fade_to_descendants(
 
 /// True if the OS pointer is over the world camera's viewport (the whole window when it has none).
 fn cursor_in_viewport(window: &Window, camera: &Camera) -> bool {
-    let Some(cursor) = window.physical_cursor_position() else {
+    // The headless hover probe's aim stands in for a missing cursor, as in the UI's mouse feed.
+    let probe = || crate::target::hover_probe_point().map(|p| p * window.scale_factor());
+    let Some(cursor) = window.physical_cursor_position().or_else(probe) else {
         return false;
     };
     match &camera.viewport {
@@ -1708,6 +1729,7 @@ mod tests {
     /// A press that has travelled `yaw`/`pitch` degrees of camera rotation.
     fn press(yaw_deg: f32, pitch_deg: f32) -> PressGesture {
         PressGesture {
+            drop: false,
             at: 0.0,
             yaw_travel: yaw_deg.to_radians(),
             pitch_travel: pitch_deg.to_radians(),
@@ -2154,6 +2176,16 @@ mod tests {
         assert_eq!(state(follow_cmd::LEFT_MOUSE, false), FollowState::Idle);
         assert_eq!(state(follow_cmd::AUTORUN, false), FollowState::Move);
         assert_eq!(state(follow_cmd::TRACK, false), FollowState::Track);
+        assert_eq!(state(follow_cmd::TRACK_TURN, false), FollowState::Track);
+        assert_eq!(
+            state(follow_cmd::TRACK | follow_cmd::TRACK_AS_MOVE, false),
+            FollowState::Move,
+        );
+        assert_eq!(
+            state(follow_cmd::TRACK_TURN | follow_cmd::TRACK_AS_MOVE, false),
+            FollowState::Move,
+        );
+        assert_eq!(state(follow_cmd::TRACK_AS_MOVE, false), FollowState::Idle);
         assert_eq!(
             state(follow_cmd::TRACK | follow_cmd::FORWARD, false),
             FollowState::Move,

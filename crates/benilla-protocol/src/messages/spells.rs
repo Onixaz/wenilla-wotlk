@@ -5,8 +5,8 @@
 use std::io::{self, Read};
 
 use crate::wire::{
-    capacity_hint, read_cstring, read_i32_le, read_packed_guid, read_u32_le, read_u64_le, read_u8,
-    Vector3d,
+    capacity_hint, read_cstring, read_f32_le, read_i32_le, read_packed_guid, read_u32_le,
+    read_u64_le, read_u8, Vector3d,
 };
 
 /// The verdict on our cast. 12340's `SMSG_CAST_FAILED` (0x130, the opcode benilla names
@@ -271,11 +271,13 @@ pub(super) fn read_cast_result(r: &mut &[u8]) -> io::Result<(u8, u32, CastOutcom
 // The `SpellCastTargets` mask bits, a `u32` on 12340.
 pub(super) const TARGET_FLAG_UNIT: u32 = 0x0002;
 pub(super) const TARGET_FLAG_ITEM: u32 = 0x0010;
+/// The not-traded trade slot, 0-based, as a trade item target names it.
+pub(super) const TRADE_ENCHANT_SLOT: u64 = 6;
 pub(super) const TARGET_FLAG_SOURCE_LOCATION: u32 = 0x0020;
 pub(super) const TARGET_FLAG_DEST_LOCATION: u32 = 0x0040;
 const TARGET_FLAG_CORPSE_ENEMY: u32 = 0x0200;
 pub(super) const TARGET_FLAG_GAMEOBJECT: u32 = 0x0800;
-const TARGET_FLAG_TRADE_ITEM: u32 = 0x1000;
+pub(super) const TARGET_FLAG_TRADE_ITEM: u32 = 0x1000;
 const TARGET_FLAG_STRING: u32 = 0x2000;
 const TARGET_FLAG_CORPSE_ALLY: u32 = 0x8000;
 const TARGET_FLAG_UNIT_MINIPET: u32 = 0x1_0000;
@@ -470,6 +472,58 @@ pub struct SpellGo {
     /// The `CAST_FLAG_ADJUST_MISSILE` pair, `(elevation, delay ms)`: a trajectory missile's launch
     /// pitch and its flight time, as the GO handler (`0x80e1b0`) reads them.
     pub trajectory: Option<(f32, u32)>,
+    /// A dest-targeted GO's cast counter (`0x80e42a`), 0 for none; a nonzero one is recorded
+    /// against the caster so its [`DestLocSpellCast`] does not play again.
+    pub dest_counter: u8,
+}
+
+/// `SMSG_NOTIFY_DEST_LOC_SPELL_CAST` (`0x810050`): a dest-location cast whose caster this client
+/// may not see, read as one `0x40`-byte block (`0x810074`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DestLocSpellCast {
+    pub caster: u64,
+    pub dest_target: u64,
+    pub spell_id: u32,
+    /// The source location, raw WoW coordinates.
+    pub src: [f32; 3],
+    /// The dest position the visuals play at, raw WoW coordinates.
+    pub dest: [f32; 3],
+    pub elevation: f32,
+    pub speed: f32,
+    /// Milliseconds before the impact-area kit (`0x802700`).
+    pub delay_ms: u32,
+    /// The caster's cast counter, matched against the last one seen (`0x8100a1`).
+    pub counter: u8,
+}
+
+/// Read `SMSG_NOTIFY_DEST_LOC_SPELL_CAST`: the fields fill the block's first `0x39` bytes and the
+/// rest is padding, left unread.
+pub(super) fn read_dest_loc_spell_cast(r: &mut &[u8]) -> io::Result<DestLocSpellCast> {
+    let point = |r: &mut &[u8]| -> io::Result<[f32; 3]> {
+        Ok([read_f32_le(r)?, read_f32_le(r)?, read_f32_le(r)?])
+    };
+    let caster = read_u64_le(r)?;
+    let dest_target = read_u64_le(r)?;
+    let spell_id = read_u32_le(r)?;
+    let src = point(r)?;
+    let dest = point(r)?;
+    let elevation = read_f32_le(r)?;
+    let speed = read_f32_le(r)?;
+    let delay_ms = read_u32_le(r)?;
+    let counter = read_u8(r)?;
+    let pad = r.len().min(7);
+    *r = &r[pad..];
+    Ok(DestLocSpellCast {
+        caster,
+        dest_target,
+        spell_id,
+        src,
+        dest,
+        elevation,
+        speed,
+        delay_ms,
+        counter,
+    })
 }
 
 /// Read `SMSG_SPELL_GO`: the shared head, `u32` timestamp, the hit and miss lists, the targets,
@@ -524,9 +578,11 @@ pub(super) fn read_spell_go(r: &mut impl Read) -> io::Result<SpellGo> {
         let _ = read_u32_le(r)?;
         let _ = read_u32_le(r)?;
     }
-    if targets.mask & TARGET_FLAG_DEST_LOCATION != 0 {
-        let _dest_byte = read_u8(r)?;
-    }
+    let dest_counter = if targets.mask & TARGET_FLAG_DEST_LOCATION != 0 {
+        read_u8(r)?
+    } else {
+        0
+    };
     if targets.mask & TARGET_FLAG_EXTRA_TARGETS != 0 {
         // `u32` count of a point and a raw guid each; unbounded, so nothing is pre-allocated.
         for _ in 0..read_u32_le(r)? {
@@ -547,6 +603,7 @@ pub(super) fn read_spell_go(r: &mut impl Read) -> io::Result<SpellGo> {
         ammo_display_id,
         runes,
         trajectory,
+        dest_counter,
     })
 }
 
@@ -574,6 +631,30 @@ pub(super) fn read_channel_start(r: &mut impl Read) -> io::Result<(u64, u32, u32
     let spell_id = read_u32_le(r)?;
     let duration_ms = read_u32_le(r)?;
     Ok((caster, spell_id, duration_ms))
+}
+
+/// `SMSG_RESUME_CAST_BAR` (`0x8020c0`): a cast or channel already running on a unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResumeCastBar {
+    pub caster: u64,
+    pub target: u64,
+    pub spell_id: u32,
+    /// Ms until the cast ends.
+    pub remaining_ms: u32,
+    /// The cast's whole length in ms; its start is `total_ms` before the end (`0x802114`).
+    pub total_ms: u32,
+}
+
+/// Read `SMSG_RESUME_CAST_BAR` (`0x8020d3`-`0x802101`): packed caster, packed target, `u32 spell`,
+/// `u32` ms left, `u32` total ms.
+pub(super) fn read_resume_cast_bar(r: &mut impl Read) -> io::Result<ResumeCastBar> {
+    Ok(ResumeCastBar {
+        caster: read_packed_guid(r)?,
+        target: read_packed_guid(r)?,
+        spell_id: read_u32_le(r)?,
+        remaining_ms: read_u32_le(r)?,
+        total_ms: read_u32_le(r)?,
+    })
 }
 
 /// Read `MSG_CHANNEL_UPDATE` (`0x801db0`): packed caster, ms left; 0 ends the channel, whether it
@@ -706,6 +787,17 @@ pub fn cast_spell_corpse(
     corpse_guid: u64,
 ) -> Vec<u8> {
     cast_at_guid(cast_count, spell_id, target.target_flag(), corpse_guid)
+}
+
+/// Body of `CMSG_CAST_SPELL` at the trade window's not-traded slot: `TARGET_FLAG_TRADE_ITEM` and
+/// the slot index in the item target's place (`0x80c5f0`).
+pub fn cast_spell_trade_item(cast_count: u8, spell_id: u32) -> Vec<u8> {
+    cast_at_guid(
+        cast_count,
+        spell_id,
+        TARGET_FLAG_TRADE_ITEM,
+        TRADE_ENCHANT_SLOT,
+    )
 }
 
 /// Body of `CMSG_CAST_SPELL` at an item, such as an enchant or poison: `TARGET_FLAG_ITEM` and the

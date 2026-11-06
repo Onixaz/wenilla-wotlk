@@ -18,7 +18,8 @@ use benilla_ui::script::{
     EncounterView, LfgBootView, LfgCatalogView, LfgCompletionRewardView, LfgDungeonRewardView,
     LfgDungeonView, LfgExpansionView, LfgGroupView, LfgLine, LfgMemberLocksView, LfgName,
     LfgPartyView, LfgProposalMemberView, LfgProposalView, LfgQueueStatusView, LfgRewardItemView,
-    LfgRoleCheckMemberView, LfgRoleCheckView, LfgUpdateView, MapDifficultyView, UiScript,
+    LfgRoleCheckMemberView, LfgRoleCheckView, LfgUpdateView, LfrGroupView, LfrListView,
+    LfrPlayerView, LfrStatsView, MapDifficultyView, UiScript,
 };
 
 use crate::char_select::ClientState;
@@ -38,10 +39,15 @@ pub(crate) struct LfgCatalog(pub(crate) Arc<LfgCatalogView>);
 
 /// What waits for the VM, in wire order.
 enum Pending {
-    Packet { packet: LfgPacket, grouped: bool },
+    Packet {
+        packet: LfgPacket,
+        grouped: bool,
+    },
     JoiningParty,
     ClearPartyInfo,
     EnterWorld,
+    /// `VOTE_KICK_REASON_NEEDED` with the member's name (`0x6cc274`).
+    VoteKickReasonNeeded(String),
 }
 
 /// The feed's session state: the waiting work and the group and instance facts the packets read.
@@ -51,6 +57,13 @@ pub(crate) struct LfgFeed {
     party: LfgPartyView,
     /// `[0xbd0894]` and the dynamic difficulty, from `SMSG_INSTANCE_DIFFICULTY`.
     difficulty: (u32, u32),
+}
+
+impl LfgFeed {
+    /// `[0xbd1980]` written by `SMSG_CHANGEPLAYER_DIFFICULTY_RESULT` 0 (`0x52c49a`).
+    pub(crate) fn set_dynamic_difficulty(&mut self, dynamic: u32) {
+        self.difficulty.1 = dynamic;
+    }
 }
 
 pub(crate) struct UiLfgPlugin;
@@ -81,6 +94,7 @@ impl Plugin for UiLfgPlugin {
             .net_handler(K::GroupUninvited, on_group_left)
             .net_handler(K::GroupDestroyed, on_group_left)
             .net_handler(K::PartyCommandResult, on_group_left)
+            .net_handler(K::PartyCommandResult, on_vote_kick_reason)
             .net_handler(K::InstanceDifficulty, on_instance_difficulty);
     }
 }
@@ -266,6 +280,15 @@ fn on_group_left(In(ev): In<SessionEvent>, mut feed: ResMut<LfgFeed>) {
     }
 }
 
+/// `SMSG_PARTY_COMMAND_RESULT` result 27: the kick vote asks us for a reason, naming the member.
+fn on_vote_kick_reason(In(ev): In<SessionEvent>, mut feed: ResMut<LfgFeed>) {
+    if let SessionEvent::PartyCommandResult { member, result, .. } = ev {
+        if result == benilla_protocol::messages::party_result::VOTE_KICK_REASON_NEEDED {
+            feed.pending.push(Pending::VoteKickReasonNeeded(member));
+        }
+    }
+}
+
 fn on_instance_difficulty(In(ev): In<SessionEvent>, mut feed: ResMut<LfgFeed>) {
     if let SessionEvent::InstanceDifficulty {
         difficulty,
@@ -319,6 +342,7 @@ fn feed_lfg(
     commands: Res<NetCommands>,
     mut errors: ResMut<UiErrorKeys>,
     mut sounds: ResMut<MessageSounds>,
+    areas: Option<Res<crate::area::AreaTableRes>>,
     mut memory: Local<VmMemo<FeedMemory>>,
 ) {
     let Some(mut script) = script else {
@@ -355,6 +379,13 @@ fn feed_lfg(
                 script.lfg_clear_party_info();
                 Vec::new()
             }
+            Pending::VoteKickReasonNeeded(name) => {
+                script.fire_event(
+                    "VOTE_KICK_REASON_NEEDED",
+                    vec![benilla_ui::script::ScriptValue::Str(name)],
+                );
+                Vec::new()
+            }
             Pending::Packet { packet, grouped } => {
                 apply(&mut script, packet, grouped, me, &name_of)
             }
@@ -374,9 +405,16 @@ fn feed_lfg(
             .into_iter()
             .filter_map(|guid| {
                 let name = names.resolve(guid, &commands)?.to_string();
-                let class_name = names
+                let class = names
                     .player_traits(guid)
-                    .and_then(|(_, class, _)| classes.as_ref()?.0.name(u32::from(class)))
+                    .map(|(_, class, _)| u32::from(class));
+                let table = classes.as_ref().map(|c| &c.0);
+                let class_name = class
+                    .and_then(|c| table?.name(c))
+                    .unwrap_or_default()
+                    .to_string();
+                let class_file = class
+                    .and_then(|c| table?.file(c))
                     .unwrap_or_default()
                     .to_string();
                 Some((
@@ -385,6 +423,7 @@ fn feed_lfg(
                         name,
                         class_name,
                         realm: String::new(),
+                        class_file,
                     },
                 ))
             })
@@ -392,6 +431,18 @@ fn feed_lfg(
         if pushed != memory.names {
             memory.names = pushed.clone();
             script.set_lfg_names(pushed);
+        }
+    }
+    if let Some(areas) = areas {
+        let wanted = script.lfr_wanted_areas();
+        if !wanted.is_empty() {
+            let named: HashMap<u32, String> = wanted
+                .into_iter()
+                .filter_map(|a| Some((a, areas.0.name(a)?.to_string())))
+                .collect();
+            if !named.is_empty() {
+                script.set_lfr_area_names(named);
+            }
         }
     }
     if let Some(displays) = displays {
@@ -418,8 +469,14 @@ fn apply(
     match packet {
         LfgPacket::UpdatePlayer(u) => script.lfg_update_player(update(u), grouped),
         LfgPacket::UpdateParty(u) => script.lfg_update_party(update(u), grouped),
-        // The raid browser's search list is not built; nothing is ever joined to end.
-        LfgPacket::UpdateSearch { .. } => Vec::new(),
+        LfgPacket::UpdateSearch { joined } => {
+            script.lfr_update_search(joined);
+            Vec::new()
+        }
+        LfgPacket::UpdateList(list) => {
+            script.lfr_list(lfr_list(*list));
+            Vec::new()
+        }
         LfgPacket::QueueStatus(s) => {
             script.lfg_queue_status(LfgQueueStatusView {
                 dungeon: s.dungeon,
@@ -539,6 +596,68 @@ fn apply(
             script.lfg_open_from_gossip(slot);
             Vec::new()
         }
+    }
+}
+
+/// `SMSG_UPDATE_LFG_LIST` as the engine takes it.
+fn lfr_list(l: benilla_protocol::messages::LfrList) -> LfrListView {
+    let stats = |s: benilla_protocol::messages::LfrStats| LfrStatsView {
+        level: s.level,
+        class: s.class,
+        race: s.race,
+        talents: s.talents,
+        armor: s.armor,
+        spell_damage: s.spell_damage,
+        spell_heal: s.spell_heal,
+        crit_melee: s.crit_melee,
+        crit_ranged: s.crit_ranged,
+        crit_spell: s.crit_spell,
+        mp5: s.mp5,
+        mp5_combat: s.mp5_combat,
+        attack_power: s.attack_power,
+        agility: s.agility,
+        max_health: s.max_health,
+        max_mana: s.max_mana,
+        unknown: s.unknown,
+        avg_item_level: s.avg_item_level,
+        defense: s.defense,
+        dodge: s.dodge,
+        block: s.block,
+        parry: s.parry,
+        haste: s.haste,
+        expertise: s.expertise,
+    };
+    LfrListView {
+        lfg_type: l.lfg_type,
+        dungeon: l.dungeon,
+        removed: l.removed,
+        total_groups: l.total_groups,
+        groups: l
+            .groups
+            .into_iter()
+            .map(|g| LfrGroupView {
+                guid: g.guid,
+                comment: g.comment,
+                roles: g.roles,
+                encounter_mask: g.instance.map(|(_, mask)| mask),
+            })
+            .collect(),
+        total_players: l.total_players,
+        players: l
+            .players
+            .into_iter()
+            .map(|p| LfrPlayerView {
+                guid: p.guid,
+                stats: p.stats.map(stats),
+                comment: p.comment,
+                leader: p.leader,
+                party: p.party,
+                roles: p.roles,
+                area: p.area,
+                status: p.status,
+                encounter_mask: p.instance.map(|(_, mask)| mask),
+            })
+            .collect(),
     }
 }
 

@@ -127,6 +127,8 @@ pub struct ItemInfo {
     pub flags2: u32,
     /// `RequiredDisenchantSkill`, -1 when the item cannot be disenchanted.
     pub required_disenchant_skill: i32,
+    /// The `ItemLimitCategory.dbc` row whose carry limit the item shares, 0 none (`ItemRec+0x1ec`).
+    pub item_limit_category: u32,
 }
 
 impl ItemInfo {
@@ -286,6 +288,18 @@ pub fn decode_item_query_response(mut body: &[u8]) -> io::Result<(u32, Option<It
     read_item_query_response_wotlk(&mut body)
 }
 
+/// One item-cache record with the bytes it was read from, which the item cache's file stores as
+/// a single response.
+pub(super) fn read_item_query_record(r: &mut &[u8]) -> io::Result<super::ItemQueryRecord> {
+    let start = *r;
+    let (entry, info) = read_item_query_response_wotlk(r)?;
+    Ok(super::ItemQueryRecord {
+        entry,
+        info: info.map(Box::new),
+        wire: start[..start.len() - r.len()].to_vec(),
+    })
+}
+
 pub(super) fn read_item_query_response_wotlk(r: &mut &[u8]) -> io::Result<(u32, Option<ItemInfo>)> {
     let entry = read_u32_le(r)?;
     if entry & 0x8000_0000 != 0 {
@@ -398,10 +412,10 @@ pub(super) fn read_item_query_response_wotlk(r: &mut &[u8]) -> io::Result<(u32, 
     let socket_bonus = read_u32_le(r)?;
     let gem_properties = read_u32_le(r)?;
     let required_disenchant_skill = read_i32_le(r)?;
-    // Armor modifier, duration, limit category, holiday.
-    for _ in 0..4 {
-        let _ = read_u32_le(r)?;
-    }
+    let _armor_damage_modifier = read_u32_le(r)?;
+    let _duration = read_u32_le(r)?;
+    let item_limit_category = read_u32_le(r)?;
+    let _holiday = read_u32_le(r)?;
 
     Ok((
         entry,
@@ -464,6 +478,7 @@ pub(super) fn read_item_query_response_wotlk(r: &mut &[u8]) -> io::Result<(u32, 
             gem_properties,
             flags2,
             required_disenchant_skill,
+            item_limit_category,
         }),
     ))
 }
@@ -514,6 +529,8 @@ pub enum UseItemTarget {
     Dest([f32; 3]),
     /// `TARGET_FLAG_ITEM` and a packed guid: a poison, oil or stone applied to a clicked item.
     Item(u64),
+    /// `TARGET_FLAG_TRADE_ITEM` and the not-traded slot in the guid's place.
+    TradeItem,
     /// `TARGET_FLAG_SOURCE_LOCATION` and three `f32` coords (the location binding); only items
     /// carrying spell 265, such as Martin Fury, use it. vmangos reads it before the dest.
     Source([f32; 3]),
@@ -558,7 +575,7 @@ pub(super) fn put_cast_targets(body: &mut Vec<u8>, target: UseItemTarget) {
     use super::spells::{
         put_cast_tail, put_target_guid, put_target_point, TARGET_FLAG_DEST_LOCATION,
         TARGET_FLAG_GAMEOBJECT, TARGET_FLAG_GLYPH_SLOT, TARGET_FLAG_ITEM,
-        TARGET_FLAG_SOURCE_LOCATION, TARGET_FLAG_UNIT,
+        TARGET_FLAG_SOURCE_LOCATION, TARGET_FLAG_TRADE_ITEM, TARGET_FLAG_UNIT, TRADE_ENCHANT_SLOT,
     };
     let (mask, guid) = match target {
         UseItemTarget::SelfImplicit => {
@@ -572,6 +589,7 @@ pub(super) fn put_cast_targets(body: &mut Vec<u8>, target: UseItemTarget) {
         UseItemTarget::Unit(guid) => (TARGET_FLAG_UNIT, guid),
         UseItemTarget::Object(guid) => (TARGET_FLAG_GAMEOBJECT, guid),
         UseItemTarget::Item(guid) => (TARGET_FLAG_ITEM, guid),
+        UseItemTarget::TradeItem => (TARGET_FLAG_TRADE_ITEM, TRADE_ENCHANT_SLOT),
         UseItemTarget::Corpse(corpse, guid) => (corpse.target_flag(), guid),
         UseItemTarget::Dest(dest) => {
             put_cast_tail(body, TARGET_FLAG_DEST_LOCATION);
@@ -646,26 +664,69 @@ pub fn set_ammo(entry: u32) -> Vec<u8> {
     entry.to_le_bytes().to_vec()
 }
 
-/// Read `SMSG_INVENTORY_CHANGE_FAILURE` into `(reason, required_level, item_guid, bag_slot)`: a
-/// `u8` reason and, unless it is 0, a `u32` level for reason 1 only, two item guids and a bag slot.
-/// That slot is the target bag's player-array slot, 255 for the player's own (`Player.cpp:8975`);
-/// the reference names that bag in reason 16's message.
-pub(super) fn read_inventory_change_failure(
-    r: &mut &[u8],
-) -> io::Result<(u8, Option<u32>, u64, u8)> {
+/// A refused inventory operation, `SMSG_INVENTORY_CHANGE_FAILURE` (`0x6e30ae`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InventoryFailure {
+    /// The `InventoryResult`; 0 ends the handler with nothing else read.
+    pub reason: u8,
+    /// The item the refusal unlocks, its spell cancelled (`0x6e3249`); 0 for none.
+    pub item: u64,
+    /// The second item the refusal unlocks (`0x6e326f`); 0 for none.
+    pub item2: u64,
+    /// The bag byte, which reason 16 names a bag by (`0x6d6720`); 255 names none.
+    pub bag_slot: u8,
+    pub tail: InventoryFailureTail,
+}
+
+/// The per-reason tail after the bag byte (switch at `0x6e3107`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InventoryFailureTail {
+    None,
+    /// Reasons 1 and `0x57`: the required level, the line's `%d` (`0x6e311b`).
+    RequiredLevel(u32),
+    /// Reason `0x51`: the item, slot and container of the server's bind confirm (`0x6e314c`).
+    BindConfirm {
+        item: u64,
+        slot: u32,
+        container: u64,
+    },
+    /// Reasons `0x54`, `0x55` and `0x59`: an `ItemLimitCategory.dbc` id (`0x6e31a6`).
+    LimitCategory(u32),
+}
+
+/// Read `SMSG_INVENTORY_CHANGE_FAILURE`: a `u8` reason and, unless it is 0, two item guids, the bag
+/// byte (`0x6e30d2`-`0x6e30e8`), then the reason's tail.
+pub(super) fn read_inventory_change_failure(r: &mut &[u8]) -> io::Result<InventoryFailure> {
     let reason = read_u8(r)?;
     if reason == 0 {
-        return Ok((0, None, 0, 0));
+        return Ok(InventoryFailure {
+            reason,
+            item: 0,
+            item2: 0,
+            bag_slot: 0,
+            tail: InventoryFailureTail::None,
+        });
     }
-    let required_level = if reason == 1 {
-        Some(read_u32_le(r)?)
-    } else {
-        None
-    };
-    let item_guid = read_u64_le(r)?;
-    let _item2 = read_u64_le(r)?;
+    let item = read_u64_le(r)?;
+    let item2 = read_u64_le(r)?;
     let bag_slot = read_u8(r)?;
-    Ok((reason, required_level, item_guid, bag_slot))
+    let tail = match reason {
+        1 | 0x57 => InventoryFailureTail::RequiredLevel(read_u32_le(r)?),
+        0x51 => InventoryFailureTail::BindConfirm {
+            item: read_u64_le(r)?,
+            slot: read_u32_le(r)?,
+            container: read_u64_le(r)?,
+        },
+        0x54 | 0x55 | 0x59 => InventoryFailureTail::LimitCategory(read_u32_le(r)?),
+        _ => InventoryFailureTail::None,
+    };
+    Ok(InventoryFailure {
+        reason,
+        item,
+        item2,
+        bag_slot,
+        tail,
+    })
 }
 
 /// Read `SMSG_ITEM_TIME_UPDATE` (`Objects/Item.cpp:1096-1106`): item guid, then seconds left, and
@@ -679,12 +740,6 @@ pub(super) fn read_item_time(r: &mut &[u8]) -> io::Result<(u64, u32)> {
 /// Read `SMSG_OPEN_CONTAINER`, the bag's guid, sent when an auto-equip lands in a bag slot
 /// (`ItemHandler.cpp:227`); the reference fires only `BAG_OPEN` from it.
 pub(super) fn read_open_container(r: &mut &[u8]) -> io::Result<u64> {
-    read_u64_le(r)
-}
-
-/// Read `SMSG_INSPECT`, the echoed target guid (`MiscHandler.cpp:957`); the reference's handler
-/// ignores it.
-pub(super) fn read_inspect(r: &mut &[u8]) -> io::Result<u64> {
     read_u64_le(r)
 }
 
@@ -717,18 +772,6 @@ mod tests {
             }
             other => panic!("expected OpenContainer, got {}", other.name()),
         }
-    }
-
-    #[test]
-    fn inspect_decodes_and_is_ignored() {
-        let body = 0x0000_0000_0000_0007u64.to_le_bytes();
-        let packet =
-            crate::messages::parse_server(crate::messages::opcode::SMSG_INSPECT, &body).unwrap();
-        assert!(matches!(
-            packet,
-            crate::messages::ServerPacket::Inspect { guid: 7 }
-        ));
-        assert!(crate::events::decode(packet).is_empty());
     }
 
     /// The fixed head every use body starts with: backpack slot 24, castCount 7, spell 0x1234,
@@ -853,31 +896,67 @@ mod tests {
         assert_eq!(destroy_item(255, 23, 0), vec![255, 23, 0, 0, 0, 0]);
     }
 
-    // Reason 1 is `EQUIP_ERR_CANT_EQUIP_LEVEL_I` (`Objects/ItemDefines.h`, `Item.cpp:198-209`).
-
-    #[test]
-    fn inventory_failure_ok_reason_is_bare() {
-        let buf = [0u8];
-        let mut r = &buf[..];
-        assert_eq!(
-            read_inventory_change_failure(&mut r).unwrap(),
-            (0, None, 0, 0)
-        );
+    fn failure_head(reason: u8) -> Vec<u8> {
+        let mut buf = vec![reason];
+        buf.extend_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes()); // item
+        buf.extend_from_slice(&0x99u64.to_le_bytes()); // item2
+        buf.push(7); // bag byte
+        buf
     }
 
     #[test]
-    fn inventory_failure_level_branch_reads_the_u32() {
-        let mut buf = Vec::new();
-        buf.push(1u8); // reason
-        buf.extend_from_slice(&40u32.to_le_bytes()); // requiredLevel
-        buf.extend_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes()); // item1
-        buf.extend_from_slice(&0u64.to_le_bytes()); // item2
-        buf.push(7); // bagSlot
+    fn inventory_failure_ok_reason_is_bare() {
+        let failure = read_inventory_change_failure(&mut &[0u8][..]).unwrap();
+        assert_eq!((failure.reason, failure.item), (0, 0));
+    }
+
+    /// The level follows the guids and the bag byte, for reasons 1 and `0x57` (AzerothCore's
+    /// `SendEquipError` writes it there too).
+    #[test]
+    fn inventory_failure_reads_the_level_after_the_bag_byte() {
+        for reason in [1u8, 0x57] {
+            let mut buf = failure_head(reason);
+            buf.extend_from_slice(&40u32.to_le_bytes());
+            let mut r = &buf[..];
+            let failure = read_inventory_change_failure(&mut r).unwrap();
+            assert!(r.is_empty());
+            assert_eq!(
+                failure,
+                InventoryFailure {
+                    reason,
+                    item: 0x1122_3344_5566_7788,
+                    item2: 0x99,
+                    bag_slot: 7,
+                    tail: InventoryFailureTail::RequiredLevel(40),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn inventory_failure_reads_the_bind_and_limit_tails() {
+        let mut buf = failure_head(0x51);
+        buf.extend_from_slice(&5u64.to_le_bytes());
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&6u64.to_le_bytes());
         let mut r = &buf[..];
         assert_eq!(
-            read_inventory_change_failure(&mut r).unwrap(),
-            (1, Some(40), 0x1122_3344_5566_7788, 7)
+            read_inventory_change_failure(&mut r).unwrap().tail,
+            InventoryFailureTail::BindConfirm {
+                item: 5,
+                slot: 3,
+                container: 6
+            }
         );
+        assert!(r.is_empty());
+        for reason in [0x54u8, 0x55, 0x59] {
+            let mut buf = failure_head(reason);
+            buf.extend_from_slice(&12u32.to_le_bytes());
+            assert_eq!(
+                read_inventory_change_failure(&mut &buf[..]).unwrap().tail,
+                InventoryFailureTail::LimitCategory(12)
+            );
+        }
     }
 
     #[test]
@@ -911,15 +990,10 @@ mod tests {
 
     #[test]
     fn inventory_failure_nonlevel_branch_has_no_u32() {
-        let mut buf = Vec::new();
-        buf.push(3u8); // reason (ITEM_DOESNT_GO_TO_SLOT)
-        buf.extend_from_slice(&0xDEAD_BEEF_0000_0001u64.to_le_bytes()); // item1
-        buf.extend_from_slice(&0u64.to_le_bytes()); // item2
-        buf.push(0); // bagSlot
+        let buf = failure_head(3);
         let mut r = &buf[..];
-        assert_eq!(
-            read_inventory_change_failure(&mut r).unwrap(),
-            (3, None, 0xDEAD_BEEF_0000_0001, 0)
-        );
+        let failure = read_inventory_change_failure(&mut r).unwrap();
+        assert!(r.is_empty());
+        assert_eq!(failure.tail, InventoryFailureTail::None);
     }
 }

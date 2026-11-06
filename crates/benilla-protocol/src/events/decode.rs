@@ -27,7 +27,24 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
     match packet {
         ServerPacket::UpdateObject { objects } => decode_objects(objects),
         // In order, each move as if alone: the app rebuilds a mover's arc from packet order.
-        ServerPacket::CompressedMoves { packets } => packets.into_iter().flat_map(decode).collect(),
+        ServerPacket::CompressedMoves { packets } | ServerPacket::PacketBatch { packets, .. } => {
+            packets.into_iter().flat_map(decode).collect()
+        }
+        // Each entry as if alone, behind its backdate; the clock returns to now after the batch.
+        ServerPacket::CombatLogBatch { entries } => {
+            let mut out = Vec::new();
+            for (ms, packet) in entries {
+                out.push(SessionEvent::CombatLogBackdate { ms });
+                out.extend(decode(packet));
+            }
+            if !out.is_empty() {
+                out.push(SessionEvent::CombatLogBackdate { ms: 0 });
+            }
+            out
+        }
+        ServerPacket::FlightSplineSync { guid, progress } => {
+            vec![SessionEvent::FlightSplineSync { guid, progress }]
+        }
         ServerPacket::CharEnum { characters } => vec![SessionEvent::CharacterList {
             characters,
             realm: None,
@@ -60,11 +77,13 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         ServerPacket::TextEmote {
             guid,
             text_emote,
+            file_index,
             target_name,
         } => {
             vec![SessionEvent::TextEmote {
                 guid,
                 text_emote,
+                file_index,
                 target_name,
             }]
         }
@@ -76,7 +95,9 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             spell_ids,
             cooldowns,
         }],
-        ServerPacket::ActionButtons { buttons } => vec![SessionEvent::ActionButtons { buttons }],
+        ServerPacket::ActionButtons { state, buttons } => {
+            vec![SessionEvent::ActionButtons { state, buttons }]
+        }
         ServerPacket::LearnedSpell { spell_id } => {
             vec![SessionEvent::SpellLearned { spell_id }]
         }
@@ -113,8 +134,8 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         }],
         ServerPacket::PetSpells(spells) => vec![SessionEvent::PetSpells(Box::new(spells))],
         ServerPacket::PetMode(mode) => vec![SessionEvent::PetMode(mode)],
-        ServerPacket::PetActionFeedback { reason } => {
-            vec![SessionEvent::PetActionFeedback { reason }]
+        ServerPacket::PetActionFeedback { reason, spell } => {
+            vec![SessionEvent::PetActionFeedback { reason, spell }]
         }
         ServerPacket::PetCastFailed { spell_id, outcome } => match outcome {
             CastOutcome::Ok => Vec::new(),
@@ -125,7 +146,15 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             }],
         },
         ServerPacket::PetTameFailure { reason } => vec![SessionEvent::PetTameFailure { reason }],
-        ServerPacket::PetNameInvalid { code } => vec![SessionEvent::PetNameInvalid { code }],
+        ServerPacket::PetNameInvalid {
+            code,
+            name,
+            declensions,
+        } => vec![SessionEvent::PetNameInvalid {
+            code,
+            name,
+            declensions,
+        }],
         ServerPacket::PetBroken => vec![SessionEvent::PetBroken],
         ServerPacket::PetActionSound { pet_guid, talk } => {
             vec![SessionEvent::PetActionSound { pet_guid, talk }]
@@ -136,9 +165,33 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
                 position: [position.x, position.y, position.z],
             }]
         }
+        ServerPacket::PetLearnedSpell { spell_id } => {
+            vec![SessionEvent::PetLearnedSpell { spell_id }]
+        }
+        ServerPacket::PetUnlearnedSpell { spell_id } => {
+            vec![SessionEvent::PetUnlearnedSpell { spell_id }]
+        }
+        ServerPacket::PetRenameable => vec![SessionEvent::PetRenameable],
+        ServerPacket::PetGuids(guids) => vec![SessionEvent::PetGuids(guids)],
         ServerPacket::ItemQueryResponse { entry, info } => {
             vec![SessionEvent::ItemTemplate { entry, info }]
         }
+        // Each record lands in the item cache (`0x67cbd0`) and its file, as a single answer does.
+        ServerPacket::ItemQueryMultiple(records) => records
+            .into_iter()
+            .flat_map(|r| {
+                [
+                    SessionEvent::QueryAnswer {
+                        opcode: crate::messages::opcode::SMSG_ITEM_QUERY_SINGLE_RESPONSE,
+                        body: r.wire,
+                    },
+                    SessionEvent::ItemTemplate {
+                        entry: r.entry,
+                        info: r.info,
+                    },
+                ]
+            })
+            .collect(),
         ServerPacket::ClientCacheVersion { version } => {
             vec![SessionEvent::ClientCacheVersion { version }]
         }
@@ -161,6 +214,7 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             flags,
             members,
         }],
+        ServerPacket::ChannelUserList(u) => vec![SessionEvent::ChannelUserList(u)],
         ServerPacket::ChatPlayerNotFound { name } => {
             vec![SessionEvent::ChatPlayerNotFound { name }]
         }
@@ -172,6 +226,8 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         ServerPacket::ServerMessage { message_type, text } => {
             vec![SessionEvent::ServerMessage { message_type, text }]
         }
+        ServerPacket::TriggerMovie { movie_id } => vec![SessionEvent::TriggerMovie { movie_id }],
+        ServerPacket::DestLocSpellCast(c) => vec![SessionEvent::DestLocSpellCast(c)],
         ServerPacket::ZoneUnderAttack { area_id } => {
             vec![SessionEvent::ZoneUnderAttack { area_id }]
         }
@@ -184,10 +240,14 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             difficulty,
             dynamic,
         }],
+        ServerPacket::DifficultyChangeResult(result) => {
+            vec![SessionEvent::DifficultyChangeResult(result)]
+        }
+        ServerPacket::KickReason { reason } => vec![SessionEvent::KickReason { reason }],
         ServerPacket::DefenseMessage { zone_id, text } => {
             vec![SessionEvent::DefenseMessage { zone_id, text }]
         }
-        ServerPacket::ChatRestricted => vec![SessionEvent::ChatRestricted],
+        ServerPacket::ChatRestricted { kind } => vec![SessionEvent::ChatRestricted { kind }],
         ServerPacket::PlayedTime { total, level, show } => {
             vec![SessionEvent::PlayedTime { total, level, show }]
         }
@@ -202,27 +262,23 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             roll,
             guid,
         }],
-        ServerPacket::InventoryChangeFailure {
-            reason,
-            required_level,
-            item_guid,
-            bag_slot,
-        } if reason != 0 => {
-            vec![SessionEvent::InventoryFailure {
-                reason,
-                required_level,
-                item_guid,
-                bag_slot,
-            }]
+        // Reason 0 ends the handler (`0x6e30ba`): no failure.
+        ServerPacket::InventoryChangeFailure(f) if f.reason != 0 => {
+            vec![SessionEvent::InventoryFailure(f)]
         }
-        // Reason 0 is `EQUIP_ERR_OK`, which vmangos sends too (`Player.cpp:11688`): no failure.
-        ServerPacket::InventoryChangeFailure { .. } => Vec::new(),
+        ServerPacket::InventoryChangeFailure(_) => Vec::new(),
         ServerPacket::AttackStart { attacker, victim } => {
             vec![SessionEvent::AttackStart { attacker, victim }]
         }
-        ServerPacket::AttackStop { attacker, victim } => {
-            vec![SessionEvent::AttackStop { attacker, victim }]
-        }
+        ServerPacket::AttackStop {
+            attacker,
+            victim,
+            face_victim,
+        } => vec![SessionEvent::AttackStop {
+            attacker,
+            victim,
+            face_victim,
+        }],
         ServerPacket::AttackerState(s) => vec![SessionEvent::AttackerState(s)],
         ServerPacket::AttackSwingError(e) => vec![SessionEvent::AttackSwingError(e)],
         ServerPacket::CancelCombat => vec![SessionEvent::CancelCombat],
@@ -273,6 +329,7 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
                 // Against the resolved caster: a GameObject's own guid in slot 1 is not an item.
                 item_caster: (s.item_or_caster != caster).then_some(s.item_or_caster),
                 trajectory: s.trajectory,
+                dest_counter: s.dest_counter,
             }];
             events.extend(runes);
             events
@@ -298,7 +355,7 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             spell_id,
             reason,
         }],
-        ServerPacket::CancelAutoRepeat => vec![SessionEvent::CancelAutoRepeat],
+        ServerPacket::CancelAutoRepeat { guid } => vec![SessionEvent::CancelAutoRepeat { guid }],
         ServerPacket::SpellCooldownList {
             caster,
             flags,
@@ -315,9 +372,15 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             item_guid,
             spell_id,
         }],
-        ServerPacket::InspectItems { guid, items } => {
-            vec![SessionEvent::InspectItems { guid, items }]
-        }
+        // The talents first: 12340 reads them and fires `INSPECT_TALENT_READY` before the items.
+        ServerPacket::InspectTalent {
+            guid,
+            talents,
+            items,
+        } => vec![
+            SessionEvent::InspectTalents { guid, talents },
+            SessionEvent::InspectItems { guid, items },
+        ],
         ServerPacket::SocketGemsResult { item, enchants } => {
             vec![SessionEvent::SocketGemsResult { item, enchants }]
         }
@@ -388,6 +451,19 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         ServerPacket::ComboPoints { target, points } => {
             vec![SessionEvent::ComboPoints { target, points }]
         }
+        ServerPacket::HealthUpdate { guid, value } => {
+            vec![SessionEvent::HealthUpdate { guid, value }]
+        }
+        ServerPacket::ForceDisplayUpdate { guid } => {
+            vec![SessionEvent::ForceDisplayUpdate { guid }]
+        }
+        ServerPacket::CameraShake { group, sound_kit } => {
+            vec![SessionEvent::CameraShake { group, sound_kit }]
+        }
+        ServerPacket::PlayerSkinned { flag } => vec![SessionEvent::PlayerSkinned { flag }],
+        ServerPacket::ResurrectFailed => vec![SessionEvent::ResurrectFailed],
+        ServerPacket::ForcedDeathUpdate => vec![SessionEvent::ForcedDeathUpdate],
+        ServerPacket::ClearFarSightImmediate => vec![SessionEvent::ClearFarSight],
         ServerPacket::PetComboPoints {
             pet,
             target,
@@ -434,6 +510,10 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             spell_id,
             duration_ms,
         }],
+        ServerPacket::ResumeCastBar(r) => vec![SessionEvent::ResumeCastBar(r)],
+        ServerPacket::ResetRangedCombatTimer { time_ms } => {
+            vec![SessionEvent::ResetRangedCombatTimer { time_ms }]
+        }
         ServerPacket::ChannelUpdate {
             caster,
             remaining_ms,
@@ -534,6 +614,7 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         ServerPacket::NpcText { text_id, blocks } => {
             vec![SessionEvent::NpcGreeting { text_id, blocks }]
         }
+        ServerPacket::NpcTextMiss { text_id } => vec![SessionEvent::NpcTextMiss { text_id }],
         ServerPacket::VendorList {
             vendor,
             items,
@@ -626,8 +707,8 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             vec![SessionEvent::LootReleaseResponse { guid, result }]
         }
         ServerPacket::LootRemoved { slot } => vec![SessionEvent::LootRemoved { slot }],
-        ServerPacket::LootMoneyNotify { amount } => {
-            vec![SessionEvent::LootMoneyNotify { amount }]
+        ServerPacket::LootMoneyNotify { amount, solo } => {
+            vec![SessionEvent::LootMoneyNotify { amount, solo }]
         }
         ServerPacket::LootClearMoney => vec![SessionEvent::LootClearMoney],
         ServerPacket::LootStartRoll(p) => vec![SessionEvent::LootStartRoll(p)],
@@ -647,9 +728,29 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         ServerPacket::ReferAFriendFailure { error, name } => {
             vec![SessionEvent::ReferAFriendFailure { error, name }]
         }
+        ServerPacket::Notice(n) => vec![SessionEvent::Notice(n)],
         ServerPacket::UnlearnSpells(s) => vec![SessionEvent::UnlearnSpells(s)],
         ServerPacket::InebriationThreshold(p) => vec![SessionEvent::InebriationThreshold(p)],
         ServerPacket::LearnedDanceMoves(m) => vec![SessionEvent::LearnedDanceMoves(m)],
+        ServerPacket::DanceQueryResponse { id, record } => {
+            vec![SessionEvent::DanceRecord { id, record }]
+        }
+        ServerPacket::InvalidateDance { id } => vec![SessionEvent::InvalidateDance { id }],
+        ServerPacket::RWhois(w) => vec![SessionEvent::RWhois(w)],
+        // 12340 answers after running its own built-in check on the key (`0x86faf0`); that belongs
+        // with the Warden work, so the challenge goes unanswered.
+        ServerPacket::CheckForBots { .. } => Vec::new(),
+        ServerPacket::CharRename(r) => vec![SessionEvent::CharRename(r)],
+        ServerPacket::CharCustomize(r) => vec![SessionEvent::CharCustomize(r)],
+        ServerPacket::CharFactionChange(r) => vec![SessionEvent::CharFactionChange(r)],
+        ServerPacket::DeclinedNamesResult(r) => vec![SessionEvent::DeclinedNamesResult(r)],
+        ServerPacket::Motd(lines) => vec![SessionEvent::Motd(lines)],
+        // `0x4fb540` reads the channel, flags and count, and does nothing with them.
+        ServerPacket::ChannelMemberCount { .. } => Vec::new(),
+        ServerPacket::Whois(text) => vec![SessionEvent::Whois(text)],
+        ServerPacket::RealmSplit(s) => vec![SessionEvent::RealmSplit(s)],
+        ServerPacket::ServerFirstAchievement(a) => vec![SessionEvent::ServerFirstAchievement(a)],
+        ServerPacket::GuildEventLog(rows) => vec![SessionEvent::GuildEventLog(rows)],
         ServerPacket::LootMasterList { candidates } => {
             vec![SessionEvent::LootMasterList { candidates }]
         }
@@ -722,6 +823,8 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             inviter,
         }],
         ServerPacket::GroupDecline { name } => vec![SessionEvent::GroupDecline { name }],
+        ServerPacket::GroupCancel { inviter } => vec![SessionEvent::GroupCancel { inviter }],
+        ServerPacket::GroupActionThrottled => vec![SessionEvent::GroupActionThrottled],
         ServerPacket::GroupUninvited => vec![SessionEvent::GroupUninvited],
         ServerPacket::GroupLeaderChanged { name } => {
             vec![SessionEvent::GroupLeaderChanged { name }]
@@ -739,6 +842,8 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             lfg_status,
             lfg_slot,
             battleground,
+            group_guid,
+            counter,
         } => vec![SessionEvent::GroupList {
             group_type,
             own_flags,
@@ -751,6 +856,8 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             lfg_status,
             lfg_slot,
             battleground,
+            group_guid,
+            counter,
         }],
         ServerPacket::RealGroupUpdate {
             flags,
@@ -765,10 +872,12 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             operation,
             member,
             result,
+            value,
         } => vec![SessionEvent::PartyCommandResult {
             operation,
             member,
             result,
+            value,
         }],
         ServerPacket::PartyMemberStats { guid, full, info } => {
             vec![SessionEvent::PartyMemberStats { guid, full, info }]
@@ -776,18 +885,26 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         ServerPacket::MinimapPing { guid, x, y } => {
             vec![SessionEvent::MinimapPing { guid, x, y }]
         }
-        ServerPacket::RaidTargetSet { icon, guid } => {
-            vec![SessionEvent::RaidTargetSet { icon, guid }]
+        ServerPacket::RaidTargetSet { setter, marks } => {
+            vec![SessionEvent::RaidTargetSet { setter, marks }]
         }
         ServerPacket::RaidTargetList { entries } => {
             vec![SessionEvent::RaidTargetList { entries }]
         }
-        ServerPacket::ReadyCheckRequest => vec![SessionEvent::ReadyCheckRequest],
+        ServerPacket::ReadyCheckStarted { initiator } => {
+            vec![SessionEvent::ReadyCheckStarted { initiator }]
+        }
+        ServerPacket::ReadyCheckConfirm { guid, ready } => {
+            vec![SessionEvent::ReadyCheckConfirm { guid, ready }]
+        }
+        ServerPacket::ReadyCheckFinished => vec![SessionEvent::ReadyCheckFinished],
+        ServerPacket::ReadyCheckError => vec![SessionEvent::ReadyCheckError],
+        ServerPacket::PartySquelch { silenced } => vec![SessionEvent::PartySquelch { silenced }],
+        ServerPacket::EchoPartySquelch { guid, silenced } => {
+            vec![SessionEvent::EchoPartySquelch { guid, silenced }]
+        }
         ServerPacket::RaidInstanceInfo { entries } => {
             vec![SessionEvent::RaidInstanceInfo { entries }]
-        }
-        ServerPacket::ReadyCheckAnswer { guid, ready } => {
-            vec![SessionEvent::ReadyCheckAnswer { guid, ready }]
         }
         ServerPacket::DuelRequested {
             arbiter,
@@ -841,6 +958,10 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         }
         ServerPacket::MirrorTimerStop { kind } => vec![SessionEvent::MirrorTimerStop { kind }],
         ServerPacket::ContactList(list) => vec![SessionEvent::ContactList(list)],
+        ServerPacket::ComplaintResult(r) => vec![SessionEvent::ComplaintResult(r)],
+        ServerPacket::FeatureSystemStatus { complaints } => {
+            vec![SessionEvent::ComplaintStatus { status: complaints }]
+        }
         ServerPacket::FriendStatus(status) => vec![SessionEvent::FriendStatus(status)],
         ServerPacket::WhoResults(results) => vec![SessionEvent::WhoResults(results)],
         ServerPacket::GuildQueryResponse(response) => {
@@ -880,7 +1001,14 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             vec![SessionEvent::PetitionDeclined { player }]
         }
         ServerPacket::PetitionRenamed(rename) => vec![SessionEvent::PetitionRenamed(rename)],
-        ServerPacket::DestroyObject { guid } => vec![SessionEvent::ObjectDestroyed(guid)],
+        ServerPacket::DestroyObject { guid, on_death } => {
+            let mut events = Vec::with_capacity(2);
+            if on_death {
+                events.push(SessionEvent::DestroyedOnDeath(guid));
+            }
+            events.push(SessionEvent::ObjectDestroyed(guid));
+            events
+        }
         ServerPacket::TriggerCinematic { cinematic_id } => {
             vec![SessionEvent::CinematicTriggered { cinematic_id }]
         }
@@ -901,6 +1029,7 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             run_mode,
             arc,
             facing_fixed,
+            cycle,
         } => vec![SessionEvent::MonsterMove {
             guid,
             transport,
@@ -915,11 +1044,13 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             run_mode,
             arc,
             facing_fixed,
+            cycle,
         }],
         ServerPacket::PlayerMove {
             guid,
             opcode,
             flags,
+            flags2,
             position,
             orientation,
             pitch,
@@ -934,7 +1065,7 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             flags,
             pitch,
             time,
-            verb: crate::messages::RelayVerb::of(opcode),
+            verb: crate::messages::RelayVerb::of(opcode, flags2),
             fall_time,
             jump,
             transport,
@@ -992,6 +1123,9 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             packed,
             zone,
         }],
+        ServerPacket::GameTimeUpdate(clock) => vec![SessionEvent::GameTimeSync(clock)],
+        ServerPacket::GameTimeSet(clock) => vec![SessionEvent::GameTimeSet(clock)],
+        ServerPacket::GameSpeed { timescale } => vec![SessionEvent::GameSpeed { timescale }],
         ServerPacket::QueryTimeResponse {
             unix_time,
             reset_in,
@@ -1037,6 +1171,7 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             zone,
             delay_ms,
         }],
+        ServerPacket::SummonCancel => vec![SessionEvent::SummonCancel],
         ServerPacket::TalentsInfo(info) => vec![SessionEvent::TalentsInfo(info)],
         ServerPacket::AllAchievementData(d) => vec![SessionEvent::AllAchievementData(d)],
         ServerPacket::TotemCreated(t) => vec![SessionEvent::TotemCreated(t)],
@@ -1093,10 +1228,9 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         ServerPacket::BattlegroundPlayer { guid, joined } => {
             vec![SessionEvent::BattlegroundPlayer { guid, joined }]
         }
-        ServerPacket::MeetingStoneSetQueue { area, status } => {
-            vec![SessionEvent::MeetingStoneSetQueue { area, status }]
+        ServerPacket::ChatNotInParty { chat_type } => {
+            vec![SessionEvent::ChatNotInParty { chat_type }]
         }
-        ServerPacket::MeetingStoneNotice(notice) => vec![SessionEvent::MeetingStoneNotice(notice)],
         ServerPacket::TutorialFlags(flags) => vec![SessionEvent::TutorialFlags(flags.bytes)],
         ServerPacket::PlayerBound { binder, area } => {
             vec![SessionEvent::PlayerBound { binder, area }]
@@ -1111,8 +1245,20 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         ServerPacket::InitializeFactions { standings } => {
             vec![SessionEvent::Reputations { standings }]
         }
-        ServerPacket::SetFactionStanding { standings } => {
-            vec![SessionEvent::ReputationDelta { standings }]
+        ServerPacket::SetFactionStanding {
+            bonus,
+            show_effect,
+            standings,
+        } => vec![SessionEvent::ReputationDelta {
+            bonus,
+            show_effect,
+            standings,
+        }],
+        ServerPacket::SetFactionAtWar { list_id, at_war } => {
+            vec![SessionEvent::ReputationAtWar { list_id, at_war }]
+        }
+        ServerPacket::ExpectedSpamRecords(patterns) => {
+            vec![SessionEvent::ExpectedSpamRecords(patterns)]
         }
         ServerPacket::SetFactionVisible { list_id } => {
             vec![SessionEvent::ReputationVisible { list_id }]
@@ -1120,16 +1266,21 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         ServerPacket::NameQueryResponse {
             guid,
             name,
+            realm,
             race,
             gender,
             class,
         } => vec![SessionEvent::PlayerName {
             guid,
             name,
+            realm,
             race,
             gender,
             class,
         }],
+        ServerPacket::NameQueryMiss { guid, miss } => {
+            vec![SessionEvent::PlayerNameMiss { guid, miss }]
+        }
         ServerPacket::PetNameQueryResponse { pet_number, name } => {
             vec![SessionEvent::PetName { pet_number, name }]
         }
@@ -1188,6 +1339,7 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             text,
             next_page_id,
         }],
+        ServerPacket::PageTextMiss { page_id } => vec![SessionEvent::PageTextMiss { page_id }],
         ServerPacket::GameObjectQueryResponse { entry, info } => {
             let event = match info {
                 Some(i) => SessionEvent::GameObjectInfo {
@@ -1213,6 +1365,9 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         ServerPacket::GameObjectDespawnAnim { guid } => {
             vec![SessionEvent::GameObjectDespawnAnim { guid }]
         }
+        ServerPacket::GameObjectResetState { guid } => {
+            vec![SessionEvent::GameObjectResetState { guid }]
+        }
         ServerPacket::OpenContainer { item } => vec![SessionEvent::OpenContainer { item }],
         ServerPacket::TimeSyncReq { counter } => vec![SessionEvent::TimeSyncReq { counter }],
         ServerPacket::StandStateUpdate { state } => {
@@ -1220,7 +1375,9 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         }
         // Nothing: the reference's discards the echoed guid, and the inspect window reads the
         // target's `PLAYER_VISIBLE_ITEM_*` fields. Parsed so no tally calls it dropped.
-        ServerPacket::Inspect { .. } => Vec::new(),
+        ServerPacket::InspectResultsUpdate { guid, items } => {
+            vec![SessionEvent::InspectItems { guid, items }]
+        }
         ServerPacket::FishNotHooked => vec![SessionEvent::FishNotHooked],
         ServerPacket::FishEscaped => vec![SessionEvent::FishEscaped],
         ServerPacket::Pong { sequence } => vec![SessionEvent::Pong { sequence }],
@@ -1259,13 +1416,39 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
                 flags,
                 pitch,
                 time,
-                // The opcode's meaning is the speed, carried by its own event: the pose is plain.
-                verb: crate::messages::RelayVerb::Pose,
+                // The opcode's meaning is the speed, carried by its own event.
+                verb: crate::messages::RelayVerb::Value,
                 fall_time,
                 jump,
                 transport,
             },
             SessionEvent::SpeedChanged { guid, kind, speed },
+        ],
+        ServerPacket::MoveCollisionHeight {
+            guid,
+            flags,
+            position,
+            orientation,
+            pitch,
+            time,
+            fall_time,
+            jump,
+            transport,
+            height,
+        } => vec![
+            SessionEvent::UnitMove {
+                guid,
+                position: v3(position),
+                orientation,
+                flags,
+                pitch,
+                time,
+                verb: crate::messages::RelayVerb::Value,
+                fall_time,
+                jump,
+                transport,
+            },
+            SessionEvent::CollisionHeightChanged { guid, height },
         ],
         ServerPacket::MountResult { mount, code } => {
             vec![SessionEvent::MountResult { mount, code }]
@@ -1282,7 +1465,7 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             nearest_node,
             known,
         } => {
-            // The reference parser gates on this word: zero carries no menu; vmangos sends 1.
+            // The show flag: zero opens nothing (`0x6d61af`); AzerothCore sends 1.
             if window == 0 {
                 vec![]
             } else {
@@ -1368,6 +1551,8 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             scope: None,
             states: vec![(id, value)],
         }],
+        ServerPacket::SetPhaseShift { mask } => vec![SessionEvent::PhaseShift { mask }],
+        ServerPacket::Ignored { .. } => Vec::new(),
         // No parse arm at all: surfaced for the app's dropped-opcode tally.
         ServerPacket::Other { opcode } => vec![SessionEvent::PacketDropped {
             opcode,
@@ -1392,6 +1577,7 @@ fn decode_objects(objects: Vec<Object>) -> Vec<SessionEvent> {
                 object_type,
                 movement,
                 mask,
+                spawned,
             } => {
                 // Items have no pose: route them before the placement gate, which would drop them.
                 if matches!(object_type, ObjectType::Item | ObjectType::Container) {
@@ -1421,16 +1607,24 @@ fn decode_objects(objects: Vec<Object>) -> Vec<SessionEvent> {
                         transport: movement.transport,
                         spline: movement.spline,
                         vehicle: movement.vehicle,
+                        attack_target: movement.attack_target,
+                        spawned,
                         fields: mask,
                     });
                 }
             }
             Object::Movement { guid, movement } => {
-                if let Some((position, orientation)) = movement.position {
+                if let (Some((position, orientation)), Some(mover), Some(speeds)) =
+                    (movement.position, movement.mover, movement.speeds)
+                {
                     out.push(SessionEvent::ObjectMove {
                         guid,
                         position: v3(position),
                         orientation,
+                        mover,
+                        speeds: MoveSpeeds::from_wire(speeds),
+                        transport: movement.transport,
+                        spline: movement.spline,
                     });
                 }
             }
@@ -1443,8 +1637,9 @@ fn decode_objects(objects: Vec<Object>) -> Vec<SessionEvent> {
                     out.push(SessionEvent::ObjectValues { guid, fields: mask });
                 }
             }
-            // `Near` is a guid pre-announce; no state.
-            Object::Near { .. } => {}
+            Object::Near { guids } => {
+                out.push(SessionEvent::ObjectsNear(guids));
+            }
         }
     }
     out

@@ -4,19 +4,19 @@ use crate::messages::{
     ActionButton, AttackSwingError, AttackerState, AuctionBidderNotification, AuctionCommandTail,
     AuctionListPage, AuctionOwnerNotification, AuctionPendingSale, ChannelNoticeTail, Character,
     ContactList, CreateSpline, DamageShield, DifficultySet, DispelFailed, EnchantmentLog,
-    EnvironmentalDamageLog, ExplorationXp, FriendStatusUpdate, GmResponse, GmTicket, GossipMenu,
-    GroupDifficulties, GroupLootInfo, GroupMemberEntry, GuildCommandResult, GuildEventNotice,
-    GuildInfo, GuildQueryResponse, GuildRoster, InspectHonorStats, ItemInfo, ItemPushResult,
-    JumpInfo, LevelUpInfo, LootAllPassed, LootItem, LootList, LootRoll, LootRollWon,
-    LootSlotChanged, LootStartRoll, MailList, MailResult, MailSender, MirrorTimerStart,
-    MonsterMoveFacing, MoverState, ObjectFields, PartyKillLog, PartyMemberStatsInfo,
-    PeriodicAuraLog, PetMode, PetSpells, PetitionQueryResponse, PetitionRename, PetitionShowList,
-    PetitionShowSignatures, PetitionSignResults, PvpCredit, QuestComplete, QuestConfirmAccept,
-    QuestDetails, QuestGiverList, QuestOfferReward, QuestRequestItems, QuestShareMsg,
-    QuestTemplate, SpellDamageLog, SpellEnergizeLog, SpellHealLog, SpellInstaKillLog,
-    SpellLogExecute, SpellLogMiss, SpellOutcomeLog, SpellRemoveLog, SplineArc, StabledPet,
-    TaxiMask, TradeStatus, TradeStatusExtended, TrainerSpell, TransportPose, VendorItem,
-    WhoResults, XpGain,
+    EnvironmentalDamageLog, ExplorationXp, FriendStatusUpdate, GameClock, GmResponse, GmTicket,
+    GossipMenu, GroupDifficulties, GroupLootInfo, GroupMemberEntry, GuildCommandResult,
+    GuildEventNotice, GuildInfo, GuildQueryResponse, GuildRoster, InspectHonorStats, ItemInfo,
+    ItemPushResult, JumpInfo, LevelUpInfo, LootAllPassed, LootItem, LootList, LootRoll,
+    LootRollWon, LootSlotChanged, LootStartRoll, MailList, MailResult, MailSender,
+    MirrorTimerStart, MonsterMoveFacing, MoverState, ObjectFields, PartyKillLog,
+    PartyMemberStatsInfo, PeriodicAuraLog, PetMode, PetSpells, PetitionQueryResponse,
+    PetitionRename, PetitionShowList, PetitionShowSignatures, PetitionSignResults, PvpCredit,
+    QuestComplete, QuestConfirmAccept, QuestDetails, QuestGiverList, QuestOfferReward,
+    QuestRequestItems, QuestShareMsg, QuestTemplate, SpellDamageLog, SpellEnergizeLog,
+    SpellHealLog, SpellInstaKillLog, SpellLogExecute, SpellLogMiss, SpellOutcomeLog,
+    SpellRemoveLog, SplineArc, StabledPet, TaxiMask, TradeStatus, TradeStatusExtended,
+    TrainerSpell, TransportPose, VendorItem, WhoResults, XpGain,
 };
 
 /// Coarse entity classification, free of wire types, carried on [`SessionEvent::ObjectCreate`].
@@ -242,12 +242,17 @@ pub enum SessionEvent {
         /// `UPDATE_FLAG_TRANSPORT`'s path progress in ms, only on a type-11/15 transport create;
         /// progress is this plus elapsed ms; position is `timetable(progress % period)`.
         transport_progress: Option<u32>,
-        /// Its rider pose, local to the transport, when created with `MOVEFLAG_ON_TRANSPORT`.
+        /// Its pose local to a transport: a unit's `MOVEFLAG_ON_TRANSPORT` rider tail, or a
+        /// GameObject's, corpse's or dynamic object's `POSITION` passenger pose.
         transport: Option<TransportPose>,
         /// The path it was already walking (`MOVEFLAG_SPLINE_ENABLED`), with the ms already ridden.
         spline: Option<CreateSpline>,
         /// `UPDATEFLAG_VEHICLE`: the unit's `Vehicle.dbc` id and its facing at create.
         vehicle: Option<(u32, f32)>,
+        /// `UPDATEFLAG_HAS_TARGET`: the attack target unit init seeds (`0x73c274`).
+        attack_target: Option<u64>,
+        /// `CREATE_OBJECT2`, the newly spawned object the type's init is told about.
+        spawned: bool,
         /// The full descriptor from the create mask; later [`Self::ObjectValues`] merge into it.
         fields: ObjectFields,
     },
@@ -259,11 +264,16 @@ pub enum SessionEvent {
         /// The full descriptor; `OBJECT_FIELD_ENTRY` is the template for `CMSG_ITEM_QUERY_SINGLE`.
         fields: ObjectFields,
     },
-    /// An update-object movement block: a one-off authoritative pose that supersedes any path.
+    /// An update-object `MOVEMENT` block: a mover's whole status, speeds and any spline, applied
+    /// as a create's `LIVING` block is (`0x6f1520`); the reference ignores one for its own mover.
     ObjectMove {
         guid: u64,
         position: [f32; 3],
         orientation: f32,
+        mover: MoverState,
+        speeds: MoveSpeeds,
+        transport: Option<TransportPose>,
+        spline: Option<CreateSpline>,
     },
     /// A relayed player move (`MSG_MOVE_*`, about 2 Hz): `fall_time` is ms airborne, `jump` rides
     /// with `JUMPING`, `transport` is deck-local with `MOVEFLAG_ON_TRANSPORT`.
@@ -288,8 +298,13 @@ pub enum SessionEvent {
     ObjectValues { guid: u64, fields: ObjectFields },
     /// Left view range (`OutOfRange`); the reference keeps them in a staging table for re-create.
     ObjectsRemoved(Vec<u64>),
+    /// `NEAR_OBJECTS`: guids back in range, which revive from the staging table (`0x4d6f40`).
+    ObjectsNear(Vec<u64>),
     /// `SMSG_DESTROY_OBJECT`: the reference frees it at once, no fade; a respawn is a fresh create.
     ObjectDestroyed(u64),
+    /// `SMSG_DESTROY_OBJECT` with its `onDeath` byte set, just ahead of that guid's
+    /// [`Self::ObjectDestroyed`]: a unit still above 0 health dies first (`0x4d7661`-`0x4d7682`).
+    DestroyedOnDeath(u64),
     /// `SMSG_TRIGGER_CINEMATIC`. Until `CMSG_COMPLETE_CINEMATIC` vmangos anchors visibility to the
     /// cinematic camera (`Player::UpdateCinematic`), despawning the world around the body.
     CinematicTriggered { cinematic_id: u32 },
@@ -320,6 +335,8 @@ pub enum SessionEvent {
         arc: Option<SplineArc>,
         /// `SPLINEFLAG_ORIENTATION_FIXED`: the unit keeps its facing along the path.
         facing_fixed: bool,
+        /// `SPLINEFLAG_CYCLIC`: the path loops.
+        cycle: Option<crate::messages::SplineCycle>,
     },
     /// Same-map teleport (`MSG_MOVE_TELEPORT_ACK`): the app snaps our player and echoes the ack.
     Teleport {
@@ -360,6 +377,15 @@ pub enum SessionEvent {
         /// The server's zone offset in hours.
         zone: i32,
     },
+    /// `SMSG_GAMETIME_SET`: the game clock set to the packet's time at its current speed
+    /// (`0x7e2bb0`).
+    GameTimeSet(GameClock),
+    /// `SMSG_GAMETIME_UPDATE`: the game clock synced to the packet's time at its current speed, a
+    /// clock ahead of it keeping its lead (`0x7e2a37`).
+    GameTimeSync(GameClock),
+    /// The game clock's speed (`SMSG_GAMESPEED_SET`), game minutes per real second; the time runs
+    /// on from where it is.
+    GameSpeed { timescale: f32 },
     /// The server's wall clock in unix seconds (`SMSG_QUERY_TIME_RESPONSE`), the base of absolute
     /// descriptor stamps: a timed quest's deadline is `time(nullptr) + limitTime`. `reset_in` is the
     /// seconds to the daily quest reset (the quest log's server-time set, `0x5dff40`).
@@ -391,12 +417,14 @@ pub enum SessionEvent {
     /// `SMSG_BINDER_CONFIRM`, the `CONFIRM_BINDER` dialog; echo `binder` in `CMSG_BINDER_ACTIVATE`.
     BinderConfirm { binder: u64 },
     /// `SMSG_SUMMON_REQUEST`: `zone` is the summoner's AreaTable id, `delay_ms` the auto-decline
-    /// hold. Accepting sends `CMSG_SUMMON_RESPONSE`; there is no decline opcode.
+    /// hold. The answer is `CMSG_SUMMON_RESPONSE`, agreeing or not.
     SummonRequest {
         summoner: u64,
         zone: u32,
         delay_ms: u32,
     },
+    /// The summon was withdrawn (`SMSG_SUMMON_CANCEL`, empty body).
+    SummonCancel,
     /// `MSG_TALENT_WIPE_CONFIRM`, `cost` in copper; accepting echoes it, declining sends nothing.
     TalentWipeConfirm { trainer: u64, cost: u32 },
     /// The talent groups (`SMSG_TALENTS_INFO`): the player's, or the pet's.
@@ -483,10 +511,8 @@ pub enum SessionEvent {
     ArenaTeamInvite { inviter: String, team: String },
     /// `SMSG_BATTLEGROUND_PLAYER_JOINED`/`_LEFT`, printed once the name cache has the guid.
     BattlegroundPlayer { guid: u64, joined: bool },
-    /// The meeting-stone queue state (`SMSG 0x295`): the area queued for and a status byte.
-    MeetingStoneSetQueue { area: u32, status: u8 },
-    /// One of the meeting stone's four chat-line-only replies (`0x297/0x298/0x299/0x2BB`).
-    MeetingStoneNotice(crate::messages::MeetingStoneNotice),
+    /// A party or raid line of `chat_type` was sent outside one (`SMSG_CHAT_NOT_IN_PARTY`).
+    ChatNotInParty { chat_type: u32 },
     /// The tutorial bank bytes (`SMSG_TUTORIAL_FLAGS`); the client copies both its banks from them.
     TutorialFlags(Vec<u8>),
     /// The bind took (`SMSG_PLAYERBOUND`); `area` matches the [`Self::BindPoint`] sent beside it.
@@ -497,18 +523,33 @@ pub enum SessionEvent {
     /// `SMSG_INITIALIZE_FACTIONS` at login: `(flags, standing)` per `Faction.dbc`
     /// `reputationIndex`. The standing excludes the DBC race/class base; add it before ranking.
     Reputations { standings: Vec<(u8, i32)> },
-    /// `SMSG_SET_FACTION_STANDING`: `(reputationListId, standing)` per slot, base excluded.
-    ReputationDelta { standings: Vec<(u32, i32)> },
+    /// `SMSG_SET_FACTION_STANDING`: the Refer-A-Friend bonus, the rank-up effect switch, and
+    /// `(reputationListId, standing)` per slot, base excluded.
+    ReputationDelta {
+        bonus: f32,
+        show_effect: bool,
+        standings: Vec<(u32, i32)>,
+    },
+    /// `SMSG_SET_FACTION_ATWAR`: one slot's at-war flag, set or cleared.
+    ReputationAtWar { list_id: u32, at_war: bool },
+    /// `SMSG_EXPECTED_SPAM_RECORDS`: the server's chat spam patterns, replacing the last list.
+    ExpectedSpamRecords(Vec<String>),
     /// `SMSG_SET_FACTION_VISIBLE`: sets the slot's visible flag, which decides if it is listed.
     ReputationVisible { list_id: u32 },
-    /// `SMSG_NAME_QUERY_RESPONSE`: names are never descriptor fields in 1.12, only query answers.
-    /// An unknown guid answers with an empty `name`.
+    /// `SMSG_NAME_QUERY_RESPONSE`: names are never descriptor fields, only query answers.
     PlayerName {
         guid: u64,
         name: String,
+        /// Empty for a player on our realm.
+        realm: String,
         race: u32,
         gender: u32,
         class: u32,
+    },
+    /// `SMSG_NAME_QUERY_RESPONSE` with no name: retry, cache a placeholder, or deny.
+    PlayerNameMiss {
+        guid: u64,
+        miss: crate::messages::NameQueryMiss,
     },
     /// `SMSG_PET_NAME_QUERY_RESPONSE`, keyed by the pet number its guid carries in place of an
     /// entry ([`crate::guid::pet_number`]). An empty `name` is the negative answer.
@@ -553,6 +594,9 @@ pub enum SessionEvent {
     /// `SMSG_GAMEOBJECT_DESPAWN_ANIM`: the reference arms substate 12 (AnimationData 157 Despawn)
     /// and keeps the object alive through the same-tick `SMSG_DESTROY_OBJECT` while it plays.
     GameObjectDespawnAnim { guid: u64 },
+    /// `SMSG_GAMEOBJECT_RESET_STATE`: the reference shows the descriptor's `GAMEOBJECT_STATE` again
+    /// when its shown state differs, or always on a type-15 transport (`0x70f810`).
+    GameObjectResetState { guid: u64 },
     /// `SMSG_OPEN_CONTAINER`: the reference fires `BAG_OPEN` with 0 for our own guid (the
     /// backpack), 1..10 for a bag-cache slot, and nothing for a miss.
     OpenContainer { item: u64 },
@@ -578,9 +622,11 @@ pub enum SessionEvent {
         instant: bool,
     },
     /// A chat emote (`SMSG_TEXT_EMOTE`, `EmotesText.dbc`); empty `target_name` means untargeted.
+    /// `file_index` is the voice file the sender picked, `-1` the normal pick.
     TextEmote {
         guid: u64,
         text_emote: u32,
+        file_index: i32,
         target_name: String,
     },
     /// A unit's anim emote (`SMSG_EMOTE`): an `Emotes.dbc` id, its anim and its `EventSoundID`.
@@ -590,8 +636,12 @@ pub enum SessionEvent {
         spell_ids: Vec<u32>,
         cooldowns: Vec<crate::messages::SpellCooldown>,
     },
-    /// The saved action bar at login (`SMSG_ACTION_BUTTONS`): slots 0..119, 0..11 the main bar.
-    ActionButtons { buttons: Vec<ActionButton> },
+    /// The saved action bar (`SMSG_ACTION_BUTTONS`): its state byte and the occupied slots
+    /// 0..143, 0..11 the main bar.
+    ActionButtons {
+        state: u8,
+        buttons: Vec<ActionButton>,
+    },
     /// A spell learned after login (`SMSG_LEARNED_SPELL`), widened from the wire `u16`.
     SpellLearned { spell_id: u32 },
     /// A spell unlearned (`SMSG_REMOVED_SPELL`), widened from `u16`; a respec sends one per rank.
@@ -616,8 +666,9 @@ pub enum SessionEvent {
     PetSpells(Box<PetSpells>),
     /// The pet's react/command state alone (`SMSG_PET_MODE`), with no bar edit.
     PetMode(PetMode),
-    /// A refused pet order (`SMSG_PET_ACTION_FEEDBACK`): one reason code for the red error line.
-    PetActionFeedback { reason: u8 },
+    /// A refused pet order (`SMSG_PET_ACTION_FEEDBACK`): one reason code for the red error line,
+    /// and the refused spell for reasons 2 and 3 (0 when absent).
+    PetActionFeedback { reason: u8, spell: u32 },
     /// The pet's cast refusal (`SMSG_PET_CAST_FAILED`); it never touches our own cast state.
     /// `reason` is in the shared numbering, `arg` the first argument word when sent.
     PetCastFailed {
@@ -629,15 +680,29 @@ pub enum SessionEvent {
     /// `PETTAME_*` string fills `ERR_TAME_FAILED`.
     PetTameFailure { reason: u8 },
     /// A refused pet rename (`SMSG_PET_NAME_INVALID`): `code` is the name code the reference's
-    /// name-error display shows.
-    PetNameInvalid { code: u32 },
+    /// name-error display shows; the declined forms come with a declension request.
+    PetNameInvalid {
+        code: u32,
+        name: String,
+        declensions: Option<[String; 5]>,
+    },
     /// The pet ran away at zero loyalty (`SMSG_PET_BROKEN`, empty body): `ERR_PET_BROKEN`.
     PetBroken,
     /// The pet's voice (`SMSG_PET_ACTION_SOUND`): a talk selector into its `CreatureSoundData` row.
     PetActionSound { pet_guid: u64, talk: u32 },
     /// A dismissed pet's sound (`SMSG_PET_DISMISS_SOUND`): the `CreatureModelData` column-29 kit.
     PetDismissSound { model_id: u32, position: [f32; 3] },
-    /// `SMSG_ITEM_QUERY_SINGLE_RESPONSE`, by entry; `None` is unknown. Boxed, being wide.
+    /// The pet learned a spell (`SMSG_PET_LEARNED_SPELL`): only a chat line; the bar follows the
+    /// `SMSG_PET_SPELLS` behind it.
+    PetLearnedSpell { spell_id: u32 },
+    /// The pet lost a spell (`SMSG_PET_UNLEARNED_SPELL`): `ERR_PET_SPELL_UNLEARNED_S`.
+    PetUnlearnedSpell { spell_id: u32 },
+    /// The pet may be renamed (`SMSG_PET_RENAMEABLE`): `PET_RENAMEABLE`.
+    PetRenameable,
+    /// The controlled-pet list (`SMSG_PET_GUIDS`), replacing the client's whole.
+    PetGuids(Vec<u64>),
+    /// `SMSG_ITEM_QUERY_SINGLE_RESPONSE`, by entry; `None` is unknown. Boxed, being wide. Each
+    /// record of `SMSG_ITEM_QUERY_MULTIPLE_RESPONSE` arrives as one.
     ItemTemplate {
         entry: u32,
         info: Option<Box<ItemInfo>>,
@@ -667,6 +732,8 @@ pub enum SessionEvent {
         flags: u8,
         members: Vec<(u64, u8)>,
     },
+    /// One edit to the watched channel's roster (`SMSG_USERLIST_ADD`, `_REMOVE`, `_UPDATE`).
+    ChannelUserList(crate::messages::ChannelUserList),
     /// A whisper target wasn't found online (`SMSG_CHAT_PLAYER_NOT_FOUND`).
     ChatPlayerNotFound { name: String },
     /// A cross-faction whisper was refused (`SMSG_CHAT_WRONG_FACTION`); empty body.
@@ -680,6 +747,10 @@ pub enum SessionEvent {
     ServerMessage { message_type: u32, text: String },
     /// `SMSG_ZONE_UNDER_ATTACK`: an `AreaTable.dbc` id, shown on the joined defense channels.
     ZoneUnderAttack { area_id: u32 },
+    /// A dest-location cast's visuals (`SMSG_NOTIFY_DEST_LOC_SPELL_CAST`).
+    DestLocSpellCast(crate::messages::DestLocSpellCast),
+    /// The server started a movie (`SMSG_TRIGGER_MOVIE`), a `Movie.dbc` id.
+    TriggerMovie { movie_id: u32 },
     /// A defense broadcast (`SMSG_DEFENSE_MESSAGE`), shown where [`Self::ZoneUnderAttack`] is.
     DefenseMessage { zone_id: u32, text: String },
     /// A dungeon finder message, applied by the app's port of the reference's dungeon finder.
@@ -688,8 +759,13 @@ pub enum SessionEvent {
     Calendar(crate::messages::CalendarPacket),
     /// `SMSG_INSTANCE_DIFFICULTY`: the entered map's difficulty, 0-based, and the dynamic one.
     InstanceDifficulty { difficulty: u32, dynamic: u32 },
-    /// A trial account's whisper cap (`SMSG_CHAT_RESTRICTED`, empty body): error id `0x1c3`.
-    ChatRestricted,
+    /// `SMSG_CHANGEPLAYER_DIFFICULTY_RESULT`: a dynamic-difficulty change's step.
+    DifficultyChangeResult(crate::messages::DifficultyChangeResult),
+    /// `SMSG_KICK_REASON`: the reason `DISCONNECTED_FROM_SERVER` reports.
+    KickReason { reason: u8 },
+    /// A chat restriction (`SMSG_CHAT_RESTRICTED`): 0 restricted, 1 throttled, 2 squelched, 3 yell
+    /// restricted (`0x6e44d0`).
+    ChatRestricted { kind: u8 },
     /// `/played` (`SMSG_PLAYED_TIME`): total and this-level played time, in seconds. The player's
     /// played clock always takes `total` (`0x6cf470`); only `show` prints it and fires
     /// `TIME_PLAYED_MSG` (`0x4013f6`).
@@ -702,17 +778,16 @@ pub enum SessionEvent {
         guid: u64,
     },
     /// A refused inventory operation (`SMSG_INVENTORY_CHANGE_FAILURE`), never `EQUIP_ERR_OK`.
-    InventoryFailure {
-        reason: u8,
-        required_level: Option<u32>,
-        item_guid: u64,
-        /// The destination bag's absolute player slot, reason 16's `%s`; 255 is the player's own.
-        bag_slot: u8,
-    },
+    InventoryFailure(crate::messages::InventoryFailure),
     /// A unit began melee auto-attack (`SMSG_ATTACKSTART`), our own included.
     AttackStart { attacker: u64, victim: u64 },
-    /// A unit stopped melee auto-attack (`SMSG_ATTACKSTOP`).
-    AttackStop { attacker: u64, victim: u64 },
+    /// A unit stopped melee auto-attack (`SMSG_ATTACKSTOP`, `SMSG_COMBAT_EVENT_FAILED`);
+    /// `face_victim` holds its facing toward the victim.
+    AttackStop {
+        attacker: u64,
+        victim: u64,
+        face_victim: bool,
+    },
     /// One melee swing (`SMSG_ATTACKERSTATEUPDATE`): one packet is one swing, no client timer.
     AttackerState(AttackerState),
     /// Our melee swing was refused (`SMSG_ATTACKSWING_*`); sent to the swinger alone.
@@ -759,6 +834,8 @@ pub enum SessionEvent {
         item_caster: Option<u64>,
         /// A trajectory missile's `(elevation, delay ms)` (`CAST_FLAG_ADJUST_MISSILE`).
         trajectory: Option<(f32, u32)>,
+        /// A dest-targeted GO's cast counter, 0 for none (`0x80e42a`).
+        dest_counter: u8,
     },
     /// A channeled beam's hops (`SMSG_SPELL_UPDATE_CHAIN_TARGETS`), consumed once by the next chain
     /// `CharProc`; the reference fills that `unit+0xd44` array from spell-go hits too.
@@ -779,8 +856,8 @@ pub enum SessionEvent {
     /// A unit's cast was pushed back by damage (`SMSG_SPELL_DELAYED`); its end moves out by
     /// `delay_ms`.
     SpellDelayed { caster: u64, delay_ms: u32 },
-    /// Stop our own ranged auto-repeat (`SMSG_CANCEL_AUTO_REPEAT`, self-only).
-    CancelAutoRepeat,
+    /// A unit's ranged auto-repeat ended (`SMSG_CANCEL_AUTO_REPEAT`); ours when `guid` is ours.
+    CancelAutoRepeat { guid: u64 },
     /// `SMSG_SPELL_COOLDOWN` for the player or pet: `(spell_id, cooldown_ms)`, 0 ms meaning the
     /// spell's own `Spell.dbc` recovery; a normal cast's cooldown is client-tracked.
     SpellCooldowns {
@@ -794,7 +871,15 @@ pub enum SessionEvent {
     /// `SMSG_ITEM_TIME_UPDATE`: seconds left on a timed item, 0 when expired. The client shows
     /// this, not `ITEM_FIELD_DURATION` (vmangos `Item::SendTimeUpdate`, `Objects/Item.cpp:1094`).
     ItemTime { item_guid: u64, seconds: u32 },
-    /// `SMSG_INSPECT_TALENT`'s worn items of the inspected player.
+    /// The combat-log events that follow, up to the next of these, happened `ms` before now: a
+    /// batched entry's offset, 0 after the batch (`SMSG_SEND_ALL_COMBAT_LOG`).
+    CombatLogBackdate { ms: i32 },
+    /// The inspected player's talent groups (`SMSG_INSPECT_TALENT`).
+    InspectTalents {
+        guid: u64,
+        talents: crate::messages::TalentsInfo,
+    },
+    /// The inspected player's worn items (`SMSG_INSPECT_TALENT`, `SMSG_INSPECT_RESULTS_UPDATE`).
     InspectItems {
         guid: u64,
         items: Vec<crate::messages::InspectItem>,
@@ -854,6 +939,20 @@ pub enum SessionEvent {
         caster: u64,
         delay_ms: i32,
     },
+    /// A unit's predicted health (`SMSG_HEALTH_UPDATE`).
+    HealthUpdate { guid: u64, value: u32 },
+    /// Rebuild a unit's model from its current fields (`SMSG_FORCE_DISPLAY_UPDATE`).
+    ForceDisplayUpdate { guid: u64 },
+    /// A `SpellEffectCameraShakes` group and a sound kit at the player (`SMSG_CAMERA_SHAKE`).
+    CameraShake { group: u32, sound_kit: u32 },
+    /// Our corpse's insignia was taken (`SMSG_PLAYER_SKINNED`); `PLAYER_SKINNED`'s argument.
+    PlayerSkinned { flag: bool },
+    /// A resurrection failed (`SMSG_RESURRECT_FAILED`): the dead or alive event again.
+    ResurrectFailed,
+    /// The release timer is derived again (`SMSG_FORCED_DEATH_UPDATE`).
+    ForcedDeathUpdate,
+    /// Far sight ends at once (`SMSG_CLEAR_FAR_SIGHT_IMMEDIATE`).
+    ClearFarSight,
     /// A unit's power of one type, set outright (`SMSG_POWER_UPDATE`).
     PowerUpdate {
         guid: u64,
@@ -898,6 +997,10 @@ pub enum SessionEvent {
         spell_id: u32,
         duration_ms: u32,
     },
+    /// A cast or channel already running on a unit (`SMSG_RESUME_CAST_BAR`).
+    ResumeCastBar(crate::messages::ResumeCastBar),
+    /// Each ranged book spell starts `time_ms` of recovery (`SMSG_RESET_RANGED_COMBAT_TIMER`).
+    ResetRangedCombatTimer { time_ms: u32 },
     /// A unit's channel time left (`MSG_CHANNEL_UPDATE`); 0 is over, natural or interrupted.
     ChannelUpdate { caster: u64, remaining_ms: u32 },
     /// A unit's aura slots (`SMSG_AURA_UPDATE_ALL` / `SMSG_AURA_UPDATE`).
@@ -1006,6 +1109,8 @@ pub enum SessionEvent {
         text_id: u32,
         blocks: Vec<crate::messages::NpcTextBlock>,
     },
+    /// The server has no such NPC text (`SMSG_NPC_TEXT_UPDATE`, a top-bit id).
+    NpcTextMiss { text_id: u32 },
     /// A vendor's stock (`SMSG_LIST_INVENTORY`); `current_count == 0xFFFF_FFFF` is unlimited. An
     /// empty stock carries its `error` reason, and only reason 0 opens the window (`0x6d9ad0`).
     VendorInventory {
@@ -1023,7 +1128,7 @@ pub enum SessionEvent {
     /// Forget a player's cached name (`SMSG_INVALIDATE_PLAYER`), the cache's only eviction.
     InvalidatePlayer { guid: u64 },
     /// The stable list (`MSG_LIST_STABLED_PETS`), unasked on the gossip option and on refresh;
-    /// slots are rebased, 0 the current pet. Read by slot: a petless hunter has no slot-0 row.
+    /// rows in wire order, the current pet told by [`StabledPet::is_current`].
     ListStabledPets {
         npc: u64,
         num_stable_slots: u8,
@@ -1076,8 +1181,9 @@ pub enum SessionEvent {
     LootError { guid: u64, error: u8 },
     /// A loot row was taken, by anyone (`SMSG_LOOT_REMOVED`).
     LootRemoved { slot: u8 },
-    /// Our share of the coin (`SMSG_LOOT_MONEY_NOTIFY`), answering `CMSG_LOOT_MONEY`.
-    LootMoneyNotify { amount: u32 },
+    /// Our share of the coin (`SMSG_LOOT_MONEY_NOTIFY`), answering `CMSG_LOOT_MONEY`, and whether
+    /// we looted it alone.
+    LootMoneyNotify { amount: u32, solo: bool },
     /// The coin line disappears for every current looter (`SMSG_LOOT_CLEAR_MONEY`).
     LootClearMoney,
     /// The loot window closes (`SMSG_LOOT_RELEASE_RESPONSE`), answering our `CMSG_LOOT_RELEASE`;
@@ -1105,12 +1211,41 @@ pub enum SessionEvent {
     ProposeLevelGrant { granter: u64 },
     /// A refer-a-friend error (`SMSG_REFER_A_FRIEND_FAILURE`): the code, and a name for code 9.
     ReferAFriendFailure { error: u32, name: String },
+    /// A one-line world notice ([`crate::messages::WorldNotice`]).
+    Notice(crate::messages::WorldNotice),
     /// The spells the trainer shows as used (`SMSG_SEND_UNLEARN_SPELLS`).
     UnlearnSpells(Vec<u32>),
     /// A player's drunk state crossed a threshold (`SMSG_CROSSED_INEBRIATION_THRESHOLD`).
     InebriationThreshold(crate::messages::InebriationThreshold),
     /// The learned dance moves' mask (`SMSG_LEARNED_DANCE_MOVES`).
     LearnedDanceMoves(u64),
+    /// One dance-cache answer (`SMSG_DANCE_QUERY_RESPONSE`); `None` is a miss.
+    DanceRecord {
+        id: u32,
+        record: Option<crate::messages::DanceRecord>,
+    },
+    /// Drop a dance-cache record (`SMSG_INVALIDATE_DANCE`).
+    InvalidateDance { id: u32 },
+    /// A GM's account lookup (`SMSG_RWHOIS`), for the console.
+    RWhois(crate::messages::RWhois),
+    /// A rename's result (`SMSG_CHAR_RENAME`).
+    CharRename(crate::messages::CharRenameResult),
+    /// A customize's result (`SMSG_CHAR_CUSTOMIZE`).
+    CharCustomize(crate::messages::CharChangeResult),
+    /// A race or faction change's result (`SMSG_CHAR_FACTION_CHANGE`).
+    CharFactionChange(crate::messages::CharChangeResult),
+    /// A declension's result (`SMSG_SET_PLAYER_DECLINED_NAMES_RESULT`).
+    DeclinedNamesResult(crate::messages::DeclinedNamesResult),
+    /// The message of the day, a line each (`SMSG_MOTD`).
+    Motd(Vec<String>),
+    /// A GM's whois answer (`SMSG_WHOIS`).
+    Whois(String),
+    /// The realm split state (`SMSG_REALM_SPLIT`), an answer to `CMSG_REALM_SPLIT`.
+    RealmSplit(crate::messages::RealmSplit),
+    /// A realm-first award (`SMSG_SERVER_FIRST_ACHIEVEMENT`).
+    ServerFirstAchievement(crate::messages::ServerFirstAchievement),
+    /// The guild's event log (`MSG_GUILD_EVENT_LOG_QUERY`), oldest first.
+    GuildEventLog(Vec<crate::messages::GuildEventLogEntry>),
     /// Master-loot candidates (`SMSG_LOOT_MASTER_LIST`), sent by `SendLoot` before its response.
     LootMasterList { candidates: Vec<u64> },
     /// An item landed in our bags (`SMSG_ITEM_PUSH_RESULT`): the "You receive loot" line.
@@ -1183,6 +1318,11 @@ pub enum SessionEvent {
         counter: u32,
         height: f32,
     },
+    /// A unit's collision height relayed (`MSG_MOVE_SET_COLLISION_HGT`), no ack: the active mover
+    /// takes the height alone (`0x740833`), another unit with its pose (`0x74099f`).
+    CollisionHeightChanged { guid: u64, height: f32 },
+    /// `SMSG_FLIGHT_SPLINE_SYNC`: where along its cyclic path the server has the unit, `0..1`.
+    FlightSplineSync { guid: u64, progress: f32 },
     /// Our root, water-walk, feather-fall, hover, can-fly or gravity changed. Ack with `counter`
     /// and our `MovementInfo`, or the server never applies it and observers never see it.
     MoveMode {
@@ -1211,6 +1351,10 @@ pub enum SessionEvent {
     GroupInvite { can_accept: bool, inviter: String },
     /// An invite we sent was declined (`SMSG_GROUP_DECLINE`).
     GroupDecline { name: String },
+    /// The inviter withdrew our invite (`SMSG_GROUP_CANCEL`).
+    GroupCancel { inviter: String },
+    /// Too many group commands (`SMSG_GROUPACTION_THROTTLED`, empty body).
+    GroupActionThrottled,
     /// We were removed from our group (`SMSG_GROUP_UNINVITE`, empty body), kicked or left.
     GroupUninvited,
     /// The group's leader changed (`SMSG_GROUP_SET_LEADER`).
@@ -1236,6 +1380,9 @@ pub enum SessionEvent {
         lfg_slot: u32,
         /// Group-type bit `0x01`: a battleground's group.
         battleground: bool,
+        /// The group's guid and the list's update counter, which tell a stale list apart.
+        group_guid: u64,
+        counter: u32,
     },
     /// The group outside the battleground (`SMSG_REAL_GROUP_UPDATE`): `0x2` in `flags` a raid.
     RealGroupUpdate { flags: u8, count: u32, leader: u64 },
@@ -1245,6 +1392,8 @@ pub enum SessionEvent {
         operation: u32,
         member: String,
         result: u32,
+        /// The seconds an LFG boot result names, signed.
+        value: i32,
     },
     /// A member's stats (`SMSG_PARTY_MEMBER_STATS`, or the asked-for `_FULL` form when `full`).
     PartyMemberStats {
@@ -1254,14 +1403,23 @@ pub enum SessionEvent {
     },
     /// Someone pinged the minimap (`MSG_MINIMAP_PING`): the group ping marker.
     MinimapPing { guid: u64, x: f32, y: f32 },
-    /// One raid-target icon changed (`MSG_RAID_TARGET_UPDATE`, delta shape); `guid == 0` clears it.
-    RaidTargetSet { icon: u8, guid: u64 },
+    /// Raid-target icons changed (`MSG_RAID_TARGET_UPDATE`, delta shape): who set them, then each
+    /// icon and its target, 0 clearing it.
+    RaidTargetSet { setter: u64, marks: Vec<(u8, u64)> },
     /// The set raid-target icons (`MSG_RAID_TARGET_UPDATE`, full-list shape).
     RaidTargetList { entries: Vec<(u8, u64)> },
-    /// The raid leader started a ready check (`MSG_RAID_READY_CHECK`, empty body).
-    ReadyCheckRequest,
-    /// A member's ready-check answer, to the leader only (`MSG_RAID_READY_CHECK`, with a body).
-    ReadyCheckAnswer { guid: u64, ready: u8 },
+    /// A ready check started (`MSG_RAID_READY_CHECK`), by `initiator`.
+    ReadyCheckStarted { initiator: u64 },
+    /// A member's ready-check answer (`MSG_RAID_READY_CHECK_CONFIRM`).
+    ReadyCheckConfirm { guid: u64, ready: bool },
+    /// The ready check closed (`MSG_RAID_READY_CHECK_FINISHED`).
+    ReadyCheckFinished,
+    /// Our ready check came too soon (`SMSG_RAID_READY_CHECK_ERROR`, empty body).
+    ReadyCheckError,
+    /// A leader silenced or restored our voice (`MSG_NOTIFY_PARTY_SQUELCH`).
+    PartySquelch { silenced: bool },
+    /// We silenced or restored a member's voice (`SMSG_ECHO_PARTY_SQUELCH`).
+    EchoPartySquelch { guid: u64, silenced: bool },
     /// Our saved raid lockouts (`SMSG_RAID_INSTANCE_INFO`), replacing the list; empty is normal.
     RaidInstanceInfo {
         entries: Vec<crate::messages::RaidInstanceEntry>,
@@ -1339,6 +1497,10 @@ pub enum SessionEvent {
     /// A friend/ignore result (`SMSG_FRIEND_STATUS`): an add/remove ack or a friend's login or
     /// logout broadcast; the [`friend_result`](crate::messages::friend_result) code says which.
     FriendStatus(FriendStatusUpdate),
+    /// The answer to our complaint (`SMSG_COMPLAIN_RESULT`).
+    ComplaintResult(crate::messages::ComplaintResult),
+    /// The complaint system's status (`SMSG_FEATURE_SYSTEM_STATUS`): 0 off, 2 on with auto-ignore.
+    ComplaintStatus { status: u8 },
     /// A `/who` answer (`SMSG_WHO`): at most 49 rows, plus the true match total.
     WhoResults(WhoResults),
     /// A guild's name, ten rank names and tabard (`SMSG_GUILD_QUERY_RESPONSE`), cached by id.
@@ -1410,6 +1572,8 @@ pub enum SessionEvent {
         text: String,
         next_page_id: u32,
     },
+    /// The server has no such page (`SMSG_PAGE_TEXT_QUERY_RESPONSE`, a top-bit id).
+    PageTextMiss { page_id: u32 },
     /// A copied letter's text (`SMSG_ITEM_TEXT_QUERY_RESPONSE`), keyed by the letter item's guid.
     ItemText { item_guid: u64, text: String },
     /// A mail arrived (`SMSG_RECEIVED_MAIL`); `seconds` until it is delivered.
@@ -1465,6 +1629,8 @@ pub enum SessionEvent {
         scope: Option<(u32, u32, u32)>,
         states: Vec<(u32, u32)>,
     },
+    /// The player's phase mask (`SMSG_SET_PHASE_SHIFT`), which gates phased world-state rows.
+    PhaseShift { mask: u32 },
 }
 
 impl SessionEventKind {

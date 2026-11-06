@@ -85,11 +85,15 @@ mod battlefield_score;
 mod bind_confirm;
 mod binder;
 mod binding_abi;
+mod binding_commands;
 mod dialog_verbs;
 pub mod focus;
 mod secure_call;
 mod tutorial;
 mod unit_menu;
+pub use chat_record::{ChatComplaint, ChatRecord};
+pub use level_grant::UnitRequest;
+pub use name_records::NameRecord;
 pub use unit_menu::{DifficultyState, ReferAFriendState};
 mod worldmap_arrow;
 // `camera_view`: the five camera views and `FlipCameraYaw`, as the reference's UI camera has them.
@@ -102,6 +106,7 @@ mod channel_pane;
 mod char_sheet;
 mod char_stats;
 mod chat_misc;
+mod chat_record;
 mod chat_send;
 mod chat_types;
 mod chat_window;
@@ -117,6 +122,7 @@ pub mod diagnostics;
 mod editbox;
 mod formatted_text;
 pub mod instance;
+mod name_records;
 mod static_constants;
 pub(crate) use editbox::{adopt_text_region, editbox_text_region_wrapper};
 pub(crate) mod addon;
@@ -176,8 +182,10 @@ mod cooldown_widget;
 mod input_verbs;
 mod inspect;
 mod inventory_verbs;
+mod item_search;
 mod item_stats;
 mod item_text;
+mod kb_system;
 pub mod keybind;
 mod keyboard;
 mod layout;
@@ -307,7 +315,7 @@ pub use char_stats::{
     weapon_subclass_skill, BankBagSlots, InvSlotView, InventorySlots, UnitCombatStats,
     BANK_BAG_SLOT_COUNT, INVENTORY_SLOT_COUNT, SKILL_DEFENSE, SKILL_UNARMED,
 };
-pub use chat_misc::EmoteRequest;
+pub use chat_misc::{EmoteRequest, EmoteTarget};
 pub use chat_send::ChatSend;
 pub use chat_types::{default_chat_color, ChatTypeColor};
 pub use chat_window::{
@@ -340,11 +348,11 @@ pub use death::{DeathAction, DeathUiState};
 pub use dressup::DressUpIntent;
 pub use duel::DuelRequest;
 pub use follow::FollowRequest;
-pub use gm_ticket::GmTicketIntent;
+pub use gm_ticket::{GmTicketIntent, SurveySubmission, SurveyTables};
 pub use gossip::{GossipMenu, GossipOptionView, GossipQuestRow};
 pub use guild::{
-    GuildMemberInfo, GuildRankEdit, GuildRankInfo, GuildRequest, GuildState, LastOnline, UnitGuild,
-    MAX_RANKS, MIN_RANKS, RANK_RIGHT_BITS,
+    GuildEventView, GuildMemberInfo, GuildRankEdit, GuildRankInfo, GuildRequest, GuildState,
+    LastOnline, UnitGuild, MAX_RANKS, MIN_RANKS, RANK_RIGHT_BITS,
 };
 pub use guild_bank::{
     GuildBankLogView, GuildBankRequest, GuildBankSlotView, GuildBankTabView, GuildBankView,
@@ -367,8 +375,9 @@ pub use video_pairs::VIDEO_PAIR_CVARS;
 pub use worldmap_arrow::ARROW_MODEL;
 
 pub use achievement::{
-    achievement_hyperlink, AchievementBook, AchievementCategoryRow, AchievementCriteriaRow,
-    AchievementDb, AchievementRow, AchievementUpdate, CriteriaWire, WowDate,
+    achievement_hyperlink, decode_tracked, encode_tracked, AchievementBook, AchievementCategoryRow,
+    AchievementCriteriaRow, AchievementDb, AchievementRow, AchievementUpdate, CriteriaWire,
+    WowDate,
 };
 pub use calendar::{
     date_time_text, CalendarCatalogView, CalendarCommandResultView, CalendarEventRowView,
@@ -398,7 +407,8 @@ pub use lfg::{
     EncounterView, LfgBootView, LfgCatalogView, LfgCompletionRewardView, LfgDungeonRewardView,
     LfgDungeonView, LfgExpansionView, LfgGroupView, LfgLine, LfgMemberLocksView, LfgName,
     LfgPartyView, LfgProposalMemberView, LfgProposalView, LfgQueueStatusView, LfgRequest,
-    LfgRewardItemView, LfgRoleCheckMemberView, LfgRoleCheckView, LfgUpdateView, MapDifficultyView,
+    LfgRewardItemView, LfgRoleCheckMemberView, LfgRoleCheckView, LfgUpdateView, LfrGroupView,
+    LfrListView, LfrPlayerView, LfrStatsView, MapDifficultyView,
 };
 pub use loot::{LootRow, LootState, LOOT_PORTRAIT_UNIT};
 pub use loot_roll::{LootRollEntry, LootRollsState};
@@ -442,7 +452,7 @@ pub(crate) use simplehtml::{
     apply_element_font_parts as apply_simplehtml_font_parts,
     element_of_xml_tag as simplehtml_element_of_xml_tag,
 };
-pub use skills::{SkillEntry, SkillsState};
+pub use skills::{SkillEntry, SkillRequest, SkillsState};
 pub use social::{FriendInfo, SocialRequest, SocialState, WhoInfo, WhoRecords};
 pub use sound::{MusicRequest, SoundRequest};
 pub use spell_info::{SpellInfo, SpellInfoSource};
@@ -553,7 +563,7 @@ pub(crate) const TEXTURE_ONLY_METHODS: [&str; 13] = [
 /// FontString-only: the font, text, justify and shadow block and the string metrics.
 /// `GetStringHeight`, `SetFormattedText` and `SetSize` are not 1.12 FontString methods; 3.3.5a's
 /// `SetFormattedText` goes into the leaf alone (`region::text::install_formatted`).
-pub(crate) const FONTSTRING_ONLY_METHODS: [&str; 23] = [
+pub(crate) const FONTSTRING_ONLY_METHODS: [&str; 24] = [
     "SetFont",
     "GetFont",
     "SetFontObject",
@@ -574,6 +584,7 @@ pub(crate) const FONTSTRING_ONLY_METHODS: [&str; 23] = [
     "GetStringWidth",
     "SetNonSpaceWrap",
     "CanNonSpaceWrap",
+    "GetFieldSize",
     "SetAlphaGradient",
     "SetSpacing",
     "GetSpacing",
@@ -996,6 +1007,10 @@ fn install_in_game(lua: &Lua) -> mlua::Result<()> {
     static_constants::install(lua)?;
     chat_types::install(lua)?;
     chat_misc::install(lua)?;
+    chat_record::install(lua)?;
+    binding_commands::install(lua)?;
+    item_search::install(lua)?;
+    name_records::install(lua)?;
     channel::install(lua)?;
     channel_pane::install(lua)?;
     chat_window::install(lua)?;
@@ -1097,6 +1112,7 @@ fn install_in_game(lua: &Lua) -> mlua::Result<()> {
     loot::install(lua)?;
     loot_roll::install(lua)?;
     level_grant::install(lua)?;
+    kb_system::install(lua)?;
     quest::install(lua)?;
     quest_log::install(lua)?;
     quest_watch::install(lua)?;
@@ -1212,6 +1228,27 @@ impl UiScript {
         drop(model);
         // The implicit rects are in layout units, which follow the aspect.
         self.reapply_implicit_rects();
+        true
+    }
+
+    /// Make the resolved UI scale `UIParent`'s own (`0x513240`, `0x51fb80`), then fire
+    /// `UPDATE_FLOATING_CHAT_WINDOWS` for the chat frames that place themselves by the screen size.
+    /// `true` when the dial moved; `false` too with no `UIParent` yet, as the reference skips the
+    /// write until the FrameXML load has found one.
+    pub fn set_ui_scale(&mut self, scale: f32) -> bool {
+        if self.model_ref().ui_scale == Some(scale) {
+            return false;
+        }
+        let Some(h) = self.model_ref().arena.lookup("UIParent") else {
+            return false;
+        };
+        let mut model = self.model_mut();
+        model.ui_scale = Some(scale);
+        model.set_frame_scale(h, scale);
+        drop(model);
+        // Every drawn size moved, so every text metric on the new raster is owed again.
+        self.invalidate_text_measures();
+        self.fire_event("UPDATE_FLOATING_CHAT_WINDOWS", vec![]);
         true
     }
 
@@ -1632,8 +1669,8 @@ impl UiScript {
         keyboard::char_input(&self.lua, text) || editbox::char_input(&self.lua, text)
     }
 
-    /// Paste host clipboard text into the focused EditBox as one edit: newlines survive only in a
-    /// `multiLine` box, other control characters drop. `true` if a box consumed it.
+    /// Paste host clipboard text into the focused EditBox a character at a time, through the path
+    /// typing takes. `true` if a box consumed it.
     pub fn paste(&mut self, text: &str) -> bool {
         editbox::paste(&self.lua, text)
     }
@@ -1670,6 +1707,17 @@ impl UiScript {
                         crate::widget::KindState::EditBox(eb) if eb.alt_arrow_key_mode)
             })
         })
+    }
+
+    /// Whether the OS window has the keyboard, fed each frame; the caret reads it and nothing
+    /// extract paints does, so the mutation count stands.
+    pub fn set_window_focused(&mut self, focused: bool) {
+        if self.model_ref().window_focused != focused {
+            let quiet = self.visual_epoch();
+            let mut model = self.model_mut();
+            model.window_focused = focused;
+            model.set_epoch(quiet);
+        }
     }
 
     /// Whether a visible EditBox holds keyboard focus, which gates the world's keys as the client's

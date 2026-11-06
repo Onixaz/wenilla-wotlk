@@ -68,6 +68,53 @@ fn simple_server_bodies_parse() {
     }
 }
 
+/// `SMSG_GAMETIME_UPDATE` and `SMSG_GAMETIME_SET` carry SETTIMESPEED's clock and zone without the
+/// speed; `SMSG_GAMESPEED_SET` carries the speed alone; a longer body is dropped (`0x7e285f`).
+#[test]
+fn the_game_clock_packets_decode_their_time_or_their_speed() {
+    let datetime: u32 = (26 << 24) | (6 << 20) | (17 << 14) | (3 << 11) | (14 << 6) | 30;
+    let mut body = datetime.to_le_bytes().to_vec();
+    body.extend_from_slice(&3u32.to_le_bytes());
+    let clock = messages::GameClock {
+        hours: 14,
+        minutes: 30,
+        day_serial: 26 * 372 + 6 * 31 + 17,
+        packed: datetime,
+        zone: 3,
+    };
+    for (opcode, name, sync) in [
+        (
+            messages::opcode::SMSG_GAMETIME_UPDATE,
+            "SMSG_GAMETIME_UPDATE",
+            true,
+        ),
+        (
+            messages::opcode::SMSG_GAMETIME_SET,
+            "SMSG_GAMETIME_SET",
+            false,
+        ),
+    ] {
+        let (p, tail) = messages::parse_server_with_tail(opcode, &body).unwrap();
+        assert_eq!(tail, 0, "{name} reads both u32s");
+        assert_eq!(p.name(), name);
+        match decode(p)[..] {
+            [SessionEvent::GameTimeSync(c)] if sync => assert_eq!(c, clock, "{name}"),
+            [SessionEvent::GameTimeSet(c)] if !sync => assert_eq!(c, clock, "{name}"),
+            ref other => panic!("{name}: {other:?}"),
+        }
+        let mut long = body.clone();
+        long.push(0);
+        assert!(messages::parse_server(opcode, &long).is_err(), "{name}");
+    }
+
+    let speed = 0.05f32.to_le_bytes();
+    let p = messages::parse_server(messages::opcode::SMSG_GAMESPEED_SET, &speed).unwrap();
+    assert!(matches!(decode(p)[..], [SessionEvent::GameSpeed { timescale }] if timescale == 0.05));
+    let mut long = speed.to_vec();
+    long.push(0);
+    assert!(messages::parse_server(messages::opcode::SMSG_GAMESPEED_SET, &long).is_err());
+}
+
 /// The response is one u32 of unix-epoch seconds (vmangos `Handlers/QueryHandler.cpp:418-423`).
 #[test]
 fn query_time_asks_empty_and_decodes_the_server_wall_clock() {
@@ -212,14 +259,20 @@ fn set_faction_standing_parses_and_decodes() {
     let body = hx("0000000001020000002e000000b80b00005900000090e8ffff");
     let p = messages::parse_server(messages::opcode::SMSG_SET_FACTION_STANDING, &body).unwrap();
     match p {
-        ServerPacket::SetFactionStanding { ref standings } => {
+        ServerPacket::SetFactionStanding {
+            bonus,
+            show_effect,
+            ref standings,
+        } => {
+            assert_eq!(bonus, 0.0);
+            assert!(show_effect, "the rank-up effect byte");
             assert_eq!(standings[..], [(46, 3000), (89, -6000)]);
         }
         _ => panic!("set faction standing"),
     }
     assert!(matches!(
         decode(p)[..],
-        [SessionEvent::ReputationDelta { ref standings }]
+        [SessionEvent::ReputationDelta { ref standings, .. }]
             if standings[..] == [(46, 3000), (89, -6000)]
     ));
 }
@@ -603,18 +656,32 @@ fn pet_feedback_family_parses_and_decodes() {
 
     // SMSG_PET_NAME_INVALID: the name code, the name ("Bruce") and the declension flag, then with
     // the flag set its five declined forms (here empty).
-    for (body, want) in [
-        ("0c000000".to_owned() + "427275636500" + "00", 12),
-        ("10000000".to_owned() + "00" + "01" + "0000000000", 16),
+    for (body, want, name, forms) in [
+        (
+            "0c000000".to_owned() + "427275636500" + "00",
+            12,
+            "Bruce",
+            false,
+        ),
+        (
+            "10000000".to_owned() + "00" + "01" + "0000000000",
+            16,
+            "",
+            true,
+        ),
     ] {
         let p = messages::parse_server(opcode::SMSG_PET_NAME_INVALID, &hx(&body)).unwrap();
         assert!(
-            matches!(p, ServerPacket::PetNameInvalid { code } if code == want),
+            matches!(
+                p,
+                ServerPacket::PetNameInvalid { code, name: ref n, ref declensions }
+                    if code == want && n == name && declensions.is_some() == forms
+            ),
             "body {body:?}"
         );
         assert!(matches!(
             decode(p)[..],
-            [SessionEvent::PetNameInvalid { code }] if code == want
+            [SessionEvent::PetNameInvalid { code, .. }] if code == want
         ));
     }
 
@@ -624,6 +691,38 @@ fn pet_feedback_family_parses_and_decodes() {
         assert!(matches!(p, ServerPacket::PetBroken), "body {body:?}");
         assert!(matches!(decode(p)[..], [SessionEvent::PetBroken]));
     }
+
+    // SMSG_PET_LEARNED_SPELL / SMSG_PET_UNLEARNED_SPELL: one u32 spell id each (0x5d4c30).
+    let p = messages::parse_server(opcode::SMSG_PET_LEARNED_SPELL, &hx("65430000")).unwrap();
+    assert!(matches!(
+        decode(p)[..],
+        [SessionEvent::PetLearnedSpell { spell_id: 17253 }]
+    ));
+    let p = messages::parse_server(opcode::SMSG_PET_UNLEARNED_SPELL, &hx("65430000")).unwrap();
+    assert!(matches!(
+        decode(p)[..],
+        [SessionEvent::PetUnlearnedSpell { spell_id: 17253 }]
+    ));
+    assert!(messages::parse_server(opcode::SMSG_PET_LEARNED_SPELL, &hx("6543")).is_err());
+
+    // SMSG_PET_RENAMEABLE: no body read (0x5d3140).
+    let p = messages::parse_server(opcode::SMSG_PET_RENAMEABLE, &[]).unwrap();
+    assert!(matches!(decode(p)[..], [SessionEvent::PetRenameable]));
+
+    // SMSG_PET_GUIDS: u32 count, then the u64 guids (0x5d6550); a short list is an error.
+    let body = hx(&("02000000".to_owned() + "2a00000000004010" + "9900000000004010"));
+    let p = messages::parse_server(opcode::SMSG_PET_GUIDS, &body).unwrap();
+    match &decode(p)[..] {
+        [SessionEvent::PetGuids(guids)] => {
+            assert_eq!(guids, &[0x1040_0000_0000_002A, 0x1040_0000_0000_0099]);
+        }
+        other => panic!("{other:?}"),
+    }
+    let p = messages::parse_server(opcode::SMSG_PET_GUIDS, &hx("00000000")).unwrap();
+    assert!(matches!(&decode(p)[..], [SessionEvent::PetGuids(g)] if g.is_empty()));
+    assert!(
+        messages::parse_server(opcode::SMSG_PET_GUIDS, &hx("020000002a00000000004010")).is_err()
+    );
 
     // SMSG_PET_ACTION_SOUND: u64 guid then the u32 talk selector.
     let body = hx("2a0000000000401001000000");
@@ -793,4 +892,170 @@ fn gravity_collision_height_and_spline_flight_parse_and_ack() {
         ServerPacket::PlayerMove { guid: 0x2A, flags, .. }
             if flags & messages::CLASSIC_DISABLE_GRAVITY != 0
     ));
+}
+
+/// `SMSG_SET_FACTION_ATWAR` (`0x5d0850`): a list index and flags whose `0x2` is the war bit;
+/// `SMSG_EXPECTED_SPAM_RECORDS` (`0x501c70`): a count and that many cstrings.
+#[test]
+fn faction_at_war_and_spam_records_parse() {
+    let p = messages::parse_server(messages::opcode::SMSG_SET_FACTION_ATWAR, &hx("2e00000003"))
+        .unwrap();
+    assert!(matches!(
+        decode(p)[..],
+        [SessionEvent::ReputationAtWar {
+            list_id: 46,
+            at_war: true
+        }]
+    ));
+    let p = messages::parse_server(messages::opcode::SMSG_SET_FACTION_ATWAR, &hx("2e00000001"))
+        .unwrap();
+    assert!(matches!(
+        decode(p)[..],
+        [SessionEvent::ReputationAtWar { at_war: false, .. }]
+    ));
+    // Two patterns, "gold" and "w+": the second a regular expression.
+    let p = messages::parse_server(
+        messages::opcode::SMSG_EXPECTED_SPAM_RECORDS,
+        &hx("02000000676f6c6400772b00"),
+    )
+    .unwrap();
+    assert!(matches!(
+        decode(p)[..],
+        [SessionEvent::ExpectedSpamRecords(ref v)] if v[..] == ["gold", "w+"]
+    ));
+}
+
+/// `SMSG_KICK_REASON` (`0x4d9500`): a `u8` reason, 0 for an empty body; the glue's 16-byte
+/// authenticator seed after it is read past.
+#[test]
+fn kick_reason_parses_with_and_without_its_seed() {
+    let kick = |body: &[u8]| {
+        let (pkt, tail) =
+            messages::parse_server_with_tail(messages::opcode::SMSG_KICK_REASON, body).unwrap();
+        assert_eq!(tail, 0);
+        match decode(pkt).as_slice() {
+            [SessionEvent::KickReason { reason }] => *reason,
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(kick(&[3]), 3);
+    assert_eq!(kick(&[]), 0);
+    let mut seeded = vec![5u8];
+    seeded.extend([0xEE; 16]);
+    assert_eq!(kick(&seeded), 5);
+}
+
+/// `SMSG_CHANGEPLAYER_DIFFICULTY_RESULT` (`0x52c460`): each result reads its own tail.
+#[test]
+fn difficulty_change_results_read_their_tails() {
+    use messages::DifficultyChangeResult as R;
+    let result = |body: Vec<u8>| {
+        let (pkt, tail) = messages::parse_server_with_tail(
+            messages::opcode::SMSG_CHANGEPLAYER_DIFFICULTY_RESULT,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(tail, 0, "{body:?}");
+        match decode(pkt).as_slice() {
+            [SessionEvent::DifficultyChangeResult(r)] => *r,
+            other => panic!("{other:?}"),
+        }
+    };
+    let with = |code: u32, tail: &[u8]| {
+        let mut body = code.to_le_bytes().to_vec();
+        body.extend_from_slice(tail);
+        body
+    };
+    assert_eq!(result(with(0, &[1])), R::Stored(1));
+    assert_eq!(result(with(1, &90u32.to_le_bytes())), R::Cooldown(90));
+    for code in [2, 3, 4, 5, 7] {
+        assert_eq!(result(with(code, &[])), R::Refused(code));
+    }
+    assert_eq!(result(with(6, &300u32.to_le_bytes())), R::Started(300));
+    assert_eq!(result(with(8, &42u32.to_le_bytes())), R::MapMessage(42));
+    assert_eq!(result(with(9, &[])), R::Done);
+    assert_eq!(result(with(12, &[])), R::Other(12));
+}
+
+/// `SMSG_SET_PHASE_SHIFT` (`0x526cf4`): one `u32` mask.
+#[test]
+fn the_phase_shift_is_one_mask() {
+    let p =
+        messages::parse_server(messages::opcode::SMSG_SET_PHASE_SHIFT, &hx("41000000")).unwrap();
+    assert!(matches!(
+        decode(p).as_slice(),
+        [SessionEvent::PhaseShift { mask: 0x41 }]
+    ));
+}
+
+/// `SMSG_FEATURE_SYSTEM_STATUS` (`0x6e3f39`): the complaint status, then the voice status, read
+/// and dropped; `SMSG_COMPLAIN_RESULT` (`0x6e3e94`): result, reason.
+#[test]
+fn the_complaint_system_packets() {
+    let p =
+        messages::parse_server(messages::opcode::SMSG_FEATURE_SYSTEM_STATUS, &hx("0201")).unwrap();
+    assert!(matches!(
+        decode(p).as_slice(),
+        [SessionEvent::ComplaintStatus { status: 2 }]
+    ));
+    let p = messages::parse_server(messages::opcode::SMSG_COMPLAIN_RESULT, &hx("010c")).unwrap();
+    assert!(matches!(
+        decode(p).as_slice(),
+        [SessionEvent::ComplaintResult(messages::ComplaintResult {
+            result: 1,
+            reason: 12
+        })]
+    ));
+    let p = messages::parse_server(messages::opcode::SMSG_COMPLAIN_RESULT, &hx("00")).unwrap();
+    assert!(
+        matches!(
+            decode(p).as_slice(),
+            [SessionEvent::ComplaintResult(messages::ComplaintResult {
+                result: 0,
+                reason: 0
+            })]
+        ),
+        "AzerothCore's result alone takes the chat arm"
+    );
+    assert_eq!(
+        messages::complaint_mail(0x0102, 77),
+        hx("000201000000000000000000004d00000000000000"),
+        "u8 0, the sender, u32 0, the mail, u32 0"
+    );
+}
+
+/// The three user-list packets (`0x504130`, `0x5042f0`, `0x500380`): a removal carries no member
+/// flags.
+#[test]
+fn the_user_list_packets() {
+    use messages::{ChannelUserList, ChannelUserListKind as K};
+    let body = |member: Option<u8>| {
+        let mut b = 0x99u64.to_le_bytes().to_vec();
+        b.extend(member);
+        b.push(0x18);
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(b"General\0");
+        b
+    };
+    for (op, kind, member) in [
+        (messages::opcode::SMSG_USERLIST_ADD, K::Add, Some(0x2)),
+        (messages::opcode::SMSG_USERLIST_REMOVE, K::Remove, None),
+        (messages::opcode::SMSG_USERLIST_UPDATE, K::Update, Some(0x4)),
+    ] {
+        let p = messages::parse_server(op, &body(member)).unwrap();
+        match decode(p).as_slice() {
+            [SessionEvent::ChannelUserList(u)] => assert_eq!(
+                *u,
+                ChannelUserList {
+                    kind,
+                    guid: 0x99,
+                    member_flags: member.unwrap_or(0),
+                    channel_flags: 0x18,
+                    count: 3,
+                    channel: "General".into(),
+                }
+            ),
+            other => panic!("{kind:?}: {other:?}"),
+        }
+    }
 }

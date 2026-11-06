@@ -144,6 +144,11 @@ impl BattlefieldQueue {
         self.active.map(|_| self.active_map)
     }
 
+    /// Our arena side from the active status, which a streamed player's is compared against.
+    pub(crate) fn arena_faction(&self) -> u8 {
+        self.arena_faction
+    }
+
     /// The active slot's queue word, `LeaveBattlefield`'s payload, 0 with none (`0x54c26c`).
     fn active_queue(&self) -> u64 {
         self.active
@@ -190,10 +195,16 @@ struct WorldPvpQueue {
 }
 
 impl WorldPvpQueue {
+    /// Whether the slot search finds this slot for `queue_id`: it holds the queue, or it is free,
+    /// a zero area or status word (`0x549534`-`0x54953a`).
+    fn takes(&self, queue_id: u32) -> bool {
+        self.queue_id == queue_id || self.area_id == 0 || self.status == 0
+    }
+
     /// The world PvP queue's write (`0x549500`): the slot holding the queue, else a free one; a
     /// zero area or expiry keeps the old.
     fn set(&mut self, queue_id: u32, status: u32, area_id: u32, expire: u32) {
-        if self.queue_id != queue_id && self.queue_id != 0 && self.status != 0 {
+        if !self.takes(queue_id) {
             return;
         }
         if area_id != 0 {
@@ -262,7 +273,8 @@ impl Battlefield {
                 if cleared_afk {
                     self.cleared_afk += 1;
                 }
-                if self.world_pvp.queue_id == queue_id || self.world_pvp.status == 0 {
+                // `0x54993d`-`0x54998a`.
+                if self.world_pvp.takes(queue_id) {
                     self.world_pvp.queue_id = queue_id;
                     self.world_pvp.status = 0;
                 }
@@ -303,9 +315,8 @@ impl Battlefield {
                 battle_status,
                 relocated,
             } => {
-                if matches!(reason, 1 | 2 | 4 | 5 | 7..=11)
-                    && (self.world_pvp.queue_id == queue_id || self.world_pvp.status == 0)
-                {
+                // `0x549a15`-`0x549a6a`.
+                if matches!(reason, 1 | 2 | 4 | 5 | 7..=11) && self.world_pvp.takes(queue_id) {
                     self.world_pvp.queue_id = queue_id;
                     self.world_pvp.status = 0;
                 }
@@ -524,7 +535,7 @@ fn feed_battlemaster_rows(
 
 /// The VM's pushes and the handlers' lines and events.
 #[allow(clippy::too_many_arguments)]
-fn feed_battlefield(
+pub(crate) fn feed_battlefield(
     script: Option<NonSendMut<UiScript>>,
     mut state: ResMut<Battlefield>,
     mut queue: ResMut<BattlefieldQueue>,
@@ -621,6 +632,13 @@ fn feed_battlefield(
             vec![ScriptValue::Int(i64::from(slot))],
         );
     }
+    // `SMSG_BATTLEFIELD_MGR_ENTERED`'s third byte: `CLEARED_AFK` as a system line before the
+    // queue write and the event (`0x5498f6`-`0x54992b`).
+    for _ in 0..std::mem::take(&mut state.cleared_afk) {
+        let text = crate::ui_chat::combat::global_string(&script, "CLEARED_AFK")
+            .unwrap_or_else(|| "CLEARED_AFK".to_string());
+        crate::ui_chat::away::push_system(&mut sink.chat, text);
+    }
     for (name, args) in std::mem::take(&mut state.mgr_events) {
         script.fire_event(name, args);
     }
@@ -634,7 +652,8 @@ fn feed_battlefield(
     }
     let pending = std::mem::take(&mut state.players);
     for (guid, joined) in pending {
-        let Some(name) = names.resolve(guid, &commands).map(str::to_string) else {
+        // `name-realm` for a player from another realm (`0x54b55a`-`0x54b58a`).
+        let Some(name) = names.full_name(guid, &commands) else {
             state.players.push((guid, joined));
             continue;
         };
@@ -843,17 +862,7 @@ mod net {
             .net_handler(K::BattlegroundPlayer, on_packet)
             .net_handler(K::BattlefieldPortDenied, on_packet)
             .net_handler(K::BattlefieldMgr, on_packet)
-            .net_handler(K::ArenaUnitDestroyed, on_arena_unit_destroyed)
             .net_handler(K::Disconnected, on_session_end);
-    }
-
-    /// `SMSG_ARENA_UNIT_DESTROYED` (`0x54b5e0`), in an arena, fires `ARENA_OPPONENT_UPDATE` for the
-    /// opponent or pet slot holding the guid. No opponent slot is tracked (the `arenaN` tokens, #90), so no
-    /// slot matches and nothing fires, as the reference does for an unknown guid.
-    fn on_arena_unit_destroyed(In(ev): In<SessionEvent>) {
-        if let SessionEvent::ArenaUnitDestroyed(guid) = ev {
-            debug!("ui_battlefield: arena unit {guid:#x} destroyed — no opponent slot holds it");
-        }
     }
 
     /// The queue and the session end with the session, as the game's start (`0x54e720`) zeroes them
@@ -1020,5 +1029,34 @@ mod tests {
         );
         w.set(2, 1, 99, 0);
         assert_eq!(w.queue_id, 1, "a busy slot keeps its queue");
+    }
+
+    /// `0x549534`-`0x54953a`: a slot with no area is free though its status is set; the entered
+    /// arm skips a busy slot and still owes the `CLEARED_AFK` line its third byte asks for.
+    #[test]
+    fn a_slot_with_no_area_is_free_and_entered_owes_its_afk_line() {
+        let mut b = Battlefield::default();
+        b.world_pvp.set(1, 1, 0, 0);
+        b.world_pvp.set(2, 1, 4197, 0);
+        assert_eq!(
+            (b.world_pvp.queue_id, b.world_pvp.area_id),
+            (2, 4197),
+            "no area: the slot was free"
+        );
+        b.apply_mgr(
+            BattlefieldMgrNotice::Entered {
+                queue_id: 3,
+                invited: true,
+                on_offense: false,
+                cleared_afk: true,
+            },
+            (0, 0),
+        );
+        assert_eq!(
+            (b.world_pvp.queue_id, b.world_pvp.status),
+            (2, 1),
+            "an area and a status: busy"
+        );
+        assert_eq!(b.cleared_afk, 1);
     }
 }

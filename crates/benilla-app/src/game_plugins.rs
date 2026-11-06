@@ -141,6 +141,7 @@ impl PluginGroup for GamePlugins {
             })
             .add(crate::death::DeathPlugin)
             .add(crate::ui_notices::NoticesPlugin)
+            .add(crate::ui_movie::MoviePlugin)
             .add(crate::char_select::CharSelectPlugin { start: self.start })
             .add(crate::login::LoginPlugin)
             .add(crate::realm_select::RealmSelectPlugin)
@@ -183,6 +184,7 @@ impl PluginGroup for GamePlugins {
             .add(UiDialogVerbsPlugin)
             .add(BattlefieldScorePlugin)
             .add(BattlefieldPlugin)
+            .add(crate::ui_arena::UiArenaPlugin)
             .add(BattlefieldPositionsPlugin)
             .add(crate::game_tip::GameTipPlugin)
             .add(crate::text_filter::TextFilterPlugin)
@@ -867,8 +869,7 @@ pub(crate) mod schedule_tests {
     ///   test reads one frame late at worst, as `ui_unit::feed_unit_reach`'s range test does
     ///   (`UiFeed` runs before `WorldStage::Input`, so it cannot follow the transport chain); and
     ///   against the `TutorialEvent` writers `tutorial::watch_self`, `watch_windows`,
-    ///   `ui_battlefield::feed_battlefield` and `ui_dialog_verbs::feed_meeting_stone` and the
-    ///   drain `tutorial::feed_tutorials`: it only appends one fire-once ask.
+    ///   `ui_battlefield::feed_battlefield` and the drain `tutorial::feed_tutorials`: it only appends one fire-once ask.
     /// - The vehicle seats (#632) add 15: `vehicle::ride::ride_seats` re-roots a passenger's rig in
     ///   the entity-visuals chain right after `reseat_mounts`, as a mount re-seat does, and shares
     ///   its unordered `RigPose` readers (the nameplate, overhead mark, combat-text and anim-event
@@ -925,9 +926,14 @@ pub(crate) mod schedule_tests {
     ///   writer, against the other writers of that queue (whose events commute) and the feeds it
     ///   shares the VM with; and `ui_quest_watch::feed_quest_poi_lines` against `feed_item_stats`
     ///   over `Items`: it only reads templates.
+    /// - The update-object deck passengers (#902) add 25: `transport::compose_deck_passengers`
+    ///   against the same 24 `Transform` readers `compose_riders` pairs with (the range, reach,
+    ///   threat and NPC-session feeds, the art scope, the WDL stream and the booth billboards),
+    ///   one frame late at worst, as the rider poses; and `net::motion::facing::
+    ///   apply_walk_end_facing` against `face_booth_billboards`, which turns only booth quads.
     // The realm entry latch precedes UiFeed and the logout probe, ordering 54 roster/UI pairs.
     // The corpse resolver (#636) follows the transport chain inside UiFeed, ordering 63 more.
-    const UPDATE_ACTIONABLE_CEILING: usize = 3_875;
+    const UPDATE_ACTIONABLE_CEILING: usize = 3_796;
     const UPDATE_ACTIONABLE_SLACK: usize = 40;
 
     fn ratchet(what: &str, n: usize, ceiling: usize, slack: usize) {
@@ -1373,8 +1379,6 @@ pub(crate) mod schedule_tests {
          "`feed.vm: VmMemo<CharFeedMemo>`; `vm_reset` fires every transition on a fresh memo"),
         ("ui_chat/recruitment.rs", "guild_recruitment_cascade", Because::SelfHealing,
          "`pending` is held until the zone mask and zone id are settled, which happens on the entry VM"),
-        ("ui_dialog_verbs.rs", "feed_meeting_stone", Because::SelfHealing,
-         "the text waits for the world-enter cascade's reset (`meeting_stone_enter_world`), our own create a server round trip past the login edge, and every `/reload` resets it onto its new VM"),
         ("ui_duel.rs", "feed_duel", Because::PlayerRoundTrip,
          "a duel exists only after someone's Duel cast, and the server ends any duel at logout; FINISHED/bounds ride `VmMemo<FedDuel>` (another player's act: coincidence-only residual)"),
         ("ui_follow.rs", "feed_follow", Because::MemoLatched,

@@ -125,6 +125,11 @@ impl WorldWriter {
         )
     }
 
+    /// Close the ready check we started (`MSG_RAID_READY_CHECK_FINISHED`, empty body).
+    pub fn ready_check_finish(&mut self) -> Result<()> {
+        self.send(opcode::MSG_RAID_READY_CHECK_FINISHED, &[])
+    }
+
     /// Start a raid ready check (`MSG_RAID_READY_CHECK`, empty body); leader only.
     pub fn ready_check_start(&mut self) -> Result<()> {
         self.send(opcode::MSG_RAID_READY_CHECK, &messages::ready_check_start())
@@ -165,5 +170,10 @@ impl WorldWriter {
             opcode::MSG_PARTY_ASSIGNMENT,
             &messages::party_assignment(assignment, set, guid),
         )
+    }
+
+    /// `CMSG_OPT_OUT_OF_LOOT`: pass on every roll from now on, or stop (`0x52cb40`).
+    pub fn opt_out_of_loot(&mut self, on: bool) -> Result<()> {
+        self.send(opcode::CMSG_OPT_OUT_OF_LOOT, &u32::from(on).to_le_bytes())
     }
 }

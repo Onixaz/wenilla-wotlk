@@ -73,7 +73,7 @@ pub(crate) const PROBE_VARS: &[ProbeVar] = &[
     },
     ProbeVar {
         name: "WOW_PROBE_KEY",
-        purpose: "\"<key>@<secs>[:<hold>][;…]\" — synthesize key presses once in-world (a jump, a mount flourish, a held W)",
+        purpose: "\"<key>@<secs>[:<hold>][;…]\" — synthesize key presses once in-world (a jump, a mount flourish, a held W); `MouseLeft`/`MouseRight` press a mouse button at the `WOW_HOVER_PROBE` aim",
         // Each tap fires at its `@<secs>` and releases `<hold>` later, on `ProbeClock`.
         wall_clock: true,
     },
@@ -259,6 +259,11 @@ pub(crate) const PROBE_VARS: &[ProbeVar] = &[
         wall_clock: true,
     },
     ProbeVar {
+        name: "WOW_PROBE_INTERACT",
+        purpose: "<npc flag mask> — hop beside the nearest unit carrying any of the flags and right-click it through the service ladder",
+        wall_clock: true,
+    },
+    ProbeVar {
         name: "WOW_PROBE_SERVICE",
         purpose: "1 — right-click four real NPCs, one per UNIT_NPC_FLAGS shape, and report the service-ladder arm and the window that opened",
         wall_clock: true,
@@ -286,11 +291,6 @@ pub(crate) const PROBE_VARS: &[ProbeVar] = &[
     ProbeVar {
         name: "WOW_PROBE_BOOK",
         purpose: "1 — teleport to the Old Town plaque and measure what the item-text reader costs per frame, closed vs open",
-        wall_clock: true,
-    },
-    ProbeVar {
-        name: "WOW_PROBE_STONE",
-        purpose: "1 or <x>,<y>,<z>[,<map>] — join a real meeting stone on the click's own route and read the queue back out of the live VM",
         wall_clock: true,
     },
     ProbeVar {

@@ -145,6 +145,10 @@ pub(super) struct GroupList {
     pub lfg_status: u8,
     pub lfg_slot: u32,
     pub battleground: bool,
+    /// The group's guid and the list's update counter (`0x6d88ed`, `0x6d88f8`), which tell a stale
+    /// list apart.
+    pub group_guid: u64,
+    pub counter: u32,
 }
 
 /// 3.3.5a's group-type battleground bit (`0x6d8870` tests `& 1`).
@@ -182,8 +186,8 @@ pub(super) fn read_group_list(r: &mut &[u8]) -> io::Result<GroupList> {
     } else {
         (0, 0)
     };
-    let _group_guid = read_u64_le(r)?;
-    let _counter = read_u32_le(r)?;
+    let group_guid = read_u64_le(r)?;
+    let counter = read_u32_le(r)?;
     let count = read_u32_le(r)?;
     // A raid is the widest list this carries, 40 (`raidGuids[40]` in `0x6d8870`).
     let mut members = Vec::with_capacity(capacity_hint(count, 40));
@@ -233,6 +237,8 @@ pub(super) fn read_group_list(r: &mut &[u8]) -> io::Result<GroupList> {
         lfg_status,
         lfg_slot,
         battleground: raw_type & GROUP_TYPE_BATTLEGROUND != 0,
+        group_guid,
+        counter,
     })
 }
 
@@ -259,13 +265,14 @@ pub(super) fn read_group_set_leader(r: &mut impl Read) -> io::Result<String> {
     read_cstring(r)
 }
 
-/// Read `SMSG_PARTY_COMMAND_RESULT` as `0x6cbec0` does: operation, name, result, LFG boot duration.
-pub(super) fn read_party_command_result(r: &mut impl Read) -> io::Result<(u32, String, u32)> {
+/// Read `SMSG_PARTY_COMMAND_RESULT` as `0x6cbec0` does: operation, name, result, and the signed
+/// seconds an LFG boot result names.
+pub(super) fn read_party_command_result(r: &mut impl Read) -> io::Result<(u32, String, u32, i32)> {
     let operation = read_u32_le(r)?;
     let member = read_cstring(r)?;
     let result = read_u32_le(r)?;
-    let _value = read_u32_le(r)?;
-    Ok((operation, member, result))
+    let value = read_u32_le(r)? as i32;
+    Ok((operation, member, result, value))
 }
 
 /// 12340's `SMSG_PARTY_MEMBER_STATS` mask (`0x6cf9b0`): the member fields that follow, in bit
@@ -308,6 +315,9 @@ pub struct RecordAura {
 /// present. The plain opcode carries what changed; `_FULL` everything the server has.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PartyMemberStatsInfo {
+    /// `_FULL`'s leading byte: nonzero makes the unit an arena opponent (`0x6cf9fa`), and its
+    /// pet guid an opponent's pet (`0x6cfc45`). Always false on the plain opcode.
+    pub arena_opponent: bool,
     /// [`member_status`] bits; the record holds a `u16` (`0x6cfa96`).
     pub status: Option<u16>,
     pub cur_hp: Option<u32>,
@@ -519,13 +529,13 @@ pub(super) fn read_party_member_stats(
     r: &mut impl Read,
     full: bool,
 ) -> io::Result<(u64, PartyMemberStatsInfo)> {
-    if full {
-        // benilla keeps no arena opponent list for the byte to add to (`0x6cf9fa`).
-        let _arena = read_u8(r)?;
-    }
+    let arena_opponent = full && read_u8(r)? != 0;
     let guid = read_packed_guid(r)?;
     let mask = read_u32_le(r)?;
-    let mut info = PartyMemberStatsInfo::default();
+    let mut info = PartyMemberStatsInfo {
+        arena_opponent,
+        ..Default::default()
+    };
 
     if mask & party_member_mask::STATUS != 0 {
         info.status = Some(read_u16_le(r)?);
@@ -598,46 +608,41 @@ pub(super) fn read_minimap_ping(r: &mut impl Read) -> io::Result<(u64, f32, f32)
     Ok((read_u64_le(r)?, read_f32_le(r)?, read_f32_le(r)?))
 }
 
-/// A server `MSG_RAID_TARGET_UPDATE` (`Group.cpp:132-147`): mode 0 is one changed icon, mode 1
-/// every set icon, an empty list when none is.
+/// A server `MSG_RAID_TARGET_UPDATE` (`0x5743b0`): mode 0 names the member who set the marks, then
+/// the changed `(icon, target)` pairs; any other mode is every set icon, an empty list when none is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RaidTargetUpdate {
-    Delta { icon: u8, guid: u64 },
+    Delta { setter: u64, marks: Vec<(u8, u64)> },
     List(Vec<(u8, u64)>),
 }
 
+/// The `(icon, target)` pairs until the body ends (`0x574466`, `0x574471`).
+fn read_marks(r: &mut &[u8]) -> io::Result<Vec<(u8, u64)>> {
+    let mut marks = Vec::new();
+    while !r.is_empty() {
+        marks.push((read_u8(r)?, read_u64_le(r)?));
+    }
+    Ok(marks)
+}
+
 pub(super) fn read_raid_target_update(r: &mut &[u8]) -> io::Result<RaidTargetUpdate> {
-    let mode = read_u8(r)?;
-    if mode == 0 {
-        Ok(RaidTargetUpdate::Delta {
-            icon: read_u8(r)?,
-            guid: read_u64_le(r)?,
-        })
-    } else {
-        let mut entries = Vec::new();
-        while !r.is_empty() {
-            entries.push((read_u8(r)?, read_u64_le(r)?));
-        }
-        Ok(RaidTargetUpdate::List(entries))
+    if read_u8(r)? != 0 {
+        return Ok(RaidTargetUpdate::List(read_marks(r)?));
     }
-}
-
-/// A server `MSG_RAID_READY_CHECK`: empty when the leader starts a check, else one member's answer,
-/// sent to the leader only (`Group.cpp:94-96`, `126-130`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReadyCheck {
-    Started,
-    Answer { guid: u64, ready: u8 },
-}
-
-pub(super) fn read_ready_check(r: &mut &[u8]) -> io::Result<ReadyCheck> {
-    if r.is_empty() {
-        return Ok(ReadyCheck::Started);
-    }
-    Ok(ReadyCheck::Answer {
-        guid: read_u64_le(r)?,
-        ready: read_u8(r)?,
+    // The one-mark mode reads the setter's guid first (`0x574441`).
+    let setter = read_u64_le(r)?;
+    Ok(RaidTargetUpdate::Delta {
+        setter,
+        marks: read_marks(r)?,
     })
+}
+
+/// `MSG_RAID_READY_CHECK_CONFIRM` (`0x5744f0`): the member's guid, then the ready byte when the
+/// body carries one, 0 when it does not.
+pub(super) fn read_ready_check_confirm(r: &mut &[u8]) -> io::Result<(u64, bool)> {
+    let guid = read_u64_le(r)?;
+    let ready = if r.is_empty() { 0 } else { read_u8(r)? };
+    Ok((guid, ready != 0))
 }
 
 /// `CMSG_GROUP_INVITE` body (`0x6d4300`): the name, then `InviteUnit`'s `u32` flags.
@@ -757,12 +762,12 @@ pub fn raid_target_request() -> Vec<u8> {
     vec![0xFF]
 }
 
-/// `MSG_RAID_READY_CHECK` body starting a check: empty (`Group.cpp:84-92`).
+/// `MSG_RAID_READY_CHECK` body starting a check: empty (`0x5732b0`).
 pub fn ready_check_start() -> Vec<u8> {
     Vec::new()
 }
 
-/// `MSG_RAID_READY_CHECK` body answering one: 1 ready or 0 not, no guid (`Group.cpp:84-92`).
+/// `MSG_RAID_READY_CHECK` body answering one: 1 ready or 0 not, no guid (`0x5740c0`).
 pub fn ready_check_answer(ready: bool) -> Vec<u8> {
     vec![u8::from(ready)]
 }

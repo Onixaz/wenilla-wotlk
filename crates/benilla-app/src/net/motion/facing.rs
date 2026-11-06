@@ -55,10 +55,29 @@ pub(crate) struct DisplayFacing {
 #[derive(Component)]
 pub(crate) struct FacingStep(pub(crate) f32);
 
+/// An attack stop's held facing (`0x7567c4`, `0x7567ec`): the bearing to the victim, goal row 5
+/// while the unit stands. Kept until the unit comes back to life (`0x73d536`), which the health
+/// rising from 0 stands for.
+#[derive(Component)]
+#[component(storage = "SparseSet")]
+pub(crate) struct FacingHold {
+    yaw: f32,
+    /// The health read 0 since the hold was set.
+    died: bool,
+}
+
+impl FacingHold {
+    pub(crate) fn new(yaw: f32) -> Self {
+        Self { yaw, died: false }
+    }
+}
+
 /// Which goal-chain row won, for the `face` trace.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GoalSource {
     Raw,
+    /// Row 5, an attack stop's [`FacingHold`].
+    Held,
     /// Row 7, the bearing to `UNIT_FIELD_TARGET`.
     Target,
     /// Row 9, the bearing to the local player from the interaction NPC.
@@ -69,6 +88,7 @@ impl GoalSource {
     fn tag(self) -> &'static str {
         match self {
             Self::Raw => "raw",
+            Self::Held => "held",
             Self::Target => "target",
             Self::Interact => "interact",
         }
@@ -94,8 +114,43 @@ pub(in crate::net) fn resolve_facing(
     }
 }
 
+/// A finished walk's final facing (`0x6eb0b0`'s done branch), resolved where the walk ended and
+/// handed to [`drive_display_facing`] as the raw goal it turns toward.
+#[derive(Component)]
+#[component(storage = "SparseSet")]
+pub(crate) struct WalkEndFacing(pub(crate) MonsterMoveFacing);
+
+/// Sets each finished walk's raw facing: an angle as is, a point or a unit as the bearing to it; a
+/// target not streamed in leaves the facing alone, as the reference's lookup miss does.
+pub(crate) fn apply_walk_end_facing(
+    mut commands: Commands,
+    index: Res<GuidIndex>,
+    ends: Query<(Entity, &WalkEndFacing)>,
+    transforms: Query<&Transform>,
+) {
+    for (e, end) in &ends {
+        commands.entity(e).try_remove::<WalkEndFacing>();
+        let Ok(t) = transforms.get(e) else {
+            continue;
+        };
+        let target = |g: u64| {
+            index
+                .0
+                .get(&g)
+                .and_then(|&te| transforms.get(te).ok())
+                .map(|t| bevy_to_wow(t.translation))
+        };
+        if let Some(wire) = resolve_facing(end.0, bevy_to_wow(t.translation), target) {
+            commands.entity(e).try_insert(DisplayFacing {
+                wire: wire.rem_euclid(std::f32::consts::TAU),
+                hist: [0.0; 4],
+            });
+        }
+    }
+}
+
 /// The horizontal bearing from `from` to `to`, `None` when they coincide.
-fn bearing(from: [f32; 3], to: [f32; 3]) -> Option<f32> {
+pub(crate) fn bearing(from: [f32; 3], to: [f32; 3]) -> Option<f32> {
     let (dx, dy) = (to[0] - from[0], to[1] - from[1]);
     (dx * dx + dy * dy >= 1.0e-4).then(|| dy.atan2(dx))
 }
@@ -154,14 +209,15 @@ fn filter_step(cur: f32, goal: f32, hist: &mut [f32; 4]) -> f32 {
 /// | 2 | `standState != 0` | raw |
 /// | 3 | a state emote lacking [`EMOTE_PERMITS_FACING`] | raw |
 /// | 4 | [`UNIT_FLAG_STUNNED`] | raw |
-/// | 5 | the combat override `+0xc58 & 1` to `+0xcac` | not built |
+/// | 5 | an attack stop's hold, `+0xa30 & 1` (`0x7360eb`) | [`FacingHold`]'s bearing |
 /// | 6 | a remote player | raw, excluded by [`RemoteMotion`] |
 /// | 7 | `UNIT_FIELD_TARGET` resolves | bearing to that unit |
 /// | 9 | this unit is the interaction NPC | bearing to the local player |
 /// | - | none of the above | raw |
 ///
 /// No range, line-of-sight, faction or alive test is on this path; the window's own range close
-/// is the only leash.
+/// is the only leash. Deviation: a remote player's facing is the remote interp's, so row 5 never
+/// reaches one; a server sets the hold for none on AzerothCore.
 #[allow(clippy::type_complexity)] // one Bevy system's full input set
 pub(crate) fn drive_display_facing(
     mut commands: Commands,
@@ -178,6 +234,8 @@ pub(crate) fn drive_display_facing(
             Without<RemoteMotion>,
             Without<ActiveMover>,
             Without<benilla_world::rig_anim::AnimParked>,
+            // A fading model's transform is detached (`0x783630`).
+            Without<benilla_world::model_fade::DespawnFade>,
         ),
     >,
     self_q: Query<Entity, With<SelfPlayer>>,
@@ -187,7 +245,17 @@ pub(crate) fn drive_display_facing(
     latched: Query<Entity, (With<FacingStep>, Without<RemoteMotion>)>,
     // A unit that starts moving drops its state, so the next seed reads the pose it stops at.
     ungoverned: Query<Entity, (With<DisplayFacing>, Or<(With<Spline>, With<RemoteMotion>)>)>,
+    mut holds: Query<(Entity, &ObjectStore, &mut FacingHold)>,
 ) {
+    for (e, store, mut hold) in &mut holds {
+        match store.0.unit_health() {
+            Some(0) => hold.died = true,
+            Some(_) if hold.died => {
+                commands.entity(e).remove::<FacingHold>();
+            }
+            _ => {}
+        }
+    }
     let self_pos = self_q
         .iter()
         .next()
@@ -211,6 +279,13 @@ pub(crate) fn drive_display_facing(
         {
             goals.push((e, None, GoalSource::Raw));
             continue;
+        }
+        // Row 5.
+        if let Ok((_, _, hold)) = holds.get(e) {
+            if !hold.died {
+                goals.push((e, Some(hold.yaw), GoalSource::Held));
+                continue;
+            }
         }
         let Ok(unit_t) = transforms.get(e) else {
             continue;
@@ -246,7 +321,7 @@ pub(crate) fn drive_display_facing(
         let Ok(mut state) = facings.get_mut(e) else {
             // First frame governed: the transform still holds the wire's facing, so seed from it
             // with a clean ring.
-            commands.entity(e).insert(DisplayFacing {
+            commands.entity(e).try_insert(DisplayFacing {
                 wire: cur,
                 hist: [0.0; 4],
             });
@@ -381,6 +456,55 @@ mod tests {
             !emote_suppresses_facing(7, |_| Some(EMOTE_PERMITS_FACING)),
             "the bit permits the facing"
         );
+    }
+
+    /// A finished walk's final facing is the pump's raw goal: an angle as is, a unit as the
+    /// bearing to it, turned toward rather than snapped.
+    #[test]
+    fn a_walk_end_facing_becomes_the_raw_goal() {
+        let mut app = App::new();
+        app.init_resource::<GuidIndex>().add_systems(
+            Update,
+            (apply_walk_end_facing, drive_display_facing).chain(),
+        );
+        let unit = |app: &mut App, facing| {
+            app.world_mut()
+                .spawn((
+                    NetEntity {
+                        kind: EntityKind::Unit,
+                        display_id: None,
+                        scale: 1.0,
+                    },
+                    ObjectStore::default(),
+                    Transform::default(),
+                    WalkEndFacing(facing),
+                ))
+                .id()
+        };
+        let angled = unit(&mut app, MonsterMoveFacing::Angle(FRAC_PI_2));
+        let target = app
+            .world_mut()
+            .spawn(Transform::from_translation(wow_to_bevy([0.0, -5.0, 0.0])))
+            .id();
+        app.world_mut()
+            .resource_mut::<GuidIndex>()
+            .0
+            .insert(0x42, target);
+        let facing_it = unit(&mut app, MonsterMoveFacing::Target(0x42));
+        app.update();
+        let wire =
+            |app: &App, e: Entity| app.world().entity(e).get::<DisplayFacing>().unwrap().wire;
+        assert!((wire(&app, angled) - FRAC_PI_2).abs() < 1e-6);
+        assert!((wire(&app, facing_it) - 1.5 * PI).abs() < 1e-5, "due -y");
+        let yaw = |app: &App, e: Entity| {
+            yaw_of(app.world().entity(e).get::<Transform>().unwrap().rotation)
+        };
+        let first = yaw(&app, angled);
+        assert!(
+            first > 0.0 && first < FRAC_PI_2,
+            "the pump turns part way, no snap: {first}"
+        );
+        assert!(app.world().entity(angled).get::<WalkEndFacing>().is_none());
     }
 
     #[test]
@@ -649,5 +773,60 @@ mod tests {
         assert!(bearing([1.0, 2.0, 3.0], [1.0, 2.0, 9.0]).is_none());
         let b = bearing([0.0, 0.0, 0.0], [1.0, 1.0, 0.0]).expect("a real bearing");
         assert!((b - std::f32::consts::FRAC_PI_4).abs() < 1.0e-5, "{b}");
+    }
+
+    /// Row 5 (`0x7360eb`): an attack stop's hold outranks the target row and stays until the
+    /// unit comes back to life (`0x73d536`).
+    #[test]
+    fn an_attack_stop_hold_outranks_the_target_until_the_unit_lives_again() {
+        use benilla_protocol::field::FIELD_UNIT_HEALTH;
+        let mut app = App::new();
+        app.init_resource::<GuidIndex>()
+            .add_systems(Update, drive_display_facing);
+        let health = |hp: u32| {
+            ObjectStore(benilla_protocol::ObjectFields::from_pairs(&[(
+                FIELD_UNIT_HEALTH,
+                hp,
+            )]))
+        };
+        let unit = app
+            .world_mut()
+            .spawn((
+                NetEntity {
+                    kind: EntityKind::Unit,
+                    display_id: None,
+                    scale: 1.0,
+                },
+                health(100),
+                Transform::default(),
+                FacingHold::new(FRAC_PI_2),
+            ))
+            .id();
+        for _ in 0..16 {
+            app.update();
+        }
+        let yaw = |app: &App| {
+            yaw_of(
+                app.world()
+                    .entity(unit)
+                    .get::<Transform>()
+                    .unwrap()
+                    .rotation,
+            )
+        };
+        assert!((yaw(&app) - FRAC_PI_2).abs() < 1e-4, "held: {}", yaw(&app));
+        app.world_mut().entity_mut(unit).insert(health(0));
+        app.update();
+        assert!(
+            app.world().entity(unit).contains::<FacingHold>(),
+            "death keeps it"
+        );
+        app.world_mut().entity_mut(unit).insert(health(1));
+        app.update();
+        app.update();
+        assert!(
+            !app.world().entity(unit).contains::<FacingHold>(),
+            "life releases it"
+        );
     }
 }

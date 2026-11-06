@@ -64,7 +64,6 @@ pub(crate) mod id {
     pub(crate) const WELCOME: u32 = 0x29;
     pub(crate) const RANGED_WEAPONS: u32 = 0x2b;
     pub(crate) const RAID_GROUPS: u32 = 0x2d;
-    pub(crate) const MEETING_STONES: u32 = 0x2e;
     pub(crate) const BATTLEGROUND_QUEUE: u32 = 0x2f;
     pub(crate) const PORT_TO_BATTLEGROUND: u32 = 0x30;
     pub(crate) const KEYRINGS: u32 = 0x31;
@@ -72,18 +71,27 @@ pub(crate) mod id {
     pub(crate) const THREAT: u32 = 0x35;
 }
 
-/// The level-gated arm of the `SMSG_LEVELUP_INFO` handler: in the handler's own order, each fires
-/// when the new level is at least its threshold.
-const LEVEL_TRIGGERS: [(u32, u32); 8] = [
-    (3, 0x16),  // Chatting
-    (4, 0x0d),  // Trainers
-    (4, 0x02),  // Cameras
-    (5, 0x26),  // Groups
-    (7, 0x15),  // Friends
-    (7, 0x25),  // Professions
-    (8, 0x20),  // Jumping
-    (10, 0x0c), // Learning Talents
+/// The level-gated arm of the `SMSG_LEVELUP_INFO` handler (`0x6e35d2`): in the handler's own
+/// order, each fires when the packet's level is at least its threshold.
+const LEVEL_TRIGGERS: [(u32, u32); 9] = [
+    (2, 0x36),
+    (4, 0x0d),
+    (6, 0x16),
+    (7, 0x15),
+    (7, 0x25),
+    (8, 0x20),
+    (10, 0x0c),
+    (12, 0x26),
+    (15, 0x32),
 ];
+
+/// The tutorials a level-up packet for `level` triggers, in the handler's order.
+pub(crate) fn level_triggers(level: u32) -> impl Iterator<Item = u32> {
+    LEVEL_TRIGGERS
+        .into_iter()
+        .filter(move |&(threshold, _)| level >= threshold)
+        .map(|(_, id)| id)
+}
 
 /// The Targeting popup's delay at its one site.
 pub(crate) const TARGETING_DELAY_MS: u32 = 10_000;
@@ -143,6 +151,8 @@ pub(crate) struct Tutorials {
     pushes: Vec<(u32, u8, u32)>,
     /// `showTutorials` off: a trigger flags its tutorial seen, with no popup (`0x530871`).
     muted: bool,
+    /// The completed list (`0xbd19f0`), `id + 1` each in completion order, sixty at most.
+    completed: Vec<u32>,
 }
 
 impl Tutorials {
@@ -209,6 +219,9 @@ impl Tutorials {
         if let Some(bank_a) = self.fire_once.as_mut() {
             set_bank_bit(bank_a, id);
         }
+        if !self.completed.contains(&(id + 1)) && self.completed.len() < 60 {
+            self.completed.push(id + 1);
+        }
         self.sends.push(TutorialSend::Flag(id));
     }
 
@@ -232,6 +245,7 @@ impl Tutorials {
         {
             bank.iter_mut().for_each(|b| *b = 0);
         }
+        self.completed.clear();
         self.sends.push(TutorialSend::Reset);
     }
 
@@ -271,11 +285,10 @@ impl Tutorials {
     }
 }
 
-/// The self descriptor's last-seen fields, for the edge-triggered sites: the level-up arm, the
-/// ghost flag, the resting flag, the PvP flag, the rest state.
+/// The self descriptor's last-seen fields, for the edge-triggered sites: the ghost flag, the
+/// resting flag, the PvP flag, the rest state.
 #[derive(Default)]
 struct SelfWatch {
-    level: Option<u32>,
     player_flags: Option<u32>,
     unit_flags: Option<u32>,
     rest_state: Option<u8>,
@@ -305,6 +318,7 @@ fn feed_tutorials(
     items: Res<crate::items::Items>,
     mut sounds: ResMut<crate::sound::MessageSounds>,
     mut told: Local<crate::ui_script::VmMemo<Option<Vec<u8>>>>,
+    mut told_completed: Local<crate::ui_script::VmMemo<Vec<u32>>>,
 ) {
     let now = Instant::now();
     for ask in asks.read() {
@@ -356,10 +370,14 @@ fn feed_tutorials(
         told.clone_from(&tutorials.acknowledged);
         script.set_tutorial_bank(tutorials.acknowledged.clone());
     }
+    let told_completed = told_completed.get(&script);
+    if *told_completed != tutorials.completed {
+        told_completed.clone_from(&tutorials.completed);
+        script.set_tutorials_completed(tutorials.completed.clone());
+    }
 }
 
-/// The self descriptor's edge sites: the `SMSG_LEVELUP_INFO` arm on the level rising, the ghost and
-/// resting flags, the PvP flag, the rested table's one live row, and the mover entering water. Each
+/// The self descriptor's edge sites: the ghost and resting flags, the PvP flag, the rested table's one live row, and the mover entering water. Each
 /// fires on a change, never on the login descriptor; the bring-up resets the memory.
 fn watch_self(
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
@@ -373,19 +391,9 @@ fn watch_self(
     }
     // The first sight of each field arms silently.
     if let Ok(store) = self_q.single() {
-        let level = store.0.unit_level();
         let player_flags = store.0.player_flags();
         let unit_flags = store.0.unit_flags();
         let rest_state = store.0.player_rest_state();
-        if let (Some(prev), Some(new)) = (watch.level, level) {
-            if new > prev {
-                for (threshold, id) in LEVEL_TRIGGERS {
-                    if new >= threshold {
-                        asks.write(TutorialEvent::trigger(id));
-                    }
-                }
-            }
-        }
         if let Some(prev) = watch.player_flags {
             let rose = |bit: u32| prev & bit == 0 && player_flags & bit != 0;
             if rose(PLAYER_FLAGS_GHOST) {
@@ -406,7 +414,6 @@ fn watch_self(
                 asks.write(TutorialEvent::trigger(id::RESTED));
             }
         }
-        watch.level = level;
         watch.player_flags = Some(player_flags);
         watch.unit_flags = Some(unit_flags);
         watch.rest_state = rest_state;
@@ -457,9 +464,15 @@ fn on_world_enter(
     mut entered: MessageReader<EnteredWorldMessage>,
     mut tutorials: ResMut<Tutorials>,
     mut cascade: ResMut<WorldEnterCascade>,
+    cvars: Option<Res<crate::cvars::Cvars>>,
 ) {
     for e in entered.read() {
         tutorials.world_enter();
+        // `0x5303a0`: the completed list comes back out of `flaggedTutorials`.
+        if let Some(value) = cvars.as_ref().and_then(|c| c.get("flaggedTutorials")) {
+            tutorials.completed = benilla_ui::script::decode_tracked(value);
+            tutorials.completed.truncate(60);
+        }
         if let Some(bytes) = &e.tutorial_flags {
             tutorials.apply_flags(bytes);
         }
@@ -572,8 +585,19 @@ fn watch_windows(
     watch.raid = Some(raid);
 }
 
-fn on_world_leave(mut tutorials: ResMut<Tutorials>, mut cascade: ResMut<WorldEnterCascade>) {
+fn on_world_leave(
+    mut tutorials: ResMut<Tutorials>,
+    mut cascade: ResMut<WorldEnterCascade>,
+    cvars: Option<ResMut<crate::cvars::Cvars>>,
+) {
     tutorials.world_leave();
+    // `0x530300`: the list goes back into `flaggedTutorials`.
+    if let Some(mut cvars) = cvars {
+        cvars.set(
+            "flaggedTutorials",
+            &benilla_ui::script::encode_tracked(&tutorials.completed),
+        );
+    }
     cascade.armed = false;
     cascade.entered_at = None;
 }
@@ -890,5 +914,17 @@ mod tests {
             app.world().resource::<Tutorials>().fired.is_empty(),
             "…and once there is an interface, it is published exactly once"
         );
+    }
+
+    /// The level-up packet's tutorials: every threshold at or below the level, in order.
+    #[test]
+    fn level_up_tutorials_follow_the_12340_thresholds() {
+        assert_eq!(level_triggers(1).count(), 0);
+        assert_eq!(level_triggers(2).collect::<Vec<_>>(), [0x36]);
+        assert_eq!(
+            level_triggers(10).collect::<Vec<_>>(),
+            [0x36, 0x0d, 0x16, 0x15, 0x25, 0x20, 0x0c]
+        );
+        assert_eq!(level_triggers(80).count(), 9);
     }
 }

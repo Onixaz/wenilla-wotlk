@@ -77,6 +77,7 @@ pub(crate) fn compose(
         | K::Loot
         | K::Money
         | K::Opening
+        | K::TargetIcons
         | K::Tradeskills
         | K::PetInfo
         | K::CombatXpGain
@@ -92,6 +93,8 @@ pub(crate) fn compose(
             &[Arg::S(&format!("|Hplayer:{0}|h[{0}]|h", event.sender))],
         ),
         // `format(CHAT_IGNORED, arg2)` and `format(CHAT_FILTERED, arg2)` (`:2766-2769`).
+        // `AddMessage(CHAT_RESTRICTED)` (`:2770-2771`).
+        K::Restricted => get("CHAT_RESTRICTED").unwrap_or_default(),
         K::Ignored => fill(
             &get("CHAT_IGNORED").unwrap_or_default(),
             &[Arg::S(&event.sender)],
@@ -239,7 +242,10 @@ pub(crate) fn compose_notice(
     kind: ChatEventKind,
     get: &dyn Fn(&str) -> Option<String>,
 ) -> Option<String> {
-    let token = notice_token(event.notice_byte()?, event.slot_state)?;
+    let token = match event.notice_byte() {
+        Some(byte) => notice_token(byte, event.slot_state, event.suspended)?,
+        None => event.text.as_str(),
+    };
     let template =
         get(&format!("CHAT_{token}_NOTICE_BN")).or_else(|| get(&format!("CHAT_{token}_NOTICE")))?;
     let number = Arg::D(i64::from(event.channel_number));

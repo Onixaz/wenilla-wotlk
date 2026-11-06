@@ -1446,10 +1446,10 @@ fn a_deepening_step_off_fall_never_becomes_a_jump() {
     }
 }
 
-/// A cast id is CLASS_A but not COMBAT, so a jump in place routes it full-body over the hang, and
-/// with no plays mid-arc the airborne freeze holds it until an edge.
+/// A cast id is in the upper set, so a jump in place splits it: the key bone plays it and the legs
+/// keep the jump.
 #[test]
-fn a_jump_in_place_cast_replaces_the_hang_and_survives_the_arc() {
+fn a_jump_in_place_cast_plays_on_the_key_bone_over_the_jump() {
     let mut app = app();
     let unit = jumper(&mut app);
     app.update(); // settle: Stand
@@ -1478,24 +1478,13 @@ fn a_jump_in_place_cast_replaces_the_hang_and_survives_the_arc() {
     }
     assert_eq!(
         drv(&app, unit).mode,
-        super::super::select::Mode::Swing {
-            id: 54,
-            under: Some(super::super::select::Special::Jump),
-        },
-        "the cast replaces the hang full-body — never dropped, never masked"
+        super::super::select::Mode::Entering(super::super::select::Special::Jump),
+        "the legs keep the jump"
     );
-    assert!(
-        drv(&app, unit).overlay.is_none(),
-        "no move bits, non-combat id: not the overlay route"
-    );
-    app.update();
-    app.update();
-    assert!(
-        matches!(
-            drv(&app, unit).mode,
-            super::super::select::Mode::Swing { id: 54, .. }
-        ),
-        "the airborne-freeze holds the one-shot through the arc"
+    assert_eq!(
+        drv(&app, unit).overlay.map(|o| o.id),
+        Some(54),
+        "a fall splits an upper-set id onto the key bone"
     );
 }
 
@@ -1531,10 +1520,10 @@ fn landing_mid_cast_plays_the_land_pick() {
     );
 }
 
-/// Fall(40) plays once, on the substep FALLINGFAR latches, so a cast armed after it holds bone 0
-/// until the landing pick.
+/// Fall(40) plays once, on the substep FALLINGFAR latches, and a cast armed in the fall splits: the
+/// key bone plays it and bone 0 keeps the loop until the landing pick.
 #[test]
-fn a_cast_over_the_fall_loop_holds_until_landing() {
+fn a_cast_over_the_fall_loop_takes_the_key_bone() {
     let mut app = app();
     let unit = jumper(&mut app);
     app.update();
@@ -1551,7 +1540,7 @@ fn a_cast_over_the_fall_loop_holds_until_landing() {
         via_player: false,
         remap_special: true,
     });
-    app.update(); // Swing { 54, under: Jump }
+    app.update();
     app.world_mut().entity_mut(unit).insert(MovementState {
         flags: move_flags::FALLING | move_flags::FALLING_FAR,
         vertical_speed: -5.0,
@@ -1562,7 +1551,7 @@ fn a_cast_over_the_fall_loop_holds_until_landing() {
     assert_eq!(
         mode(&app),
         super::super::select::Mode::Looping(super::super::select::Special::Fall),
-        "the latch's Fall play replaces the held cast"
+        "the latch's Fall play takes bone 0"
     );
     app.world_mut().write_message(EmoteAnim {
         entity: unit,
@@ -1572,29 +1561,20 @@ fn a_cast_over_the_fall_loop_holds_until_landing() {
         remap_special: true,
     });
     app.update();
-    assert!(
-        matches!(
-            mode(&app),
-            super::super::select::Mode::Swing {
-                id: 54,
-                under: Some(super::super::select::Special::Fall),
-                ..
-            }
-        ),
-        "the cast arms over the Fall loop"
+    assert_eq!(
+        mode(&app),
+        super::super::select::Mode::Looping(super::super::select::Special::Fall),
+        "the legs keep the Fall loop"
     );
-    app.update();
-    app.update();
-    assert!(
-        matches!(
-            mode(&app),
-            super::super::select::Mode::Swing {
-                id: 54,
-                under: Some(super::super::select::Special::Fall),
-                ..
-            }
-        ),
-        "the cast holds bone 0 through the fall — Fall plays only at its latch edge"
+    assert_eq!(
+        app.world()
+            .entity(unit)
+            .get::<AnimDriver>()
+            .unwrap()
+            .overlay
+            .map(|o| o.id),
+        Some(54),
+        "the cast takes the key bone"
     );
     app.world_mut()
         .entity_mut(unit)
@@ -1603,7 +1583,7 @@ fn a_cast_over_the_fall_loop_holds_until_landing() {
     assert_eq!(
         mode(&app),
         super::super::select::Mode::Land { id: 39, flags: 0 },
-        "the landing pick replaces the held cast"
+        "the landing pick ends the fall"
     );
 }
 
@@ -2379,6 +2359,45 @@ fn walk_rate(app: &App, unit: Entity) -> f32 {
         .animation(AnimationNodeIndex::new(2))
         .expect("the walk node is playing")
         .speed()
+}
+
+/// `0x7823e6`: a torn-down walker's detached model keeps animating its sequence, driven by no one.
+#[test]
+fn a_fading_walker_keeps_its_walk() {
+    use benilla_world::model_fade::DespawnFade;
+    let walking = MovementState {
+        flags: move_flags::FORWARD,
+        speed: 2.5,
+        ..Default::default()
+    };
+    let mut app = app();
+    let spawn = |app: &mut App| {
+        app.world_mut()
+            .spawn((
+                walker_model(),
+                AnimationPlayer::default(),
+                AnimationTransitions::new(),
+                AnimDriver::default(),
+                Transform::IDENTITY,
+                walking,
+            ))
+            .id()
+    };
+    let (fading, control) = (spawn(&mut app), spawn(&mut app));
+    app.update();
+    for unit in [fading, control] {
+        let mut unit = app.world_mut().entity_mut(unit);
+        unit.remove::<MovementState>();
+    }
+    app.world_mut()
+        .entity_mut(fading)
+        .insert(DespawnFade::default());
+    for _ in 0..4 {
+        advance(&mut app, 25);
+    }
+    let gait = |unit: Entity| app.world().entity(unit).get::<AnimDriver>().unwrap().gait;
+    assert_eq!(gait(fading), Some(4), "the walk plays on through the fade");
+    assert_eq!(gait(control), Some(0), "a live unit stops into Stand");
 }
 
 /// A Gordok Ogre-Mage (scale 2.2) walking at vmangos' `speed_walk` 1.6 × 2.5 = 4.0 yd/s cycles at
@@ -4043,9 +4062,9 @@ mod routing {
 
     const FIELD_MOUNTDISPLAYID: u16 = 133;
     const MOUNT: u16 = 91;
-    const PRAY: u16 = 75; // EmoteKneel, not CLASS_A
-    const CHEER: u16 = 68; // CLASS_A
-    const SHUFFLE: u16 = 12; // mount-set, not CLASS_A
+    const PRAY: u16 = 75; // EmoteKneel, in neither set
+    const CHEER: u16 = 68; // the upper set
+    const SHUFFLE: u16 = 12; // the full set, not the upper
     const EAT: u16 = 61;
 
     fn masked(anim_id: u16, node: u32, upper: u32) -> AnimClip {
@@ -4156,7 +4175,7 @@ mod routing {
         assert!(drv(&app, child).overlay.is_none());
         assert!(
             drv(&app, rider).overlay.is_none(),
-            "not CLASS_A: the rider idles"
+            "not the upper set: the rider idles"
         );
         assert_eq!(drv(&app, rider).active_anim(), Some(MOUNT));
     }
@@ -4226,7 +4245,7 @@ mod routing {
         assert_eq!(armed(&app), Some(CHEER), "the requested id, not clip 0");
     }
 
-    /// A mounted rider's mount-set emote is tested once, on the rider: an id the rider has armed
+    /// A mounted rider's full-set emote is tested once, on the rider: an id the rider has armed
     /// is not forwarded to the mount child.
     #[test]
     fn a_rider_armed_id_stops_the_forward_to_the_mount() {
@@ -4261,7 +4280,7 @@ mod routing {
         send(&mut app, false);
         assert!(
             matches!(child_mode(&app), Mode::Swing { id: SHUFFLE, .. }),
-            "the mount-set emote reaches the mount"
+            "the full-set emote reaches the mount"
         );
         app.world_mut()
             .entity_mut(child)
@@ -4970,4 +4989,89 @@ fn a_cast_during_the_latch_does_not_pick_its_kit_anim() {
     };
     assert_eq!(pick(0), Some(0));
     assert_eq!(pick(1), Some(51));
+}
+
+/// A synthetic creature model: Stand, the sit pose's three clips, and Birth when asked.
+fn spawner_model(birth: bool) -> ModelAnimations {
+    let mut clips = vec![
+        clip(0, 1, true),   // Stand
+        clip(96, 2, false), // SitGroundDown
+        clip(97, 3, true),  // SitGround
+        clip(98, 4, false), // SitGroundUp
+    ];
+    // The authored-id table `owns` reads (`0x825e00`).
+    let mut animation_lookup = vec![0xffff; 128];
+    for (slot, id) in [0usize, 96, 97, 98].into_iter().enumerate() {
+        animation_lookup[id] = slot as u16;
+    }
+    if birth {
+        clips.push(clip(127, 5, false));
+        animation_lookup[127] = 4;
+    }
+    ModelAnimations {
+        graph: Handle::default(),
+        clips,
+        hand_close: [None, None],
+        playable_animation_lookup: Vec::new(),
+        animation_lookup,
+        global_bones: Vec::new(),
+        first_seq: None,
+        pose: Default::default(),
+    }
+}
+
+fn spawner(app: &mut App, birth: bool, stand_state: u32, fresh: bool) -> Entity {
+    let mut e = app.world_mut().spawn((
+        spawner_model(birth),
+        AnimationPlayer::default(),
+        AnimationTransitions::new(),
+        AnimDriver::default(),
+        crate::net::ObjectStore(ObjectFields::from_pairs(&[
+            (benilla_protocol::field::FIELD_UNIT_HEALTH, 100),
+            (benilla_protocol::field::FIELD_UNIT_BYTES_1, stand_state),
+        ])),
+    ));
+    if fresh {
+        e.insert(crate::net::FreshSpawn);
+    }
+    e.id()
+}
+
+/// A CREATE_OBJECT2 creature whose model owns Birth plays it first (`0x716fe5`); the seed lasts
+/// one pass, and a plain create stands.
+#[test]
+fn a_create2_creature_streams_in_on_its_birth() {
+    use super::super::select::Mode;
+    let mut app = app();
+    let born = spawner(&mut app, true, 0, true);
+    let plain = spawner(&mut app, true, 0, false);
+    app.update();
+    let mode = |app: &App, e: Entity| app.world().entity(e).get::<AnimDriver>().unwrap().mode;
+    assert_eq!(
+        mode(&app, born),
+        Mode::Swing {
+            id: 127,
+            under: None
+        }
+    );
+    assert!(app
+        .world()
+        .entity(born)
+        .get::<crate::net::FreshSpawn>()
+        .is_none());
+    assert_eq!(mode(&app, plain), Mode::Gait, "a CREATE_OBJECT stands");
+}
+
+/// Without Birth, a CREATE_OBJECT2 sitter starts on its sit loop (`0x71e22a`, the seed past the
+/// last stand state); a CREATE_OBJECT one sits down first, its seed being Stand.
+#[test]
+fn a_create2_sitter_starts_on_its_loop_where_a_create_sits_down() {
+    use super::super::select::{Mode, Special};
+    let mut app = app();
+    let seeded = spawner(&mut app, false, 1, true);
+    let plain = spawner(&mut app, false, 1, false);
+    app.update();
+    let mode = |app: &App, e: Entity| app.world().entity(e).get::<AnimDriver>().unwrap().mode;
+    assert_eq!(mode(&app, seeded), Mode::Looping(Special::Pose(1)));
+    assert_eq!(mode(&app, plain), Mode::Entering(Special::Pose(1)));
 }

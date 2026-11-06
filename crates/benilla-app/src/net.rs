@@ -25,7 +25,9 @@ pub(crate) mod handlers;
 pub(crate) mod io;
 mod motion;
 mod objects;
+mod parked;
 pub(crate) use objects::tear_down;
+pub(crate) use parked::ParkedObjects;
 mod session;
 mod world;
 
@@ -40,10 +42,10 @@ use motion::{
     sample_splines,
 };
 // `pub(crate)`: `creature_anim` reads the shuffle latch it produces, and a test runs both.
-pub(crate) use motion::drive_display_facing;
+pub(crate) use motion::{apply_walk_end_facing, drive_display_facing, facing_bearing, FacingHold};
 pub(crate) use motion::{
     ground_derived, grounded_y, jump_seed, CreatureSwimming, FacingStep, RemoteMotion, Spline,
-    SplineStopped, UnitMoveModes,
+    SplineStopped, SwimFlyTransition, UnitMoveModes,
 };
 // Only the ground-census probe reads this, so a build without the instruments leaves it unused.
 // Not a `cfg`: seam knowledge lives in three fixed places, and this file is not one of them.
@@ -107,10 +109,12 @@ impl Plugin for NetPlugin {
             .insert_resource(LoginAbandon(handles.login_abandon))
             .insert_resource(PingShared(handles.ping))
             .init_resource::<GuidIndex>()
+            .init_resource::<ParkedObjects>()
             .init_resource::<SelfGuid>()
             .init_resource::<AddonInfoReply>()
             .init_resource::<AccountExpansion>()
             .init_resource::<PendingTransfer>()
+            .init_resource::<KickReason>()
             .init_resource::<NetStatus>()
             .init_resource::<DroppedOpcodes>()
             .init_resource::<ServerTime>()
@@ -169,6 +173,8 @@ impl Plugin for NetPlugin {
                     // Due relays fire before the extrapolator advances the fresh state.
                     drain_pending_moves,
                     extrapolate_remote_units,
+                    // A finished walk's final facing becomes the pump's raw goal.
+                    apply_walk_end_facing,
                     // After the movers, so a turn reads the goal's position this frame.
                     drive_display_facing,
                 )
@@ -252,12 +258,16 @@ fn population_pulse(index: Res<GuidIndex>, time: Res<Time>, mut last: Local<f32>
 
 // ── ECS state: components ────────────────────────────────────────────────────────────────────────
 
+// A component only streamed entities carry is a sparse set, past the spawn's own three (`Guid`,
+// `NetEntity`, `ObjectStore`): each dense one gained in a new order mints a table, an empty
+// table outlives every unit that made it, and every dense query walks them all.
+
 /// The server guid of a streamed entity.
 #[derive(Component, Clone, Copy)]
 pub(crate) struct Guid(pub(crate) u64);
 
 /// A streamed entity's kind and display id, from which [`crate::entities`] builds its visual.
-#[derive(Component)]
+#[derive(Component, Clone, Copy)]
 pub(crate) struct NetEntity {
     pub(crate) kind: EntityKind,
     pub(crate) display_id: Option<u32>,
@@ -267,9 +277,16 @@ pub(crate) struct NetEntity {
     pub(crate) scale: f32,
 }
 
+/// A `CREATE_OBJECT2` creature or GameObject: the bool the reference's init takes, read once by its
+/// first animation pass (`0x740054`, `0x70c370`).
+#[derive(Component)]
+#[component(storage = "SparseSet")]
+pub(crate) struct FreshSpawn;
+
 /// A unit's movement speeds (yd/s) from its `LIVING` movement block. The animation selector runs
 /// above 2x `walk`.
 #[derive(Component, Clone, Copy)]
+#[component(storage = "SparseSet")]
 pub(crate) struct UnitSpeeds(pub(crate) MoveSpeeds);
 
 /// A mover's speed from its move flags, as the movement object's current-speed getter picks it.
@@ -424,6 +441,7 @@ pub(crate) fn apply_fields_for_test(world: &mut World, entity: Entity, delta: Ob
 
 /// Our own character's entity (guid == [`SelfGuid`]): identity, not what we steer ([`Embodied`]).
 #[derive(Component)]
+#[component(storage = "SparseSet")]
 pub(crate) struct SelfPlayer;
 
 /// The body this client is attached to: the reference's camera anchor (`camera+0x88`), written only
@@ -434,6 +452,7 @@ pub(crate) struct SelfPlayer;
 /// `MSG_MOVE_*` carry no guid, so a fallback to our body would write our pose onto the creature.
 /// Whether it may move is [`ActiveMover`]. [`crate::player`] owns the placement.
 #[derive(Component)]
+#[component(storage = "SparseSet")]
 pub(crate) struct Embodied;
 
 /// The unit this client authors motion for: the reference's active-mover global (written only by
@@ -443,6 +462,7 @@ pub(crate) struct Embodied;
 /// The server-replay lanes filter `Without<ActiveMover>`, not `Without<Embodied>`, so a body we
 /// are attached to but lost control of still follows the server.
 #[derive(Component)]
+#[component(storage = "SparseSet")]
 pub(crate) struct ActiveMover;
 
 // ── ECS state: resources ─────────────────────────────────────────────────────────────────────────
@@ -562,6 +582,12 @@ pub(crate) enum CharRequest {
     AccountDataReady,
     /// An account-data request or upload from the character screen ([`crate::account_data`]).
     AccountData(crate::account_data::Wire),
+    /// `RequestRealmSplitInfo` (`0xFFFFFFFF`) or `SetRealmSplitState`: `CMSG_REALM_SPLIT`, whose
+    /// answer the park reads and hands on.
+    RealmSplit(u32),
+    /// A paid character service (rename, customize, race or faction change, declension): the
+    /// request, whose answer the park reads and hands on.
+    Service { opcode: u16, body: Vec<u8> },
     /// A barrier: answered once every request before it is on the wire.
     Flush(crossbeam_channel::Sender<()>),
 }
@@ -701,9 +727,17 @@ pub(crate) struct DropTally {
     pub(crate) unparseable: u64,
 }
 
-/// The in-game clock (`SMSG_LOGIN_SETTIMESPEED`), advanced by its timescale.
-#[derive(Resource, Default)]
-pub(crate) struct ServerTime(pub(crate) Option<GameTime>);
+/// The in-game clock (`SMSG_LOGIN_SETTIMESPEED`), advanced by its timescale, and the speed a
+/// clock set later runs at: 12340's clock holds a speed before any time, 1/60 from its
+/// constructor (`0x76d608`).
+#[derive(Resource)]
+pub(crate) struct ServerTime(pub(crate) Option<GameTime>, pub(crate) f32);
+
+impl Default for ServerTime {
+    fn default() -> Self {
+        Self(None, GameTime::MIN_SPEED)
+    }
+}
 
 /// Publish the session clock into [`benilla_world::lighting::WorldTime`] each frame; with no
 /// server, its default (noon).
@@ -724,9 +758,10 @@ pub(crate) fn publish_world_time(
 
 /// The server's unix wall clock (`SMSG_QUERY_TIME_RESPONSE`), advanced monotonically. Descriptor
 /// deadlines are absolute server stamps (a timed quest's is `time(nullptr) + limitTime`, vmangos
-/// `Player::AddQuest`), so a countdown reads this, never the local clock.
+/// `Player::AddQuest`), so a countdown reads this, never the local clock. `answers` counts the
+/// responses, each owing a `QUEST_LOG_UPDATE` (`0x5dff89`).
 #[derive(Resource, Default)]
-pub(crate) struct ServerWallClock(pub(crate) Option<WallClockSample>);
+pub(crate) struct ServerWallClock(pub(crate) Option<WallClockSample>, pub(crate) u64);
 
 /// One `SMSG_QUERY_TIME_RESPONSE` sample and the monotonic instant it arrived.
 #[derive(Debug, Clone, Copy)]
@@ -736,16 +771,23 @@ pub(crate) struct WallClockSample {
     /// The seconds to the daily quest reset at `received`.
     reset_in: u32,
     received: Instant,
+    /// When the next `CMSG_QUERY_TIME` goes out.
+    ask_at: Instant,
 }
 
 impl ServerWallClock {
-    /// Take a fresh sample; it reads about RTT/2 behind, below a countdown's one-second grain.
+    /// Take a fresh sample; it reads about RTT/2 behind, below a countdown's one-second grain. The
+    /// re-ask is armed at the earlier of an hour and the reset (`0x5dff6a`-`0x5dff7e`).
     pub(crate) fn sample(&mut self, unix_time: u32, reset_in: u32) {
+        let received = Instant::now();
+        let wait = RESYNC_AFTER.min(Duration::from_secs(u64::from(reset_in)));
         self.0 = Some(WallClockSample {
             base_unix: unix_time,
             reset_in,
-            received: Instant::now(),
+            received,
+            ask_at: received + wait,
         });
+        self.1 += 1;
     }
 
     /// The daily quest reset in server unix seconds, as the sample placed it.
@@ -760,31 +802,33 @@ impl ServerWallClock {
             .map(|s| f64::from(s.base_unix) + s.received.elapsed().as_secs_f64())
     }
 
-    fn stale(&self) -> bool {
-        self.0.is_none_or(|s| s.received.elapsed() >= RESYNC_AFTER)
+    /// Whether the last answer's re-ask is due (`0x5e6d71`).
+    fn ask_due(&self, now: Instant) -> bool {
+        self.0.is_some_and(|s| now >= s.ask_at)
     }
 }
 
 /// The wall-clock resync interval: the reference re-asks after an hour (armed `now + 0xe10`).
 const RESYNC_AFTER: Duration = Duration::from_secs(3600);
 
-/// Ask for the server's wall clock at each world-enter cascade and hourly after, which tracks a
-/// server re-clocked under us.
+/// Ask for the server's wall clock at each world-enter cascade, then whenever the last answer's
+/// re-ask falls due, which tracks a server re-clocked under us and the daily reset.
 pub(crate) fn send_query_time(
     mut cascades: MessageReader<WorldEnterCascadeMessage>,
     commands: Res<NetCommands>,
     clock: Res<ServerWallClock>,
     status: Res<NetStatus>,
-    mut asked_at: Local<Option<Instant>>,
     mut seated: Local<bool>,
+    // The answer whose re-ask went out: the send disarms it until the next answer (`0x5e6daa`).
+    mut spent: Local<u64>,
 ) {
     let entering = cascades.read().next().is_some();
     // `connected` rises at `CMSG_PLAYER_LOGIN`, before the server seats us, so the resync waits
     // for the first cascade; a logout or a disconnect clears `connected` and so the wait re-arms.
     *seated = status.connected && (*seated || entering);
-    let due = *seated && clock.stale() && asked_at.is_none_or(|t| t.elapsed() >= RESYNC_AFTER);
+    let due = *seated && *spent != clock.1 && clock.ask_due(Instant::now());
     if entering || due {
-        *asked_at = Some(Instant::now());
+        *spent = clock.1;
         let _ = commands.0.send(ClientCommand::QueryTime);
     }
 }
@@ -845,19 +889,54 @@ pub(crate) struct GameTime {
     base_day: u32,
     timescale: f32,
     received: Instant,
+    /// Game minutes the clock had already run at `received`, at the speeds before this one.
+    carried: f64,
     /// The packed date and clock at `received`, the client game clock's seed (`0x7e28e0`).
     base: benilla_ui::script::WowTime,
 }
 
 impl GameTime {
+    /// The speed bounds every speed is clamped to (`0x76cfa0`: `0xa393e4`, `0xa393e0`).
+    pub(crate) const MIN_SPEED: f32 = 1.0 / 60.0;
+    pub(crate) const MAX_SPEED: f32 = 60.0;
+
     pub(crate) fn new(hours: u8, minutes: u8, day_serial: u32, timescale: f32) -> Self {
         Self {
             base_minute: hours as u32 * 60 + minutes as u32,
             base_day: day_serial,
-            timescale,
+            timescale: timescale.clamp(Self::MIN_SPEED, Self::MAX_SPEED),
             received: Instant::now(),
+            carried: 0.0,
             base: benilla_ui::script::WowTime::default(),
         }
+    }
+
+    pub(crate) fn timescale(&self) -> f32 {
+        self.timescale
+    }
+
+    /// Run on at `timescale` from the current time, as `SMSG_GAMESPEED_SET` sets the speed alone
+    /// (`0x7e2893`).
+    pub(crate) fn set_timescale(&mut self, timescale: f32) {
+        self.carried = self.elapsed_minutes();
+        self.received = Instant::now();
+        self.timescale = timescale.clamp(Self::MIN_SPEED, Self::MAX_SPEED);
+    }
+
+    /// `SMSG_GAMETIME_UPDATE`'s sync to `next` (`0x76d9a0`, not forced): a clock behind takes its
+    /// time, one ahead takes it run on by the whole minutes it leads, within a day.
+    pub(crate) fn synced(&self, mut next: GameTime) -> GameTime {
+        let now = i64::from(self.base_day) * 1440
+            + i64::from(self.base_minute)
+            + self.elapsed_minutes().floor() as i64;
+        let then = i64::from(next.base_day) * 1440 + i64::from(next.base_minute);
+        next.carried = ((now - then) % 1440).max(0) as f64;
+        next
+    }
+
+    /// Game minutes run since the seed.
+    fn elapsed_minutes(&self) -> f64 {
+        self.carried + self.received.elapsed().as_secs_f64() * f64::from(self.timescale)
     }
 
     /// Seat the packed date and the zone offset the calendar reads.
@@ -872,9 +951,8 @@ impl GameTime {
     /// The client game clock: the seed advanced a minute per elapsed game minute, its date carried
     /// across midnight (`0x76d740`).
     pub(crate) fn calendar_now(&self) -> benilla_ui::script::WowTime {
-        let elapsed = self.received.elapsed().as_secs_f64() * f64::from(self.timescale);
         let mut now = self.base;
-        now.add_minutes(elapsed.floor() as i32);
+        now.add_minutes(self.elapsed_minutes().floor() as i32);
         now
     }
 
@@ -885,8 +963,7 @@ impl GameTime {
 
     /// Current fractional minute of the game day, so the sky bodies move without steps.
     pub(crate) fn minute_of_day_f32(&self) -> f32 {
-        let elapsed = self.received.elapsed().as_secs_f32() * self.timescale;
-        (self.base_minute as f32 + elapsed).rem_euclid(1440.0)
+        (f64::from(self.base_minute) + self.elapsed_minutes()).rem_euclid(1440.0) as f32
     }
 
     /// Today's game date as the packed fields hold it: 0-based month and day, years since 2000.
@@ -899,8 +976,7 @@ impl GameTime {
     /// Days and day fraction since the serial epoch, unwrapped, for the moon phase
     /// `(dayCounter + todPhase) mod 1.7`; `f64` for sub-minute grain at ~12k days.
     pub(crate) fn day_continuous(&self) -> f64 {
-        let elapsed = self.received.elapsed().as_secs_f64() * self.timescale as f64;
-        self.base_day as f64 + (self.base_minute as f64 + elapsed) / 1440.0
+        f64::from(self.base_day) + (f64::from(self.base_minute) + self.elapsed_minutes()) / 1440.0
     }
 }
 
@@ -992,6 +1068,8 @@ pub(crate) enum ChatKind {
     Whisper,
     /// `/p`, dropped silently when ungrouped (`ChatHandler.cpp:472-493`).
     Party,
+    /// `/p` from the party leader (`0x50d516`), every member's `CHAT_MSG_PARTY_LEADER`.
+    PartyLeader,
     /// `/ra`; needs a raid (`ChatHandler.cpp:514-536`).
     Raid,
     /// `/rl`, leader only (`ChatHandler.cpp:538-559`).
@@ -1024,6 +1102,7 @@ impl ChatKind {
             Self::Emote => m::CHAT_TYPE_EMOTE,
             Self::Whisper => m::CHAT_TYPE_WHISPER,
             Self::Party => m::CHAT_TYPE_PARTY,
+            Self::PartyLeader => m::CHAT_TYPE_PARTY_LEADER,
             Self::Raid => m::CHAT_TYPE_RAID,
             Self::RaidWarning => m::CHAT_TYPE_RAID_WARNING,
             Self::Guild => m::CHAT_TYPE_GUILD,
@@ -1304,9 +1383,11 @@ pub(crate) enum ClientCommand {
     Emote {
         emote_id: u32,
     },
-    /// `CMSG_TEXT_EMOTE`; our own sound and animation ride the `SMSG_TEXT_EMOTE` echo.
+    /// `CMSG_TEXT_EMOTE`; our own sound and animation ride the `SMSG_TEXT_EMOTE` echo, which brings
+    /// `file_index` back.
     TextEmote {
         text_id: u32,
+        file_index: i32,
         target: u64,
     },
     /// `CMSG_CAST_SPELL`; `None` is a self or implicit target.
@@ -1414,6 +1495,8 @@ pub(crate) enum ClientCommand {
         pet_guid: u64,
         name: String,
     },
+    /// `CMSG_REQUEST_PET_INFO`: the world-enter ask while we hold a charm or summon.
+    RequestPetInfo,
     /// `CMSG_ATTACKSWING`; echoed as `SMSG_ATTACKSTART`.
     AttackSwing {
         guid: u64,
@@ -1522,14 +1605,27 @@ pub(crate) enum ClientCommand {
     GmTicketDelete,
     /// `CMSG_GMTICKET_SYSTEMSTATUS`: `GetGMStatus()`.
     GmTicketSystemStatus,
+    /// `CMSG_GM_REPORT_LAG`: `GMReportLag(type)` from `map`/`pos` where we stand.
+    GmReportLag {
+        kind: u32,
+        map: u32,
+        pos: [f32; 3],
+    },
+    /// `CMSG_GMSURVEY_SUBMIT`: `GMSurveySubmit()`.
+    GmSurveySubmit {
+        survey: u32,
+        answers: Vec<(u32, u8, String)>,
+        comment: String,
+    },
     /// `CMSG_BINDER_ACTIVATE`, the `CONFIRM_BINDER` Accept: the only packet in the flow that
     /// binds. Declining sends nothing.
     BinderActivate {
         binder: u64,
     },
-    /// `CMSG_SUMMON_RESPONSE`, the `CONFIRM_SUMMON` Accept; there is no decline opcode.
+    /// `CMSG_SUMMON_RESPONSE`: the `CONFIRM_SUMMON` answer, `agree` for Accept.
     SummonResponse {
         summoner: u64,
+        agree: bool,
     },
     /// `MSG_TALENT_WIPE_CONFIRM`, the `CONFIRM_TALENT_WIPE` Accept: the only packet in the flow
     /// that resets. Declining sends nothing.
@@ -1565,12 +1661,6 @@ pub(crate) enum ClientCommand {
     BattlefieldMgr(benilla_ui::script::BattlefieldMgrRequest),
     /// An arena-team send.
     ArenaTeam(ArenaTeamCommand),
-    /// A meeting stone right-click past the client's four refusals: `CMSG 0x292`.
-    MeetingStoneJoin {
-        go_guid: u64,
-    },
-    /// `CancelMeetingStoneRequest()`: `CMSG 0x293`.
-    MeetingStoneLeave,
     /// A dungeon finder send, queued by its verb or the world-enter cascade.
     Lfg(benilla_ui::script::LfgRequest),
     /// A calendar send, as its 12340 sender writes it.
@@ -1780,6 +1870,10 @@ pub(crate) enum ClientCommand {
         spell_id: u32,
         item_guid: u64,
     },
+    /// A cast at the trade window's not-traded slot (`TARGET_FLAG_TRADE_ITEM`).
+    CastSpellTradeItem {
+        spell_id: u32,
+    },
     /// A glyph-socket cast from the book (`TARGET_FLAG_GLYPH_SLOT`, no payload).
     CastSpellGlyph {
         spell_id: u32,
@@ -1920,6 +2014,57 @@ pub(crate) enum ClientCommand {
         mailbox: u64,
         mail_id: u32,
         sender: u64,
+    },
+    /// `CMSG_SET_TAXI_BENCHMARK_MODE`: `SetTaxiBenchmarkMode(on)`.
+    SetTaxiBenchmarkMode {
+        on: bool,
+    },
+    /// `CMSG_SKILL_BUY_RANK`: `AcceptSkillUps()`.
+    SkillBuyRank {
+        lines: Vec<(u32, u32)>,
+    },
+    /// `CMSG_SKILL_BUY_STEP`: `BuySkillTier(index)`.
+    SkillBuyStep {
+        line: u32,
+    },
+    /// `CMSG_CANCEL_TEMP_ENCHANTMENT`: `CancelItemTempEnchantment(slot)`.
+    CancelTempEnchantment {
+        slot: u32,
+    },
+    /// `CMSG_AUTOEQUIP_ITEM_SLOT`: `EquipItemByName(item, slot)`.
+    AutoEquipItemSlot {
+        item: u64,
+        slot: u8,
+    },
+    /// `CMSG_GRANT_LEVEL`: `GrantLevel(unit)`.
+    GrantLevel {
+        friend: u64,
+    },
+    /// `CMSG_CHAT_CHANNEL_DECLINE_INVITE`: `DeclineInvite(channel)`.
+    DeclineChannelInvite {
+        name: String,
+    },
+    /// `CMSG_OPT_OUT_OF_LOOT`: `SetOptOutOfLoot(on)`.
+    OptOutOfLoot {
+        on: bool,
+    },
+    /// `CMSG_REPORT_PVP_AFK`: `ReportPlayerIsPVPAFK(unit)`.
+    ReportPvpAfk {
+        guid: u64,
+    },
+    /// `CMSG_COMPLAIN` about a chat line's sender.
+    ComplainChat {
+        sender: u64,
+        sender_word: u32,
+        chat_type: u32,
+        zone_channel: u32,
+        age_secs: u32,
+        description: String,
+    },
+    /// `CMSG_COMPLAIN` about a mail's sender.
+    ComplainMail {
+        sender: u64,
+        mail_id: u32,
     },
     /// `CMSG_MAIL_DELETE`, with a `mail_delete_reason`.
     MailDelete {
@@ -2165,6 +2310,8 @@ pub(crate) enum ClientCommand {
     Flush(crossbeam_channel::Sender<()>),
     /// `OpeningCinematic()`: `CMSG_OPENING_CINEMATIC`, empty.
     OpeningCinematic,
+    /// A movie's end: `CMSG_COMPLETE_MOVIE`, empty.
+    CompleteMovie,
     /// `CMSG_COMPLETE_CINEMATIC`, at the end or skip, or at once for an unresolvable trigger.
     /// Unacked, vmangos keeps visibility on the cinematic camera and nearby NPCs despawn.
     CompleteCinematic,
@@ -2278,6 +2425,8 @@ pub(crate) enum ClientCommand {
         icon: u8,
         guid: u64,
     },
+    /// `MSG_RAID_TARGET_UPDATE` with `0xff` alone: ask for the whole icon board.
+    RequestRaidTargets,
     /// `MSG_MINIMAP_PING`, raw world `(x, y)`. The server relays it to the rest of the group and
     /// ignores it solo, so our own marker is drawn locally.
     MinimapPing {
@@ -2314,6 +2463,8 @@ pub(crate) enum ClientCommand {
     },
     /// `MSG_RAID_READY_CHECK` with an empty body, leader only.
     ReadyCheckStart,
+    /// `MSG_RAID_READY_CHECK_FINISHED`: the initiator's check closed.
+    ReadyCheckFinish,
     /// `MSG_RAID_READY_CHECK` with one byte.
     ReadyCheckAnswer {
         ready: bool,
@@ -2420,6 +2571,8 @@ pub(crate) enum ClientCommand {
     GuildDecline,
     /// `CMSG_GUILD_INFO`: founding date and counts.
     GuildInfoRequest,
+    /// `MSG_GUILD_EVENT_LOG_QUERY`: the guild's event log.
+    GuildEventLogQuery,
     /// `MSG_GUILD_BANK_MONEY_WITHDRAWN`: today's remaining guild-bank withdrawal.
     GuildBankMoneyWithdrawnRequest,
     /// Any other guild bank send.
@@ -2679,6 +2832,8 @@ pub(crate) struct DisconnectedMessage {
     /// Decided once in [`Self::new`], so its four readers (teardown, screen, cover, credentials)
     /// cannot disagree.
     pub(crate) session_over: bool,
+    /// The last [`KickReason`], `DISCONNECTED_FROM_SERVER`'s argument.
+    pub(crate) kick_reason: u8,
 }
 
 impl DisconnectedMessage {
@@ -2693,6 +2848,7 @@ impl DisconnectedMessage {
             reason,
             end,
             session_over,
+            kick_reason: 0,
         }
     }
 }
@@ -2797,6 +2953,11 @@ pub(crate) struct WorldportMessage {
     pub(crate) transport_entry: Option<u32>,
 }
 
+/// `SMSG_KICK_REASON`'s reason (`[0xb6af98]`, `0x4d9572`), which every later disconnect reports
+/// as `DISCONNECTED_FROM_SERVER`'s argument (`0x4dab0c`); never cleared, as the reference's global.
+#[derive(Resource, Default)]
+pub(crate) struct KickReason(pub(crate) u8);
+
 /// The `SMSG_TRANSFER_PENDING` latch: whether the coming worldport rides a transport. Cleared
 /// on abort and disconnect.
 #[derive(Resource, Default)]
@@ -2836,8 +2997,8 @@ pub(crate) struct EmoteMessage {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EmoteKind {
-    /// An `EmotesText.dbc` id.
-    Text(u32),
+    /// An `EmotesText.dbc` id and the voice file the sender picked, `-1` the normal pick.
+    Text { text_id: u32, file_index: i32 },
     /// An `Emotes.dbc` id (its `EventSoundID`).
     Anim(u32),
 }
@@ -2869,6 +3030,48 @@ pub(crate) struct PetDismissSoundMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A clock that has run an hour.
+    fn clock_an_hour_in() -> GameTime {
+        let mut clock = GameTime::new(10, 0, 100, GameTime::MIN_SPEED);
+        clock.carried = 60.0;
+        clock
+    }
+
+    /// A new speed keeps the time the clock has reached and runs on from there.
+    #[test]
+    fn a_speed_change_keeps_the_current_time() {
+        let mut clock = clock_an_hour_in();
+        assert_eq!(clock.minute_of_day(), 11 * 60);
+        clock.set_timescale(0.5);
+        assert_eq!(clock.timescale(), 0.5);
+        assert_eq!(clock.minute_of_day(), 11 * 60);
+        assert!((clock.day_continuous() - (100.0 + 660.0 / 1440.0)).abs() < 1e-4);
+    }
+
+    /// Every speed lands in 12340's `[1/60, 60]` (`0x76cfa0`).
+    #[test]
+    fn a_speed_is_clamped_to_the_reference_bounds() {
+        assert_eq!(GameTime::new(0, 0, 0, 0.0).timescale(), GameTime::MIN_SPEED);
+        let mut clock = GameTime::new(0, 0, 0, 1000.0);
+        assert_eq!(clock.timescale(), GameTime::MAX_SPEED);
+        clock.set_timescale(-1.0);
+        assert_eq!(clock.timescale(), GameTime::MIN_SPEED);
+    }
+
+    /// A sync moves a clock forward to the packet, never back (`0x76d9a0`).
+    #[test]
+    fn a_sync_never_runs_the_clock_back() {
+        let clock = GameTime::new(14, 5, 100, GameTime::MIN_SPEED);
+        let at = |h, m, day| GameTime::new(h, m, day, GameTime::MIN_SPEED);
+        assert_eq!(clock.synced(at(14, 2, 100)).minute_of_day(), 14 * 60 + 5);
+        assert_eq!(clock.synced(at(14, 8, 100)).minute_of_day(), 14 * 60 + 8);
+        let midnight = GameTime::new(23, 59, 100, GameTime::MIN_SPEED);
+        let next = midnight.synced(at(0, 1, 101));
+        assert_eq!((next.minute_of_day(), next.base_day), (1, 101));
+        let held = GameTime::new(0, 1, 101, GameTime::MIN_SPEED).synced(at(23, 59, 100));
+        assert_eq!(held.minute_of_day(), 1);
+    }
 
     /// A re-create of a live object notifies like a delta.
     #[test]
@@ -3079,12 +3282,13 @@ mod tests {
         assert_eq!(lanes, [0x02, 0x03, 0x04, 0x2C]);
     }
 
-    /// The chat bar's lanes: SAY is 1 (`0x50d1d8`) and there are no leader lanes.
+    /// The chat bar's lanes: SAY is 1 (`0x50d1d8`), and the party leader's alone of the leader lanes.
     #[test]
     fn chat_kinds_take_the_clients_own_wire_type() {
         for (kind, want) in [
             (ChatKind::Say, Some(0x01)),
             (ChatKind::Party, Some(0x02)),
+            (ChatKind::PartyLeader, Some(0x33)),
             (ChatKind::Raid, Some(0x03)),
             (ChatKind::Guild, Some(0x04)),
             (ChatKind::Officer, Some(0x05)),

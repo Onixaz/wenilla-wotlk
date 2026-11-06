@@ -7,8 +7,8 @@ use benilla_protocol::{SessionEvent, SessionEventKind};
 use bevy::prelude::*;
 
 use super::{
-    Engaged, EnvDamageTable, KitPush, MountFlourish, PlaySeq, RangedHold, SheathRequest,
-    SwingFlush, SwingImpact, SwingMessage,
+    Engaged, EnvDamageTable, KitPush, MountFlourish, PlaySeq, PlayerCombatEdges, RangedHold,
+    SheathRequest, SwingFlush, SwingImpact, SwingMessage,
 };
 use crate::net::{AiReactionMessage, EmoteKind, EmoteMessage, GuidIndex, NetHandlerApp, SelfGuid};
 use crate::swing_refusal::SwingRefusalEdge;
@@ -30,12 +30,26 @@ pub(super) fn register(app: &mut App) {
         .net_handler(K::PlaySpellImpact, on_play_spell_visual)
         .net_handler(K::AttackerState, on_attacker_state)
         .net_handler(K::EnvironmentalDamageLog, on_environmental_damage_log)
-        .net_handler(K::AchievementEarned, on_achievement_earned);
+        .net_handler(K::AchievementEarned, on_achievement_earned)
+        .net_handler(K::TitleEarned, on_title_earned);
 }
 
-fn on_attack_start(In(ev): In<SessionEvent>, mut commands: Commands, index: Res<GuidIndex>) {
+fn on_attack_start(
+    In(ev): In<SessionEvent>,
+    mut commands: Commands,
+    index: Res<GuidIndex>,
+    self_guid: Res<SelfGuid>,
+    mut edges: ResMut<PlayerCombatEdges>,
+) {
     if let SessionEvent::AttackStart { attacker, victim } = ev {
-        attack_start(attacker, victim, &mut commands, &index);
+        attack_start(
+            attacker,
+            victim,
+            &mut commands,
+            &index,
+            &self_guid,
+            &mut edges,
+        );
     }
 }
 
@@ -43,10 +57,30 @@ fn on_attack_stop(
     In(ev): In<SessionEvent>,
     mut commands: Commands,
     index: Res<GuidIndex>,
+    self_guid: Res<SelfGuid>,
+    transforms: Query<&Transform>,
+    mut edges: ResMut<PlayerCombatEdges>,
     mut flushes: MessageWriter<SwingFlush>,
 ) {
-    if let SessionEvent::AttackStop { attacker, victim } = ev {
-        attack_stop(attacker, victim, &mut commands, &index, &mut flushes);
+    if let SessionEvent::AttackStop {
+        attacker,
+        victim,
+        face_victim,
+    } = ev
+    {
+        attack_stop(
+            AttackStop {
+                attacker,
+                victim,
+                face_victim,
+            },
+            &mut commands,
+            &index,
+            &self_guid,
+            &transforms,
+            &mut edges,
+            &mut flushes,
+        );
     }
 }
 
@@ -78,10 +112,25 @@ fn on_mount_special(
     In(ev): In<SessionEvent>,
     self_guid: Res<SelfGuid>,
     index: Res<GuidIndex>,
+    // Absent before a world streams, which reads as dry.
+    world: Option<benilla_world::world_point::WorldPoint>,
+    units: Query<(&GlobalTransform, Option<&crate::entities::CollisionHeight>)>,
     mut out: MessageWriter<MountFlourish>,
 ) {
     if let SessionEvent::MountSpecial { guid } = ev {
-        mount_special(guid, &self_guid, &index, &mut out);
+        let deep = |e: Entity| {
+            let Ok((tf, height)) = units.get(e) else {
+                return false;
+            };
+            let wow = benilla_assets::coords::bevy_to_wow(tf.translation());
+            let surface = world
+                .as_ref()
+                .and_then(|w| w.liquid_at(benilla_world::world_point::Subject::Unit(e), wow))
+                .map(|hit| hit.surface_z);
+            let h = height.copied().unwrap_or_default().0;
+            deep_in_liquid(surface, wow[2], h)
+        };
+        mount_special(guid, &self_guid, &index, deep, &mut out);
     }
 }
 
@@ -94,12 +143,14 @@ fn on_text_emote(
     if let SessionEvent::TextEmote {
         guid,
         text_emote,
+        file_index,
         target_name,
     } = ev
     {
         self::text_emote(
             guid,
             text_emote,
+            file_index,
             target_name,
             &index,
             &mut out,
@@ -124,8 +175,18 @@ fn on_attacker_state(
     mut edges: MessageWriter<SwingRefusalEdge>,
     stores: Query<&mut crate::net::ObjectStore>,
     mut play_seq: ResMut<PlaySeq>,
+    player: Option<Res<crate::player::Player>>,
+    approach: Option<ResMut<crate::player::Approach>>,
+    follow: Option<ResMut<crate::player::FollowState>>,
 ) {
     if let SessionEvent::AttackerState(s) = ev {
+        // Our own round ends the auto-move, the swing request does not (`0x75699a`).
+        if let (Some(player), Some(mut approach), Some(mut follow)) = (player, approach, follow) {
+            let mover = player.foreign_mover.or(self_guid.0);
+            if index.0.contains_key(&s.attacker) && Some(s.attacker) == mover {
+                approach.end_on_own_round(&mut follow);
+            }
+        }
         attacker_state(
             s,
             &index,
@@ -172,33 +233,80 @@ fn on_play_spell_visual(
     }
 }
 
-/// A unit began melee auto-attack (`SMSG_ATTACKSTART`, including our own echo).
-fn attack_start(attacker: u64, victim: u64, commands: &mut Commands, index: &GuidIndex) {
-    // The Ready idle rides this window: the client's gate is the auto-attack target being set.
-    debug!("net: attack start {attacker:#x} → {victim:#x}");
-    if let Some(&e) = index.0.get(&attacker) {
-        // Melee start drops the `0x400` weapon-visual hold: a shooter closing to melee leaves the
-        // drawn idle.
-        commands
-            .entity(e)
-            .insert(Engaged(victim))
-            .remove::<RangedHold>();
-    }
-}
-
-/// A unit stopped melee auto-attack (`SMSG_ATTACKSTOP`).
-fn attack_stop(
+/// A unit began melee auto-attack (`SMSG_ATTACKSTART`, including our own echo). Ours fires
+/// `PLAYER_ENTER_COMBAT` on every packet, a new victim's too (`0x756897`).
+fn attack_start(
     attacker: u64,
     victim: u64,
     commands: &mut Commands,
     index: &GuidIndex,
+    self_guid: &SelfGuid,
+    edges: &mut PlayerCombatEdges,
+) {
+    // The Ready idle rides this window: the client's gate is the auto-attack target being set.
+    debug!("net: attack start {attacker:#x} → {victim:#x}");
+    // An unstreamed attacker does nothing (`0x75686c`).
+    let Some(&e) = index.0.get(&attacker) else {
+        return;
+    };
+    // Melee start drops the `0x400` weapon-visual hold: a shooter closing to melee leaves the
+    // drawn idle.
+    commands
+        .entity(e)
+        .insert(Engaged(victim))
+        .remove::<RangedHold>();
+    if self_guid.0 == Some(attacker) {
+        edges.0.push(true);
+    }
+}
+
+/// One `SMSG_ATTACKSTOP` or `SMSG_COMBAT_EVENT_FAILED`.
+struct AttackStop {
+    attacker: u64,
+    victim: u64,
+    face_victim: bool,
+}
+
+/// A unit stopped melee auto-attack (`0x756770`): the swing ends, a set `face_victim` holds the
+/// attacker's facing toward a streamed victim, and ours fires `PLAYER_LEAVE_COMBAT` on every packet
+/// (`0x756b86`).
+fn attack_stop(
+    stop: AttackStop,
+    commands: &mut Commands,
+    index: &GuidIndex,
+    self_guid: &SelfGuid,
+    transforms: &Query<&Transform>,
+    edges: &mut PlayerCombatEdges,
     flushes: &mut MessageWriter<SwingFlush>,
 ) {
-    debug!("net: attack stop {attacker:#x} → {victim:#x}");
-    if let Some(&e) = index.0.get(&attacker) {
-        commands.entity(e).remove::<Engaged>();
-        // A pending swing flushes as text only; death and stun arrive as this packet.
-        flushes.write(SwingFlush(e));
+    let AttackStop {
+        attacker,
+        victim,
+        face_victim,
+    } = stop;
+    debug!("net: attack stop {attacker:#x} → {victim:#x} face={face_victim}");
+    let Some(&e) = index.0.get(&attacker) else {
+        return;
+    };
+    commands.entity(e).remove::<Engaged>();
+    // A pending swing flushes as text only; death and stun arrive as this packet.
+    flushes.write(SwingFlush(e));
+    // `0x7567a5`-`0x7567ec`: the bearing from the attacker to the victim.
+    let held = (face_victim && victim != 0)
+        .then(|| index.0.get(&victim))
+        .flatten()
+        .and_then(|&v| Some((transforms.get(e).ok()?, transforms.get(v).ok()?)))
+        .and_then(|(a, v)| {
+            crate::net::facing_bearing(
+                benilla_assets::coords::bevy_to_wow(a.translation),
+                benilla_assets::coords::bevy_to_wow(v.translation),
+            )
+        });
+    if let Some(yaw) = held {
+        commands.entity(e).insert(crate::net::FacingHold::new(yaw));
+    }
+    if self_guid.0 == Some(attacker) {
+        edges.0.push(false);
     }
 }
 
@@ -317,15 +425,25 @@ fn attacker_state(
 fn text_emote(
     guid: u64,
     text_emote: u32,
+    file_index: i32,
     target_name: String,
     index: &GuidIndex,
     out: &mut MessageWriter<EmoteMessage>,
     chat_log: &mut crate::ui_chat::ChatLog,
 ) {
+    if benilla_assets::trace::enabled() {
+        benilla_assets::trace::line(
+            "emote",
+            &format!("recv guid={guid:#x} text={text_emote} index={file_index}"),
+        );
+    }
     out.write(EmoteMessage {
         guid,
         source: index.0.get(&guid).copied(),
-        kind: EmoteKind::Text(text_emote),
+        kind: EmoteKind::Text {
+            text_id: text_emote,
+            file_index,
+        },
     });
     chat_log.push_text_emote(guid, text_emote, target_name);
 }
@@ -387,20 +505,31 @@ fn environmental_damage_log(
     }
 }
 
-/// `SMSG_MOUNTSPECIAL_ANIM`: a nearby rider rears their mount (MountSpecial, 94). Our own guid is
-/// dropped, as we played it at send: vmangos asks for no echo (`MovementHandler.cpp:972`) but
-/// delivers one anyway unless its per-player broadcaster is on (`Object.cpp:2274`).
+/// `SMSG_MOUNTSPECIAL_ANIM`: a nearby rider rears their mount (MountSpecial, 94), unless the rider
+/// is deep in liquid (`0x71cb67`). Our own guid is dropped, as we played it at send
+/// (`0x71cb70`-`0x71cb81`): vmangos asks for no echo (`MovementHandler.cpp:972`) but delivers one
+/// anyway unless its per-player broadcaster is on (`Object.cpp:2274`).
 fn mount_special(
     guid: u64,
     self_guid: &SelfGuid,
     index: &GuidIndex,
+    deep: impl Fn(Entity) -> bool,
     out: &mut MessageWriter<MountFlourish>,
 ) {
     if self_guid.0 != Some(guid) {
         if let Some(&e) = index.0.get(&guid) {
-            out.write(MountFlourish { unit: e });
+            if !deep(e) {
+                out.write(MountFlourish { unit: e });
+            }
         }
     }
+}
+
+/// The deep-in-liquid test (`0x718a20`): the liquid surface over the unit's feet stands higher
+/// than half its collision height (`0x718a65`-`0x718a6c`); no liquid is a depth of 0.
+pub(crate) fn deep_in_liquid(surface_z: Option<f32>, feet_z: f32, collision_height: f32) -> bool {
+    let depth = surface_z.map_or(0.0, |s| s - feet_z);
+    collision_height * 0.5 < depth
 }
 
 /// `SMSG_ACHIEVEMENT_EARNED`'s earn effect on the earning player, any player in view (`0x5b3020`).
@@ -431,10 +560,74 @@ pub(super) fn on_achievement_earned(
     }
 }
 
+/// `SMSG_TITLE_EARNED`'s effect on our player, for an earned title only (`0x50c63c`).
+pub(super) fn on_title_earned(
+    In(ev): In<SessionEvent>,
+    me: Query<Entity, With<crate::net::SelfPlayer>>,
+    visuals: Option<Res<super::spell_visual::SpellVisuals>>,
+    mut fx: MessageWriter<super::spell_visual::SpellKitFx>,
+) {
+    let SessionEvent::TitleEarned { earned: true, .. } = ev else {
+        return;
+    };
+    let (Ok(entity), Some(visuals)) = (me.single(), visuals) else {
+        return;
+    };
+    if let Some(begin) = super::spell_visual::title_earn_fx(&visuals, entity) {
+        debug!("anim: title earned, the earn effect plays ({entity})");
+        fx.write(begin);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bevy::ecs::system::RunSystemOnce;
+
+    /// `0x718a20`: deep once the surface stands more than half the collision height over the feet.
+    #[test]
+    fn a_rider_is_deep_past_half_its_height_under_a_surface() {
+        assert!(
+            !deep_in_liquid(None, 10.0, 2.0),
+            "no liquid is a depth of 0"
+        );
+        assert!(
+            !deep_in_liquid(Some(11.0), 10.0, 2.0),
+            "exactly half is not deep"
+        );
+        assert!(deep_in_liquid(Some(11.01), 10.0, 2.0));
+        assert!(
+            !deep_in_liquid(Some(9.0), 10.0, 2.0),
+            "a surface below the feet"
+        );
+    }
+
+    /// `0x71cb67`: a rider deep in liquid does not rear; one on land does; our own echo never.
+    #[test]
+    fn a_deep_rider_does_not_rear_its_mount() {
+        const ME: u64 = 0x7;
+        const RIDER: u64 = 0x8;
+        let mut world = World::new();
+        world.init_resource::<GuidIndex>();
+        world.insert_resource(SelfGuid(Some(ME)));
+        world.init_resource::<Messages<MountFlourish>>();
+        let rider = world.spawn_empty().id();
+        let me = world.spawn_empty().id();
+        world.resource_mut::<GuidIndex>().0.insert(RIDER, rider);
+        world.resource_mut::<GuidIndex>().0.insert(ME, me);
+        for (guid, deep) in [(RIDER, true), (RIDER, false), (ME, false)] {
+            world
+                .run_system_once(
+                    move |s: Res<SelfGuid>,
+                          i: Res<GuidIndex>,
+                          mut out: MessageWriter<MountFlourish>| {
+                        mount_special(guid, &s, &i, |_| deep, &mut out);
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(world.resource::<Messages<MountFlourish>>().len(), 1);
+    }
 
     /// `0x8006c0` and `0x800610` both play on a streamed unit only, and AzerothCore's trainer buy
     /// sends kit 362 on the buyer through the impact.
@@ -476,5 +669,61 @@ mod tests {
             [(e, 362, 1), (e, 179, 0)],
             "the impact is stage 1, the visual stage 0, and an unstreamed unit plays nothing"
         );
+    }
+
+    /// `0x756800`: every start and stop of ours queues its combat event, a new victim's start
+    /// too; a stop with its flag set holds the attacker's facing toward a streamed victim
+    /// (`0x7567a5`); an unstreamed attacker does nothing.
+    #[test]
+    fn each_attack_start_and_stop_of_ours_queues_its_event_and_a_flagged_stop_holds_the_facing() {
+        use benilla_assets::coords::wow_to_bevy;
+        const ME: u64 = 10;
+        let mut world = World::new();
+        world.init_resource::<GuidIndex>();
+        world.init_resource::<SelfGuid>();
+        world.init_resource::<PlayerCombatEdges>();
+        world.init_resource::<Messages<SwingFlush>>();
+        world.resource_mut::<SelfGuid>().0 = Some(ME);
+        let me = world.spawn(Transform::default()).id();
+        let mob = world.spawn(Transform::default()).id();
+        let victim = world
+            .spawn(Transform::from_translation(wow_to_bevy([0.0, 5.0, 0.0])))
+            .id();
+        for (g, e) in [(ME, me), (0x42, mob), (0x43, victim)] {
+            world.resource_mut::<GuidIndex>().0.insert(g, e);
+        }
+        let start = |attacker, victim| SessionEvent::AttackStart { attacker, victim };
+        let stop = |attacker, victim, face_victim| SessionEvent::AttackStop {
+            attacker,
+            victim,
+            face_victim,
+        };
+        for ev in [
+            start(ME, 0x42),
+            start(ME, 0x43),
+            stop(ME, 0x43, false),
+            start(ME, 0x42),
+            start(0x42, ME),
+            stop(0x42, 0x43, true),
+            stop(0x99, 0x43, true),
+            stop(0x43, 0x99, true),
+        ] {
+            match ev {
+                SessionEvent::AttackStart { .. } => world.run_system_once_with(on_attack_start, ev),
+                _ => world.run_system_once_with(on_attack_stop, ev),
+            }
+            .expect("the handler runs as a one-shot system");
+        }
+        assert_eq!(
+            world.resource::<PlayerCombatEdges>().0,
+            [true, true, false, true],
+            "ENTER per start, a new victim's too, LEAVE per stop; another unit's fire nothing"
+        );
+        assert!(world.entity(mob).contains::<crate::net::FacingHold>());
+        assert!(
+            !world.entity(victim).contains::<crate::net::FacingHold>(),
+            "an unstreamed victim holds nothing"
+        );
+        assert!(!world.entity(me).contains::<crate::net::FacingHold>());
     }
 }

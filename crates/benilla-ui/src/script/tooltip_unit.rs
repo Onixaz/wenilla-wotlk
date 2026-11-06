@@ -39,6 +39,8 @@ const THREAT_STATUS_COLORS: [u32; 5] = [0xffffff, 0xb0b0b0, 0xffff77, 0xff9900, 
 /// app picks the tint for each line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TooltipTint {
+    /// The name's own colour, a type's line (the meeting stone's area, `0x7108d0`).
+    Title,
     /// A requirement line's normal colour (the key item's "Requires %s").
     White,
     /// `0xffff2020`, the unmet "Locked" line, the ramp's red rung.
@@ -332,6 +334,13 @@ pub(super) fn on_unit_push(lua: &Lua, token: &str) {
     }
 }
 
+/// A root-unit cursor point over the tooltip's own scale, as the anchor offset multiplies it back
+/// (`0x61b2e0`).
+fn own_units(model: &super::Model, h: FrameHandle, (x, y): (f32, f32)) -> (f32, f32) {
+    let scale = super::object::layout_methods::eff_scale(model, h);
+    (x / scale, y / scale)
+}
+
 impl super::UiScript {
     /// Show the world-mouseover unit tooltip: fire `OnTooltipSetDefaultAnchor`, render `token`,
     /// fire `UPDATE_MOUSEOVER_UNIT`. Call on a hover-target change; a re-show mid-fade returns to
@@ -452,8 +461,9 @@ impl super::UiScript {
         match cursor {
             // The cursor arm: centred above the pointer; compare-then-touch, so a still pointer
             // never re-layouts.
-            Some((ui_x, ui_y)) => {
+            Some(cursor) => {
                 let mut model = self.model_mut();
+                let (ui_x, ui_y) = own_units(&model, h, cursor);
                 // The owner: this arm is the SetOwner core, which stores it at `+0x314`; the other
                 // arms get theirs from FrameXML's `OnTooltipSetDefaultAnchor`. Without one, any Lua
                 // `GameTooltip:Show()` hides the plate: the reference's show runs only when
@@ -498,6 +508,7 @@ impl super::UiScript {
             append_line(&self.lua, &wrapper, (name.to_string(), GOLD), None, false)?;
             for (text, tint) in lines {
                 let colour = match tint {
+                    TooltipTint::Title => GOLD,
                     TooltipTint::White => WHITE,
                     TooltipTint::Red => RED,
                     TooltipTint::PureRed => PURE_RED,
@@ -558,6 +569,7 @@ impl super::UiScript {
             if let Ok(t) = tip_mut(&mut model, h) {
                 t.owner = Some(owner);
             }
+            let (ui_x, ui_y) = own_units(&model, h, (ui_x, ui_y));
             let input = model.layout_inputs.entry(h).or_default();
             // Anchor only: the frame's own clamp flag (`Frame::clamped_to_screen`, G flags bit 4)
             // slides a plate near the window edge back on screen.
@@ -615,6 +627,7 @@ impl super::UiScript {
             return;
         }
         let root_id = model.frame_id(root);
+        let (ui_x, ui_y) = own_units(&model, h, (ui_x, ui_y));
         let input = model.layout_inputs.entry(h).or_default();
         let new = Anchor::new(Point::Bottom, root_id, Point::BottomLeft, ui_x, ui_y);
         // Compare-then-touch: this runs on every pointer event.

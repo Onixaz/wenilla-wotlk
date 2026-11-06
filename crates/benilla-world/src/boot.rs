@@ -20,6 +20,14 @@ pub fn tuned_default_plugins(mut primary_window: Window) -> PluginGroupBuilder {
         primary_window.fit_canvas_to_parent = true;
         primary_window.prevent_default_event_handling = true;
     }
+    // `WOW_THREADS=1` serialises the frame's systems, a diagnostic: a defect that survives it is
+    // not a race between two systems. `WOW_COMPUTE_THREADS=<n>` pins the pool's size, a
+    // measurement lever for the per-spawn wake cost.
+    let serial = std::env::var("WOW_THREADS").ok().as_deref() == Some("1");
+    let split = pool_split(
+        bevy::tasks::available_parallelism(),
+        if serial { Some(1) } else { compute_threads() },
+    );
     DefaultPlugins
         .set(WindowPlugin {
             primary_window: Some(primary_window),
@@ -33,20 +41,20 @@ pub fn tuned_default_plugins(mut primary_window: Window) -> PluginGroupBuilder {
             custom_layer: |_| Some(Box::new(crate::log_ring::LogRing)),
             ..default()
         })
-        // Asset loads parse synchronously on the IO pool, and Bevy's default 4 threads saturate on
-        // a dense teleport, so IO keeps a floor of 2 and a ceiling of 8. Its share is Bevy's 25%,
-        // not half: compute takes what IO and async compute leave, and every frame's parallel
-        // passes run there (on 12 threads half to IO left compute 3; a quarter leaves 6, 0.15 ms
-        // a frame faster at Northshire Abbey, with login and teleport loads unchanged). Workers
-        // spawn at default QoS, behind any background build: compute is user-interactive, IO and
-        // async compute user-initiated, and `ThreadQosPlugin` promotes the render thread from
-        // inside.
+        // Asset loads parse synchronously on the IO pool, so a dense teleport waits on its width:
+        // IO takes half the cores, floor 2 and ceiling 8. Pipeline compiles and collider builds
+        // share async compute, so the loading cover's pipeline warm waits on its width: it takes
+        // half the cores too, floor 1 and ceiling 4. Compute, where every frame's parallel passes
+        // run, keeps the size the quarter split left it ([`pool_split`]), so the IO and async
+        // threads ride on top, idle outside a load. Workers spawn at default QoS, behind any background
+        // build: compute is user-interactive, IO and async compute user-initiated, and
+        // `ThreadQosPlugin` promotes the render thread from inside.
         .set(TaskPoolPlugin {
             task_pool_options: TaskPoolOptions {
                 io: bevy::app::TaskPoolThreadAssignmentPolicy {
-                    min_threads: 2,
-                    max_threads: 8,
-                    percent: 0.25,
+                    min_threads: split.io,
+                    max_threads: split.io,
+                    percent: 1.0,
                     on_thread_spawn: Some(std::sync::Arc::new(|| {
                         thread_qos::promote_current_thread(thread_qos::QosClass::UserInitiated)
                     })),
@@ -56,22 +64,17 @@ pub fn tuned_default_plugins(mut primary_window: Window) -> PluginGroupBuilder {
                     on_thread_spawn: Some(std::sync::Arc::new(|| {
                         thread_qos::promote_current_thread(thread_qos::QosClass::UserInitiated)
                     })),
-                    ..TaskPoolOptions::default().async_compute
+                    min_threads: split.async_compute,
+                    max_threads: split.async_compute,
+                    percent: 1.0,
+                    on_thread_destroy: None,
                 },
                 compute: bevy::app::TaskPoolThreadAssignmentPolicy {
                     on_thread_spawn: Some(std::sync::Arc::new(|| {
                         thread_qos::promote_current_thread(thread_qos::QosClass::UserInteractive)
                     })),
-                    // `WOW_THREADS=1` serialises the frame's systems, a diagnostic: a defect that
-                    // survives it is not a race between two systems. `WOW_COMPUTE_THREADS=<n>`
-                    // pins the pool's size, a measurement lever for the per-spawn wake cost.
-                    max_threads: match std::env::var("WOW_THREADS").ok().as_deref() {
-                        Some("1") => 1,
-                        _ => compute_threads()
-                            .unwrap_or(TaskPoolOptions::default().compute.max_threads),
-                    },
-                    min_threads: compute_threads()
-                        .unwrap_or(TaskPoolOptions::default().compute.min_threads),
+                    min_threads: split.compute,
+                    max_threads: split.compute,
                     ..TaskPoolOptions::default().compute
                 },
                 ..default()
@@ -91,10 +94,63 @@ pub fn tuned_default_plugins(mut primary_window: Window) -> PluginGroupBuilder {
         .disable::<bevy::gilrs::GilrsPlugin>()
 }
 
+/// The IO, async-compute and compute pools' thread counts on `cores`, with an optional compute
+/// override.
+struct PoolSplit {
+    io: usize,
+    async_compute: usize,
+    compute: usize,
+}
+
+/// IO gets half of `cores`, clamped to 2..=8, and async compute half, clamped to 1..=4. Compute
+/// gets what Bevy's quarter split for the two (2..=8 and 1..=4) leaves, at least 1, unless
+/// `compute_override` names it.
+fn pool_split(cores: usize, compute_override: Option<usize>) -> PoolSplit {
+    let share = |percent: f32| (cores as f32 * percent).round() as usize;
+    let quarter_io = share(0.25).min(cores).clamp(2, 8);
+    let async_compute = share(0.25)
+        .min(cores.saturating_sub(quarter_io))
+        .clamp(1, 4);
+    PoolSplit {
+        io: share(0.5).min(cores).clamp(2, 8),
+        async_compute: share(0.5).min(cores).clamp(1, 4),
+        compute: compute_override
+            .unwrap_or_else(|| cores.saturating_sub(quarter_io + async_compute).max(1)),
+    }
+}
+
 /// `WOW_COMPUTE_THREADS=<n>`: the compute pool's thread count, unset for Bevy's share.
 fn compute_threads() -> Option<usize> {
     std::env::var("WOW_COMPUTE_THREADS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n >= 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pool_split;
+
+    fn split(cores: usize, compute_override: Option<usize>) -> (usize, usize, usize) {
+        let s = pool_split(cores, compute_override);
+        (s.io, s.async_compute, s.compute)
+    }
+
+    #[test]
+    fn io_and_async_widen_while_compute_keeps_the_quarter_split_remainder() {
+        assert_eq!(split(8, None), (4, 4, 4));
+        assert_eq!(split(12, None), (6, 4, 6));
+        assert_eq!(split(32, None), (8, 4, 20));
+    }
+
+    #[test]
+    fn small_machines_keep_their_floors() {
+        assert_eq!(split(2, None), (2, 1, 1));
+        assert_eq!(split(4, None), (2, 2, 1));
+    }
+
+    #[test]
+    fn a_compute_override_wins() {
+        assert_eq!(split(8, Some(1)), (4, 4, 1));
+    }
 }
