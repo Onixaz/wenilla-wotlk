@@ -244,3 +244,70 @@ test('reading counts the client\'s waiting reads, not fetches ahead', async () =
   await settle();
   assert.equal(s.reading(), 0);
 });
+
+test('ready starts what is missing, asks once, and answers true when it lands', async () => {
+  const h = host({ 'a.blp': bytes(1) });
+  const s = plain(h);
+  assert.equal(s.ready(['a.blp']), false);
+  await settle();
+  assert.equal(s.ready(['a.blp']), false);
+  assert.equal(s.reading(), 1);
+  h.openAll();
+  await settle();
+  assert.equal(s.ready(['a.blp']), true);
+  assert.equal(s.reading(), 0);
+  assert.equal(h.calls.length, 1);
+  assert.deepEqual(Array.from(s.get('a.blp')), [1]);
+});
+
+test('ready gives up on a name that cannot arrive instead of asking every frame', async () => {
+  let asked = 0;
+  const s = createStore({
+    persist: false,
+    storage: null,
+    fetch: async () => {
+      asked += 1;
+      throw new Error('offline');
+    },
+  });
+  assert.equal(s.ready(['a.blp']), false);
+  await settle();
+  assert.equal(s.ready(['a.blp']), true);
+  assert.equal(s.reading(), 0);
+  assert.ok(asked <= 2);
+});
+
+test('ready answers true for a name the host lacks', async () => {
+  const h = host({});
+  const s = plain(h);
+  assert.equal(s.ready(['gone.blp']), false);
+  await settle();
+  h.openAll();
+  await settle();
+  assert.equal(s.ready(['gone.blp']), true);
+});
+
+test('dropAhead forgets unsent fetches ahead, leaves the rest, and a dropped name can come back', async () => {
+  const h = host({ 'a.adt': bytes(1), 'b.adt': bytes(2), 'c.blp': bytes(3), 'x.adt': bytes(4) });
+  const s = plain(h, { batchNames: 1, maxBatches: 1, maxLowBatches: 1 });
+  s.prefetch(['x.adt'], { ahead: true }); // sent, so it finishes
+  s.prefetch(['a.adt'], { ahead: true });
+  const list = s.prefetch(['c.blp']); // the page's own list stays
+  const b = s.prefetch(['b.adt'], { ahead: true });
+  await settle();
+  s.dropAhead();
+  await b;
+  for (let i = 0; i < 4; i++) {
+    h.openAll();
+    await settle();
+  }
+  await list;
+  assert.deepEqual(h.calls.map((c) => c.keys).flat().sort(), ['c.blp', 'x.adt']);
+  assert.equal(s.stats().errors, 0);
+  assert.equal(s.landed(), 2);
+  s.ready(['a.adt']);
+  await settle();
+  h.openAll();
+  await settle();
+  assert.equal(s.ready(['a.adt']), true);
+});

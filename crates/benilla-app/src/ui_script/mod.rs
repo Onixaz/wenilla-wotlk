@@ -14,6 +14,8 @@ use benilla_world::schedule::WorldStage;
 /// The addon folder: discovery, manifests, the enable file and the load walk.
 pub(crate) mod addons;
 mod content;
+#[cfg(target_arch = "wasm32")]
+mod entry_ahead;
 pub(crate) mod extract;
 /// The stock glue screens.
 pub(crate) mod glue;
@@ -411,6 +413,8 @@ impl Plugin for UiScriptPlugin {
         // The quit root runs in `Last`: the close button's `AppExit` is written in `PostUpdate`.
         crate::shutdown::on_app_exit(app, shutdown_on_exit.into_configs());
         glue_mgr::register(app);
+        #[cfg(target_arch = "wasm32")]
+        app.add_systems(Update, entry_ahead::fetch_selected_world);
         app.init_resource::<UiScaleCvar>()
             .init_resource::<UiScaleSetting>()
             // Before anything reads the scale: at boot after the file's rows land, then each frame

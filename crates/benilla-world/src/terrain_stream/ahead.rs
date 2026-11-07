@@ -75,6 +75,22 @@ impl Ahead {
     }
 }
 
+/// What a viewer arriving at wow `(x, y)` on map directory `dir` streams first, nearest first: the
+/// map's WDT and its window's tiles. The web build's world entry fetches these ahead of the login.
+pub fn entry_files(dir: &str, farclip: f32, x: f32, y: f32) -> Vec<String> {
+    let window = StreamWindow::at(farclip, x, y);
+    let (fx, fy) = window.focus_tile();
+    let mut tiles = window.wanted_tiles();
+    tiles.sort_by_key(|&(tx, ty)| (tx - fx).abs().max((ty - fy).abs()));
+    std::iter::once(format!("World\\Maps\\{dir}\\{dir}.wdt"))
+        .chain(
+            tiles
+                .into_iter()
+                .map(|(tx, ty)| format!("World\\Maps\\{dir}\\{dir}_{tx}_{ty}.adt")),
+        )
+        .collect()
+}
+
 /// Send the predicted window's new tiles to the page's store, nearest the prediction first.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(super) fn prefetch_ahead(
@@ -125,6 +141,20 @@ pub(super) fn prefetch_ahead(
 mod tests {
     use super::*;
     use benilla_formats::tile_to_world;
+
+    /// The WDT leads, then the tile underfoot, then its neighbours.
+    #[test]
+    fn an_entry_fetches_the_wdt_and_then_the_tiles_outward_from_the_character() {
+        let window = StreamWindow::at(500.0, -9450.0, 60.0);
+        let (fx, fy) = window.focus_tile();
+        let files = entry_files("Azeroth", 500.0, -9450.0, 60.0);
+        assert_eq!(files[0], "World\\Maps\\Azeroth\\Azeroth.wdt");
+        assert_eq!(
+            files[1],
+            format!("World\\Maps\\Azeroth\\Azeroth_{fx}_{fy}.adt")
+        );
+        assert_eq!(files.len(), window.wanted_tiles().len() + 1);
+    }
 
     /// Motion at a steady 10 yd/s converges on a prediction 60 yd ahead; a teleport resets it.
     #[test]

@@ -98,8 +98,18 @@ impl SkinComposites {
         plan: impl FnOnce() -> Option<CompositePlan>,
     ) -> BodyAtlas {
         let bake = self.bake;
+        let idle = !self.done.contains(&key) && !self.running.contains_key(&key);
+        let planned = idle.then(plan).flatten();
+        // The page has one thread, where the composite's reads would each block it: the textures
+        // land first, the body waits as it waits on a running composite.
+        if planned
+            .as_ref()
+            .is_some_and(|p| !benilla_formats::web::ready(&p.paths()))
+        {
+            return BodyAtlas::Pending;
+        }
         self.request_with(key, || {
-            plan().map(|p| work(p, sections.chain.clone(), bake))
+            planned.map(|p| work(p, sections.chain.clone(), bake))
         })
     }
 

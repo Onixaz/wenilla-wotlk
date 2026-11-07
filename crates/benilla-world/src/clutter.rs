@@ -547,6 +547,14 @@ pub(crate) fn stream_chunk_clutter(
             }
             cc.models = Some(models);
         }
+        // A zone's first tufts: on the page the chunk waits for its models' files, so crossing into
+        // a new ground set costs late grass and not a frozen frame.
+        let landed = cc.models.iter().flatten().all(|(model, _)| {
+            geometry.0.contains(model) || benilla_formats::web::ready_tree(model)
+        });
+        if !landed {
+            continue;
+        }
         if d2 < visible_d2 {
             late += 1;
             late_nearest = late_nearest.min(d2.sqrt());
