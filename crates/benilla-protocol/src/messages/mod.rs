@@ -17,6 +17,7 @@ mod binder;
 mod broadcast;
 mod calendar;
 mod channel;
+mod char_services;
 mod chat;
 mod client;
 mod combat_log;
@@ -35,7 +36,6 @@ mod items;
 mod lfg;
 mod loot;
 mod mail;
-mod meeting_stone;
 mod mirror_timer;
 mod monster_move;
 mod movement;
@@ -82,11 +82,12 @@ pub use achievement::{
     InspectAchievements,
 };
 pub use action_bar::{
-    set_action_button, set_actionbar_toggles, ActionButton, ACTION_KIND_EQUIPMENT_SET,
+    set_action_button, set_actionbar_toggles, ActionButton, ACTION_BUTTONS_INIT,
+    ACTION_BUTTONS_LOCK, ACTION_BUTTONS_SET, ACTION_BUTTON_SLOTS, ACTION_KIND_EQUIPMENT_SET,
     ACTION_KIND_ITEM, ACTION_KIND_MACRO, ACTION_KIND_SPELL,
 };
 pub use addons::{
-    hidden_from_reply, SecureAddon, STANDARD_MODULUS_CRC, STOCK_SECURE_ADDONS,
+    hidden_from_reply, BannedAddon, SecureAddon, STANDARD_MODULUS_CRC, STOCK_SECURE_ADDONS,
     STOCK_SECURE_ADDONS_WOTLK,
 };
 pub use area_trigger::area_trigger;
@@ -125,17 +126,30 @@ pub use calendar::{
     CalendarInviteAlert, CalendarInviteRef, CalendarInvitee, CalendarLockout, CalendarNewInvite,
     CalendarPacket, CalendarReset, CalendarSnapshot, CalendarStatusUpdate,
 };
-pub use channel::{channel_notice, ChannelNoticeTail, ChannelNotify};
+pub use channel::{
+    channel_notice, ChannelNoticeTail, ChannelNotify, ChannelUserList, ChannelUserListKind,
+};
+pub use char_services::{
+    char_customize, char_faction_change, char_rename, set_player_declined_names, CharAppearance,
+    CharChangeReq, CharChangeResult, CharRenameResult, DeclinedNamesResult,
+};
 pub use chat::{
-    chat_tag, ChatMessage, CHAT_MSG_ACHIEVEMENT, CHAT_MSG_AFK, CHAT_MSG_BATTLEGROUND,
-    CHAT_MSG_BATTLEGROUND_LEADER, CHAT_MSG_BG_SYSTEM_ALLIANCE, CHAT_MSG_BG_SYSTEM_HORDE,
-    CHAT_MSG_BG_SYSTEM_NEUTRAL, CHAT_MSG_CHANNEL, CHAT_MSG_DND, CHAT_MSG_EMOTE, CHAT_MSG_FILTERED,
-    CHAT_MSG_GUILD, CHAT_MSG_GUILD_ACHIEVEMENT, CHAT_MSG_IGNORED, CHAT_MSG_MONSTER_EMOTE,
-    CHAT_MSG_MONSTER_SAY, CHAT_MSG_MONSTER_WHISPER, CHAT_MSG_MONSTER_YELL, CHAT_MSG_OFFICER,
-    CHAT_MSG_PARTY, CHAT_MSG_PARTY_LEADER, CHAT_MSG_RAID, CHAT_MSG_RAID_BOSS_EMOTE,
-    CHAT_MSG_RAID_BOSS_WHISPER, CHAT_MSG_RAID_LEADER, CHAT_MSG_RAID_WARNING, CHAT_MSG_SAY,
-    CHAT_MSG_SYSTEM, CHAT_MSG_WHISPER, CHAT_MSG_WHISPER_INFORM, CHAT_MSG_YELL,
-    MACRO_EXPANDED_TYPES,
+    chat_tag, wotlk_chat_type_shared, ChatMessage, CHAT_MSG_ACHIEVEMENT, CHAT_MSG_AFK,
+    CHAT_MSG_BATTLEGROUND, CHAT_MSG_BATTLEGROUND_LEADER, CHAT_MSG_BG_SYSTEM_ALLIANCE,
+    CHAT_MSG_BG_SYSTEM_HORDE, CHAT_MSG_BG_SYSTEM_NEUTRAL, CHAT_MSG_CHANNEL, CHAT_MSG_DND,
+    CHAT_MSG_EMOTE, CHAT_MSG_FILTERED, CHAT_MSG_GUILD, CHAT_MSG_GUILD_ACHIEVEMENT,
+    CHAT_MSG_IGNORED, CHAT_MSG_MONSTER_EMOTE, CHAT_MSG_MONSTER_SAY, CHAT_MSG_MONSTER_WHISPER,
+    CHAT_MSG_MONSTER_YELL, CHAT_MSG_OFFICER, CHAT_MSG_PARTY, CHAT_MSG_PARTY_LEADER, CHAT_MSG_RAID,
+    CHAT_MSG_RAID_BOSS_EMOTE, CHAT_MSG_RAID_BOSS_WHISPER, CHAT_MSG_RAID_LEADER,
+    CHAT_MSG_RAID_WARNING, CHAT_MSG_SAY, CHAT_MSG_SYSTEM, CHAT_MSG_WHISPER,
+    CHAT_MSG_WHISPER_INFORM, CHAT_MSG_YELL, MACRO_EXPANDED_TYPES,
+};
+pub use chat::{
+    CHAT_MSG_CHANNEL_JOIN, CHAT_MSG_CHANNEL_LEAVE, CHAT_MSG_CHANNEL_LIST, CHAT_MSG_CHANNEL_NOTICE,
+    CHAT_MSG_CHANNEL_NOTICE_USER, CHAT_MSG_COMBAT_FACTION_CHANGE, CHAT_MSG_COMBAT_HONOR_GAIN,
+    CHAT_MSG_COMBAT_MISC_INFO, CHAT_MSG_COMBAT_XP_GAIN, CHAT_MSG_LOOT, CHAT_MSG_MONEY,
+    CHAT_MSG_MONSTER_PARTY, CHAT_MSG_OPENING, CHAT_MSG_PET_INFO, CHAT_MSG_RESTRICTED,
+    CHAT_MSG_SKILL, CHAT_MSG_TARGETICONS, CHAT_MSG_TEXT_EMOTE, CHAT_MSG_TRADESKILLS,
 };
 pub use client::{
     auth_session, auth_session_wotlk, channel_announcements, channel_ban, channel_invite,
@@ -168,9 +182,9 @@ pub use equipment_set::{
 };
 pub use gameobject::{gameobj_use, gameobject_query, GameObjectQueryInfo};
 pub use gm_ticket::{
-    gm_ticket_create, gm_ticket_updatetext, GmResponse, GmTicket, GMTICKET_QUEUE_ENABLED,
-    GMTICKET_RESPONSE_TICKET_DELETED, GMTICKET_STATUS_DBERROR, GMTICKET_STATUS_DEFAULT,
-    GMTICKET_STATUS_HASTEXT,
+    gm_report_lag, gm_survey_submit, gm_ticket_create, gm_ticket_updatetext, GmResponse, GmTicket,
+    GMTICKET_QUEUE_ENABLED, GMTICKET_RESPONSE_TICKET_DELETED, GMTICKET_STATUS_DBERROR,
+    GMTICKET_STATUS_DEFAULT, GMTICKET_STATUS_HASTEXT,
 };
 pub use gossip::{
     gossip_hello, gossip_select_option, npc_text_query, select_greeting, GossipMenu, GossipOption,
@@ -183,19 +197,20 @@ pub use group::{
     party_member_mask, party_operation, party_result, patch_auras, raid_target_request,
     raid_target_set, ready_check_answer, ready_check_start, request_party_member_stats,
     request_raid_info, set_saved_instance_extend, DifficultySet, GroupDifficulties, GroupLootInfo,
-    GroupMemberEntry, PartyMemberStatsInfo, RaidInstanceEntry, RaidTargetUpdate, ReadyCheck,
-    RecordAura, GROUP_MEMBER_ASSISTANT, GROUP_MEMBER_MAIN_ASSIST, GROUP_MEMBER_MAIN_TANK,
+    GroupMemberEntry, PartyMemberStatsInfo, RaidInstanceEntry, RaidTargetUpdate, RecordAura,
+    GROUP_MEMBER_ASSISTANT, GROUP_MEMBER_MAIN_ASSIST, GROUP_MEMBER_MAIN_TANK,
 };
 pub use guild::{
     guild_accept, guild_add_rank, guild_bank_money_param, guild_bank_money_withdrawn,
     guild_command, guild_command_error, guild_create, guild_decline, guild_default_rank,
-    guild_del_rank, guild_demote, guild_disband, guild_event, guild_info, guild_info_text,
-    guild_invite, guild_leader, guild_leave, guild_motd, guild_permissions, guild_presence,
-    guild_promote, guild_query, guild_rank, guild_rank_right, guild_remove, guild_roster,
-    guild_set_officer_note, guild_set_public_note, GuildCommandResult, GuildEventNotice, GuildInfo,
-    GuildPermissions, GuildQueryResponse, GuildRankBank, GuildRoster, GuildRosterMember,
-    GUILD_BANK_TABS, GUILD_INFO_MAX_LENGTH, GUILD_MOTD_MAX_LENGTH, GUILD_NAME_MAX_LENGTH,
-    GUILD_NOTE_MAX_LENGTH, GUILD_RANKS_MAX_COUNT, GUILD_RANKS_MIN_COUNT, GUILD_RANK_MAX_LENGTH,
+    guild_del_rank, guild_demote, guild_disband, guild_event, guild_event_log_query, guild_info,
+    guild_info_text, guild_invite, guild_leader, guild_leave, guild_motd, guild_permissions,
+    guild_presence, guild_promote, guild_query, guild_rank, guild_rank_right, guild_remove,
+    guild_roster, guild_set_officer_note, guild_set_public_note, GuildCommandResult,
+    GuildEventLogEntry, GuildEventNotice, GuildInfo, GuildPermissions, GuildQueryResponse,
+    GuildRankBank, GuildRoster, GuildRosterMember, GUILD_BANK_TABS, GUILD_EVENT_LOG_ROWS,
+    GUILD_INFO_MAX_LENGTH, GUILD_MOTD_MAX_LENGTH, GUILD_NAME_MAX_LENGTH, GUILD_NOTE_MAX_LENGTH,
+    GUILD_RANKS_MAX_COUNT, GUILD_RANKS_MIN_COUNT, GUILD_RANK_MAX_LENGTH,
 };
 pub use guild_bank::{
     guild_bank_activate, guild_bank_buy_tab, guild_bank_log, guild_bank_money,
@@ -204,9 +219,9 @@ pub use guild_bank::{
     GuildBankSlot, GuildBankSwap, GuildBankTab, GUILD_BANK_MONEY_LOG_TAB, GUILD_BANK_TAB_SLOTS,
 };
 pub use instance::{
-    instance_lock_response, reset_instances, set_difficulty, EncounterUnitUpdate,
-    InstanceLockWarning, InstanceResetFailed, InstanceResetFailure, RaidGroupOnly,
-    RaidInstanceMessage, RaidInstanceWarning,
+    instance_lock_response, reset_instances, set_difficulty, DifficultyChangeResult,
+    EncounterUnitUpdate, InstanceLockWarning, InstanceResetFailed, InstanceResetFailure,
+    RaidGroupOnly, RaidInstanceMessage, RaidInstanceWarning,
 };
 pub use item_ops::{
     item_guid_body, item_name_query, read_item, socket_gems, InspectItem, PurchaseCost,
@@ -214,16 +229,17 @@ pub use item_ops::{
 };
 pub use items::{
     auto_equip_item, auto_store_bag_item, decode_item_query_response, destroy_item, item_query,
-    open_item, set_ammo, split_item, swap_inv_item, swap_item, use_item, wrap_item, ItemDamage,
-    ItemInfo, ItemSpellEntry, ItemUseSpell, UseItemTarget, BAG_PLAYER_INVENTORY, BANK_BAGS,
-    BANK_SLOTS, ITEM_DYNFLAG_UNLOCKED, ITEM_DYNFLAG_WRAPPED, ITEM_FLAG_LOOTABLE, ITEM_FLAG_WRAPPER,
-    KEYRING_SLOTS, SLOT_BAG_FIRST, SLOT_BANK_BAG_FIRST, SLOT_BANK_FIRST, SLOT_KEYRING_FIRST,
-    SLOT_PACK_FIRST,
+    open_item, set_ammo, split_item, swap_inv_item, swap_item, use_item, wrap_item,
+    InventoryFailure, InventoryFailureTail, ItemDamage, ItemInfo, ItemSpellEntry, ItemUseSpell,
+    UseItemTarget, BAG_PLAYER_INVENTORY, BANK_BAGS, BANK_SLOTS, ITEM_DYNFLAG_UNLOCKED,
+    ITEM_DYNFLAG_WRAPPED, ITEM_FLAG_LOOTABLE, ITEM_FLAG_WRAPPER, KEYRING_SLOTS, SLOT_BAG_FIRST,
+    SLOT_BANK_BAG_FIRST, SLOT_BANK_FIRST, SLOT_KEYRING_FIRST, SLOT_PACK_FIRST,
 };
 pub use lfg::{
-    lfg_comment, lfg_join, lfg_proposal_result, LfgBootProposal, LfgCompletionReward,
+    lfg_comment, lfg_join, lfg_proposal_result, lfr_search, LfgBootProposal, LfgCompletionReward,
     LfgDungeonReward, LfgJoin, LfgMemberLocks, LfgPacket, LfgProposal, LfgProposalMember,
-    LfgQueueStatus, LfgRewardItem, LfgRoleCheck, LfgRoleCheckMember, LfgUpdate,
+    LfgQueueStatus, LfgRewardItem, LfgRoleCheck, LfgRoleCheckMember, LfgUpdate, LfrGroup, LfrList,
+    LfrPlayer, LfrStats,
 };
 pub use loot::{
     autostore_loot_item, loot, loot_error, loot_master_give, loot_money, loot_release, loot_roll,
@@ -236,9 +252,6 @@ pub use mail::{
     mail_return_to_sender, mail_take_item, mail_take_money, send_mail, MailAttachment, MailEnchant,
     MailList, MailListEntry, MailResult, MailSender, MAIL_ATTACHMENTS_MAX, MAIL_RECENT_SENDERS,
 };
-pub use meeting_stone::{
-    meeting_stone_join, meeting_stone_leave, MeetingStoneNotice, MeetingStoneSetQueue,
-};
 pub use mirror_timer::{
     read_pause_mirror_timer, read_start_mirror_timer, read_stop_mirror_timer, MirrorTimerKind,
     MirrorTimerStart,
@@ -246,11 +259,17 @@ pub use mirror_timer::{
 pub use movement::{
     JumpInfo, MoveMode, MovementInfo, RelayVerb, SpeedKind, SplineMode, TransportPose,
     CLASSIC_ASCENDING, CLASSIC_CAN_FLY, CLASSIC_DESCENDING, CLASSIC_DISABLE_GRAVITY,
-    CLASSIC_FLYING,
+    CLASSIC_FLYING, FLAG2_CAN_TRANSITION_BETWEEN_SWIM_AND_FLY,
 };
-pub use notices::{accept_level_grant, InebriationThreshold, OverrideLight};
+pub use notices::{
+    accept_level_grant, realm_split, DanceRecord, InebriationThreshold, OverrideLight, RWhois,
+    RWhoisAccount, RealmSplit, ServerFirstAchievement, WorldNotice,
+};
 pub use opcode_names::opcode_name;
-pub use packet::{CreatureQueryInfo, MonsterMoveFacing, ServerPacket, SplineArc};
+pub use packet::{
+    CreatureQueryInfo, GameClock, ItemQueryRecord, MonsterMoveFacing, NameQueryMiss, ServerPacket,
+    SplineArc, SplineCycle,
+};
 pub use page_text::page_text_query;
 pub use parse::{parse_auth_response_wotlk, parse_server, parse_server_with_tail};
 pub use pet::{
@@ -300,17 +319,19 @@ pub use roster::{
 pub use rune::{ConvertRune, ResyncRunes};
 pub use skills::unlearn_skill;
 pub use social::{
-    add_friend, add_ignore, add_mute, contact_flag, contact_list, del_friend, del_ignore, del_mute,
-    friend_result, friend_status, read_contact_list, read_friend_status, read_who,
-    set_contact_notes, who, ContactEntry, ContactList, FriendOnline, FriendStatusUpdate, WhoEntry,
-    WhoRequest, WhoResults, WHO_MAX_SEARCH_TERMS, WHO_MAX_ZONES,
+    add_friend, add_ignore, add_mute, complaint_chat, complaint_mail, contact_flag, contact_list,
+    del_friend, del_ignore, del_mute, friend_result, friend_status, read_complaint_result,
+    read_contact_list, read_friend_status, read_who, set_contact_notes, who, ComplaintResult,
+    ContactEntry, ContactList, FriendOnline, FriendStatusUpdate, WhoEntry, WhoRequest, WhoResults,
+    WHO_MAX_SEARCH_TERMS, WHO_MAX_ZONES,
 };
 pub use spellbook::SpellCooldown;
 pub use spells::{
     cancel_aura, cast_spell, cast_spell_at_dest, cast_spell_at_source, cast_spell_corpse,
-    cast_spell_gameobject, cast_spell_glyph, cast_spell_item, dismiss_critter,
-    wotlk_cast_fail_shared, CastCounter, CastOutcome, CastRunes, CorpseTarget, SpellCastTargets,
-    SpellChainTargets, SpellGo, SpellStart, WOTLK_CAST_FAIL_KEYS,
+    cast_spell_gameobject, cast_spell_glyph, cast_spell_item, cast_spell_trade_item,
+    dismiss_critter, wotlk_cast_fail_shared, CastCounter, CastOutcome, CastRunes, CorpseTarget,
+    DestLocSpellCast, ResumeCastBar, SpellCastTargets, SpellChainTargets, SpellGo, SpellStart,
+    WOTLK_CAST_FAIL_KEYS,
 };
 pub use stable::{
     buy_stable_slot, list_stabled_pets, stable_pet, stable_result, stable_swap_pet, unstable_pet,
@@ -414,6 +435,8 @@ pub fn faction_language(race: u8) -> u32 {
 /// [`CHAT_MSG_SAY`] etc.
 pub const CHAT_TYPE_SAY: u32 = 0x01;
 pub const CHAT_TYPE_PARTY: u32 = 0x02;
+/// The party leader's `PARTY` line, past the name table (`0x50d516`).
+pub const CHAT_TYPE_PARTY_LEADER: u32 = 0x33;
 pub const CHAT_TYPE_RAID: u32 = 0x03;
 pub const CHAT_TYPE_GUILD: u32 = 0x04;
 pub const CHAT_TYPE_OFFICER: u32 = 0x05;

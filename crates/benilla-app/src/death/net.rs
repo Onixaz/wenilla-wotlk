@@ -21,6 +21,9 @@ pub(super) fn register(app: &mut App) {
         .net_handler(K::SpiritHealerConfirm, on_spirit_healer_confirm)
         .net_handler(K::DurabilityDamageDeath, on_durability_damage_death)
         .net_handler(K::MoveMode, on_move_mode)
+        .net_handler(K::PlayerSkinned, on_death_refresh)
+        .net_handler(K::ResurrectFailed, on_death_refresh)
+        .net_handler(K::ForcedDeathUpdate, on_death_refresh)
         .net_handler(K::Disconnected, on_session_end);
 }
 
@@ -66,6 +69,21 @@ fn on_death_release_loc(
 fn on_corpse_map_position(In(ev): In<SessionEvent>, mut death_net: ResMut<DeathNet>) {
     if let SessionEvent::CorpseMapPosition { position, facing } = ev {
         death_net.corpse_transport_frame = Some((position, facing));
+    }
+}
+
+/// `SMSG_RESURRECT_FAILED` (`0x6ce470`) re-sends the dead or alive signal; `SMSG_FORCED_DEATH_UPDATE`
+/// derives the release timer first (`0x6e3f13`, `0x6e3f18`); `SMSG_PLAYER_SKINNED` carries its
+/// event's flag. The feed fires all three.
+fn on_death_refresh(In(ev): In<SessionEvent>, mut death_net: ResMut<DeathNet>) {
+    match ev {
+        SessionEvent::PlayerSkinned { flag } => death_net.skinned = Some(flag),
+        SessionEvent::ResurrectFailed => death_net.refresh_pending = true,
+        SessionEvent::ForcedDeathUpdate => {
+            death_net.repop_forced = true;
+            death_net.refresh_pending = true;
+        }
+        _ => {}
     }
 }
 
@@ -314,6 +332,15 @@ fn unit_move_mode(
     let Some(&e) = index.0.get(&guid) else {
         return;
     };
+    // The swim-to-fly bit is in the second word, which `UnitMoveModes` does not hold.
+    if mode == MoveMode::SwimFlyTransition {
+        if apply {
+            commands.entity(e).insert(crate::net::SwimFlyTransition);
+        } else {
+            commands.entity(e).remove::<crate::net::SwimFlyTransition>();
+        }
+        return;
+    }
     let set = |word: &mut UnitMoveModes| {
         if apply {
             word.0 |= mode.flag();
@@ -427,10 +454,18 @@ mod tests {
             "the controller decides whether it drives the unit"
         );
 
+        // The swim-to-fly bit is the second word's, kept beside the first.
+        send(&mut w, EYE, MoveMode::SwimFlyTransition, true);
+        assert!(w.entity(eye).contains::<crate::net::SwimFlyTransition>());
+        assert_eq!(w.entity(eye).get::<UnitMoveModes>().unwrap().0, word);
+        send(&mut w, EYE, MoveMode::SwimFlyTransition, false);
+        assert!(!w.entity(eye).contains::<crate::net::SwimFlyTransition>());
+        assert_eq!(w.resource::<Messages<MoveModeMessage>>().len(), 4);
+
         send(&mut w, 0xDEAD, MoveMode::Root, true);
         assert_eq!(
             w.resource::<Messages<MoveModeMessage>>().len(),
-            2,
+            4,
             "an unknown unit drops"
         );
         send(&mut w, ME, MoveMode::WaterWalk, true);

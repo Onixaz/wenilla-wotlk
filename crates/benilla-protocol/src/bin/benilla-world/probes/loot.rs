@@ -179,6 +179,7 @@ impl Probe for Loot {
                             guid: g,
                             position,
                             orientation,
+                            ..
                         } => {
                             if let Some(t) = world.tracked.get_mut(&g) {
                                 t.position = position;
@@ -283,7 +284,7 @@ impl Probe for Loot {
                 let Ok(msg) = session.recv() else { continue };
                 for ev in decode(msg) {
                     match ev {
-                        SessionEvent::LootMoneyNotify { amount } => {
+                        SessionEvent::LootMoneyNotify { amount, .. } => {
                             println!("SMSG_LOOT_MONEY_NOTIFY: amount {amount}");
                             notify = Some(amount);
                         }

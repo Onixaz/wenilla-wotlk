@@ -152,6 +152,14 @@ impl Roster {
             .and_then(|g| self.chars.iter().find(|c| c.guid == g))
     }
 
+    /// A character service's answer applied to its row, matched by guid: the name and look the
+    /// in-game UI seats from [`Self::pending_row`].
+    pub(crate) fn replace_row(&mut self, row: Character) {
+        if let Some(c) = self.chars.iter_mut().find(|c| c.guid == row.guid) {
+            *c = row;
+        }
+    }
+
     /// The roster position of the pick in flight, by guid rather than the live selection: what
     /// the reference persists as `lastCharacterIndex` at Enter World.
     pub(super) fn pending_index(&self) -> Option<usize> {
@@ -467,6 +475,7 @@ mod tests {
                 reason: "disconnected: world stream closed: failed to fill whole buffer".into(),
                 end: benilla_protocol::SessionEnd::Lost,
                 session_over: true,
+                kick_reason: 0,
             });
         app.update();
         app.update(); // `StateTransition` applies the pending state at the next frame
@@ -508,6 +517,7 @@ mod tests {
                 reason: "logged out".into(),
                 end: benilla_protocol::SessionEnd::LoggedOut,
                 session_over: false,
+                kick_reason: 0,
             });
         app.update();
         app.update();

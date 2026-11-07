@@ -8,6 +8,14 @@ use crate::messages::{self, opcode, WhoRequest};
 use super::WorldWriter;
 
 impl WorldWriter {
+    /// `CMSG_COMPLAIN` reporting a mail's sender.
+    pub fn complaint_mail(&mut self, sender: u64, message_id: u32) -> Result<()> {
+        self.send(
+            opcode::CMSG_COMPLAIN,
+            &messages::complaint_mail(sender, message_id),
+        )
+    }
+
     /// `CMSG_CONTACT_LIST`: `ShowFriends()`'s refresh of the lists `mask` names; the server also
     /// pushes every list at login.
     pub fn contact_list(&mut self, mask: u32) -> Result<()> {
@@ -57,5 +65,28 @@ impl WorldWriter {
     /// lags a tick or two and a second query sent meanwhile is dropped (`ReceivedWhoRequest`).
     pub fn who(&mut self, request: &WhoRequest) -> Result<()> {
         self.send(opcode::CMSG_WHO, &messages::who(request))
+    }
+
+    /// `CMSG_COMPLAIN` reporting a chat line's sender (`ComplainChat`, `0x50dfd0`).
+    pub fn complaint_chat(
+        &mut self,
+        sender: u64,
+        sender_word: u32,
+        chat_type: u32,
+        zone_channel: u32,
+        age_secs: u32,
+        description: &str,
+    ) -> Result<()> {
+        self.send(
+            opcode::CMSG_COMPLAIN,
+            &messages::complaint_chat(
+                sender,
+                sender_word,
+                chat_type,
+                zone_channel,
+                age_secs,
+                description,
+            ),
+        )
     }
 }

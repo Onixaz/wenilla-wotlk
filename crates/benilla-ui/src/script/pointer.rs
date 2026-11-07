@@ -121,12 +121,6 @@ fn is_world_handle(model: &Model, h: FrameHandle) -> bool {
         .is_some_and(|f| f.kind == crate::widget::FrameKind::WorldFrame)
 }
 
-/// Whether a press or release target is the world: the world frame, the reference's world click
-/// target, or no frame where `WorldFrame.xml` is not loaded (most tests).
-fn over_world(model: &Model, target: Option<FrameHandle>) -> bool {
-    target.is_none_or(|h| is_world_handle(model, h))
-}
-
 /// Whether `(x, y)` falls inside one of this frame's hyperlink spans, the engine half of the
 /// reference's per-span hyperlink-button children.
 fn link_span_hit(model: &Model, fh: FrameHandle, x: f32, y: f32) -> bool {
@@ -163,9 +157,10 @@ impl UiScript {
                 // spell is armed a plate refuses the hit before its rect is tested, so the reticle
                 // is placed through it.
                 && !model.nameplates.vetoes(fh)
-                && model.resolved.get(&fh).is_some_and(|r| {
-                    point_in_rect(inset_rect(*r, model.arena.hit_rect_insets(fh)), x, y)
-                })
+                && model
+                    .resolved
+                    .get(&fh)
+                    .is_some_and(|r| point_in_rect(hit_rect(&model, fh, *r), x, y))
                 && effective_clip(&model, &scroll_sources, fh)
                     .is_none_or(|c| point_in_rect(c, x, y))
         })
@@ -181,9 +176,10 @@ impl UiScript {
             // The wheel flag alone: the wheel index is separate from the mouse's, so the wheel
             // passes a frame that only takes the mouse, as a scroll pane's chrome does.
             model.arena.is_mouse_wheel_enabled(fh)
-                && model.resolved.get(&fh).is_some_and(|r| {
-                    point_in_rect(inset_rect(*r, model.arena.hit_rect_insets(fh)), x, y)
-                })
+                && model
+                    .resolved
+                    .get(&fh)
+                    .is_some_and(|r| point_in_rect(hit_rect(&model, fh, *r), x, y))
                 && effective_clip(&model, &scroll_sources, fh)
                     .is_none_or(|c| point_in_rect(c, x, y))
         })?;
@@ -390,18 +386,9 @@ impl UiScript {
             }
         };
         #[allow(clippy::type_complexity)]
-        let (
-            click_id,
-            drag_release,
-            world_dropped,
-            slider_jump,
-            double_id,
-            abandoned,
-            color_jump,
-        ): (
+        let (click_id, drag_release, slider_jump, double_id, abandoned, color_jump): (
             Option<u32>,
             Option<cursor::DragRelease>,
-            bool,
             Option<(u32, f32)>,
             Option<u32>,
             Option<crate::widget::FrameHandle>,
@@ -448,7 +435,7 @@ impl UiScript {
                 let click = hit_handle
                     .filter(|&h| button::wants_click(&model, h, button, false))
                     .and(hit_id);
-                (click, None, false, jump, None, abandoned, color_jump)
+                (click, None, jump, None, abandoned, color_jump)
             } else {
                 let pressed = model.mouse_down_on.remove(button);
                 // The release handler clears the capture only when no button is still held, so a
@@ -471,14 +458,6 @@ impl UiScript {
                 if let (Some(h), false) = (pressed, started) {
                     button::edge(&mut model, h, ButtonState::on_mouse_up);
                 }
-                // The world drop: a completed left click on the world, never a drag release, which
-                // keeps carrying (the reference's drop runs on the WorldFrame click release). The
-                // world is `over_world`, not "no frame": the stock `WorldFrame` covers the screen.
-                let dropped = button == "LeftButton"
-                    && !started
-                    && over_world(&model, hit_handle)
-                    && over_world(&model, pressed)
-                    && cursor::world_drop_click(&mut model);
                 let click = if started {
                     None
                 } else {
@@ -511,7 +490,7 @@ impl UiScript {
                 }
                 let double_id = double.and_then(|h| model.frame_to_id.get(&h).copied());
                 let click = if double_id.is_some() { None } else { click };
-                (click, release, dropped, None, double_id, None, None)
+                (click, release, None, double_id, None, None)
             }
         };
         // A track press's value jump fires `OnValueChanged` first, outside the borrow.
@@ -587,16 +566,14 @@ impl UiScript {
                 }
             }
         }
-        // A left press in an EditBox places the cursor, starts a selection drag and focuses it
-        // whatever its `autoFocus`, before any `OnClick`.
-        if button == "LeftButton" {
-            if down {
-                if let Some(id) = hit_id {
-                    editbox::click(&self.lua, id, x, y);
-                }
-            } else {
-                editbox::drag_end(&self.lua);
+        // A press of any button in an EditBox places the cursor, starts a selection drag and focuses
+        // it whatever its `autoFocus`, before any `OnClick`; any release ends the drag.
+        if down {
+            if let Some(id) = hit_id {
+                editbox::click(&self.lua, id, x, y);
             }
+        } else {
+            editbox::drag_end(&self.lua);
         }
         // A gesture this press replaced gets its `OnDragStop` first: its handler's
         // `StopMovingOrSizing` frees the engine's one move slot.
@@ -626,9 +603,8 @@ impl UiScript {
             }
         }
         // A world-frame hit is not the UI consuming the event: the reference runs its `OnMouseDown`
-        // without consuming, then the `BUTTON1`/`BUTTON2` binding, the world click. Only a world
-        // drop counts.
-        hit_id.is_some_and(|id| !self.is_world_frame(id)) || world_dropped
+        // without consuming, then the `BUTTON1`/`BUTTON2` binding, the world click.
+        hit_id.is_some_and(|id| !self.is_world_frame(id))
     }
 
     /// Fire `OnDragStop` on a gesture's source, the one place a started drag ends; a source that
@@ -694,8 +670,15 @@ pub(super) fn point_in_rect(r: Rect, x: f32, y: f32) -> bool {
     x >= r.left && x <= r.right && y >= r.bottom && y <= r.top
 }
 
-/// A frame's mouse rect: its resolved rect shrunk by its `[left, right, top, bottom]` hit-rect
-/// insets (y-up); an over-shrunk rect collapses to empty rather than inverting.
+/// A frame's mouse rect (`0x48fa20`): its raw hit-rect insets times its effective scale, against
+/// the resolved rect.
+fn hit_rect(model: &Model, fh: FrameHandle, r: Rect) -> Rect {
+    let scale = super::object::layout_methods::eff_scale(model, fh);
+    inset_rect(r, model.arena.hit_rect_insets(fh).map(|v| v * scale))
+}
+
+/// `r` shrunk by `[left, right, top, bottom]` insets in root units (y-up); an over-shrunk rect
+/// collapses to empty rather than inverting.
 fn inset_rect(r: Rect, [left, right, top, bottom]: [f32; 4]) -> Rect {
     Rect {
         left: r.left + left,

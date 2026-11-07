@@ -9,6 +9,8 @@ use benilla_assets::ModelAnimations;
 /// sampled into [`Self::current`]. The visibility authority multiplies that into the render-alpha
 /// `MeshTag` and hides the batch at 0, the reference's `A ≤ 0` cull.
 #[derive(Component)]
+// Sparse: only alpha-animated batches carry it, and a column would split every part layout in two.
+#[component(storage = "SparseSet")]
 pub struct MatAnim {
     anim: std::sync::Arc<benilla_formats::AlphaAnim>,
     /// The entity whose `AnimationPlayer` names the sequence to read, re-resolved every frame (the
@@ -137,34 +139,50 @@ pub fn sample_mat_anim(
     // The scene clock in f64: a long-uptime f32 drifts whole milliseconds.
     let shared = time.elapsed_secs_f64();
     // Each instance reads its host and writes only itself; a sample that lands where it stood
-    // leaves the row unmarked, since the Visibility authority re-walks every marked batch.
-    q.par_iter_mut().for_each(|mut m| {
-        if m.frozen {
-            return;
-        }
-        // A host with no player yet keeps its last slot at t = 0, a bind-posed model's pose.
-        let played = m
-            .host
-            .and_then(|h| hosts.get(h).ok().and_then(|(p, a)| playing_seq(p, a)));
-        let (seq, elapsed) = match played {
-            Some((seq, t)) => (Some(seq), t),
-            None if m.host.is_some() => (m.seq, 0.0),
-            None => (m.seq, now - m.spawned_at),
-        };
-        // The gseq cursor is sceneNow − attach, the anchor stamped on the first pass.
-        let attach = m.gseq_attach.unwrap_or(shared);
-        let current = m.anim.sample(seq, elapsed, shared - attach);
-        if m.seq != seq || m.gseq_attach.is_none() || m.current.to_bits() != current.to_bits() {
-            m.seq = seq;
-            m.gseq_attach = Some(attach);
-            m.current = current;
-        }
+    // leaves the row unmarked, since the Visibility authority re-walks every marked batch. Reading
+    // `frozen` through `Mut` marks nothing.
+    let mut rows: Vec<Mut<MatAnim>> = q.iter_mut().filter(|m| !m.frozen).collect();
+    crate::fanout::for_each_chunk_mut(&mut rows, SAMPLE_CHUNK, |chunk| {
+        chunk
+            .iter_mut()
+            .for_each(|m| sample_one(m, &hosts, now, shared));
     });
+}
+
+/// Rows per [`sample_mat_anim`] task: a sample is well under a microsecond.
+const SAMPLE_CHUNK: usize = 512;
+
+/// One unfrozen instance's sample, written only where it moved.
+fn sample_one(
+    m: &mut Mut<MatAnim>,
+    hosts: &Query<(&AnimationPlayer, &ModelAnimations)>,
+    now: f32,
+    shared: f64,
+) {
+    // A host with no player yet keeps its last slot at t = 0, a bind-posed model's pose.
+    let played = m
+        .host
+        .and_then(|h| hosts.get(h).ok().and_then(|(p, a)| playing_seq(p, a)));
+    let (seq, elapsed) = match played {
+        Some((seq, t)) => (Some(seq), t),
+        None if m.host.is_some() => (m.seq, 0.0),
+        None => (m.seq, now - m.spawned_at),
+    };
+    // The gseq cursor is sceneNow − attach, the anchor stamped on the first pass.
+    let attach = m.gseq_attach.unwrap_or(shared);
+    let current = m.anim.sample(seq, elapsed, shared - attach);
+    if m.seq != seq || m.gseq_attach.is_none() || m.current.to_bits() != current.to_bits() {
+        m.seq = seq;
+        m.gseq_attach = Some(attach);
+        m.current = current;
+    }
 }
 
 /// The scan marker: a part whose material can be a [`UvAnimMaterials`] or [`TintAnimMaterials`]
 /// key, inserted at spawn beside the registration, so the draw scan visits only animated parts.
 #[derive(bevy::prelude::Component)]
+// Sparse: a filter-only marker on the animated parts, and a column would split their tables.
+#[component(storage = "SparseSet")]
 pub struct AnimMatPart;
 
 /// Which loop a registered UV material animates on. A material-keyed row serves every instance of
@@ -780,8 +798,7 @@ pub(super) fn tick_anim_materials(
 }
 
 /// `WOW_MATANIM_DUTY=<start_s>:<period_s>` turns [`tick_anim_materials`] off and on every `period`
-/// seconds from `start`; the ON/OFF difference over the square wave is its per-frame cost. On
-/// `Time<Real>` because virtual time clamps to `max_delta` (250 ms) and lags on a hitching run.
+/// seconds from `start` on `Time<Real>`; the ON/OFF difference is its per-frame cost.
 fn matanim_off(time: &Time<bevy::time::Real>) -> bool {
     static SPEC: std::sync::OnceLock<Option<(f32, f32)>> = std::sync::OnceLock::new();
     let spec = SPEC.get_or_init(|| {

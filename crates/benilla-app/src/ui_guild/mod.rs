@@ -16,6 +16,7 @@ use crate::net::{ClientCommand, NetCommands};
 use crate::query_cache::QueryCache;
 use crate::ui_script::{UiFeed, UiInput};
 
+mod event_log;
 mod feed;
 mod lines;
 mod sort;
@@ -270,6 +271,20 @@ impl GuildState {
         }
     }
 
+    /// `SMSG_INVALIDATE_PLAYER` (`0x635400`): a guild guid drops that guild's record; a member's
+    /// guid re-asks the roster at once and restarts the `GuildRoster()` throttle (`0x5cab49`).
+    fn invalidate_player(&mut self, guid: u64, now: f64, commands: &NetCommands) {
+        if benilla_protocol::guid::is_guild(guid) {
+            if self.identities.evict(guid as u32) {
+                self.identity_generation = self.identity_generation.wrapping_add(1);
+                self.dirty = true;
+            }
+        } else if self.members.iter().any(|m| m.guid == guid) {
+            self.roster_allowed_at = now + ROSTER_REQUEST_THROTTLE_SECS;
+            let _ = commands.0.send(ClientCommand::GuildRosterRequest);
+        }
+    }
+
     /// `SMSG_GUILD_QUERY_RESPONSE`: fill the identity cache, an empty name as a negative.
     fn apply_query_response(&mut self, response: GuildQueryResponse) {
         let ours = response.guild_id == self.guild_id;
@@ -342,6 +357,10 @@ impl GuildState {
                         *slot = name;
                         self.dirty = true;
                     }
+                }
+                // Our own rank changed: its rights again (`0x6d951b`, `0x6d9524`).
+                if rank.is_some_and(|r| r as u64 == u64::from(self.rank_index)) {
+                    self.permissions_ask = true;
                 }
             }
             _ => {}
@@ -444,6 +463,11 @@ impl GuildState {
     /// Our `PLAYER_GUILDID`, 0 when guildless.
     pub(crate) fn guild_id(&self) -> u32 {
         self.guild_id
+    }
+
+    /// Our `PLAYER_GUILDRANK`.
+    pub(crate) fn rank_index(&self) -> u32 {
+        self.rank_index
     }
 
     /// `SMSG_GUILD_BANK_LIST`'s money, stored with no event (`0x5a7250`).
@@ -595,7 +619,19 @@ pub(crate) mod net {
             .net_handler(K::GuildDecline, on_decline)
             .net_handler(K::GuildInfo, on_info)
             .net_handler(K::GuildBankWithdrawMoney, on_bank_withdraw_money)
+            .net_handler(K::InvalidatePlayer, on_invalidate_player)
             .net_handler(K::Disconnected, on_session_end);
+    }
+
+    fn on_invalidate_player(
+        In(ev): In<SessionEvent>,
+        mut guild: ResMut<GuildState>,
+        commands: Res<NetCommands>,
+        time: Res<Time<Real>>,
+    ) {
+        if let SessionEvent::InvalidatePlayer { guid } = ev {
+            guild.invalidate_player(guid, time.elapsed_secs_f64(), &commands);
+        }
     }
 
     fn on_query_response(In(ev): In<SessionEvent>, mut guild: ResMut<GuildState>) {
@@ -791,6 +827,7 @@ pub(crate) fn on_cvar(ev: On<crate::cvars::CvarChanged>, mut notify: ResMut<Guil
 impl Plugin for UiGuildPlugin {
     fn build(&self, app: &mut App) {
         net::register(app);
+        event_log::register(app);
         app.add_observer(on_cvar);
         crate::query_cache::register::<GuildState>(app);
         app.init_resource::<GuildState>()
@@ -799,6 +836,10 @@ impl Plugin for UiGuildPlugin {
                 Update,
                 (
                     feed::feed_guild.in_set(UiFeed).in_set(GuildFeed),
+                    // After the roster's push, whose rank names `GetGuildEventInfo` reads.
+                    event_log::feed_guild_event_log
+                        .in_set(UiFeed)
+                        .after(feed::feed_guild),
                     feed::drain_guild.after(UiInput).in_set(GuildDrain),
                 )
                     // Never against the boot VM: the feed's edge memo survives the entry load, so
@@ -1068,6 +1109,38 @@ mod tests {
             result: guild_command_error::PLAYER_NO_MORE_IN_GUILD,
         });
         assert_eq!(guild.roster_event, Some(RosterUpdate::Stale));
+    }
+
+    #[test]
+    fn an_invalidated_guild_guid_drops_its_record_and_a_member_re_asks_the_roster() {
+        let (commands, rx) = net_commands();
+        let mut guild = GuildState::default();
+        guild
+            .identities
+            .insert(7, Some(identity("Legacy", &["GM"])));
+        assert!(guild.mirror_self(7, 0));
+        guild.apply_roster(GuildRoster {
+            rank_rights: vec![0xffff],
+            members: vec![member(0x2A, "Tigole", guild_presence::ONLINE)],
+            ..Default::default()
+        });
+
+        guild.invalidate_player(0x1FF6_0000_0000_0007, 100.0, &commands);
+        assert!(!guild.identities.answered(7), "the guild record is gone");
+        assert_eq!(rx.try_iter().count(), 0, "a guild guid asks nothing");
+
+        guild.invalidate_player(0x99, 100.0, &commands);
+        assert_eq!(rx.try_iter().count(), 0, "a non-member asks nothing");
+
+        guild.invalidate_player(0x2A, 100.0, &commands);
+        assert!(matches!(
+            rx.try_iter().collect::<Vec<_>>().as_slice(),
+            [ClientCommand::GuildRosterRequest]
+        ));
+        assert_eq!(
+            guild.roster_allowed_at,
+            100.0 + ROSTER_REQUEST_THROTTLE_SECS
+        );
     }
 
     #[test]

@@ -21,7 +21,7 @@ use crate::target::Selection;
 use crate::ui_script::gate;
 
 use super::pets::{self, Roster};
-use super::GroupState;
+use super::{GroupState, ReadyCheckWire};
 
 // ─── The VM feed and drain ───────────────────────────────────────────────────────────────────────
 
@@ -52,10 +52,17 @@ pub(super) struct FedParty {
     raid_key: Vec<(u64, u32, u32, bool)>,
     saved: Vec<SavedInstanceInfo>,
     saved_answers: u32,
-    ready_check: u32,
-    ready_check_requests: u32,
-    answers_forwarded: usize,
+    /// How far into [`GroupState::ready_checks`] the engine has been fed.
+    ready_checks_fed: usize,
+    /// A started check's initiator whose name the `READY_CHECK` fire waits on (`0x574d00`).
+    initiator_unnamed: Option<u64>,
+}
+
+/// What [`feed_marks`] last answered: the board and its packet count.
+#[derive(Default)]
+pub(super) struct FedMarks {
     raid_targets: [u64; 8],
+    raid_target_updates: u32,
 }
 
 pub(crate) const PARTY_TOKENS: [&str; 4] = ["party1", "party2", "party3", "party4"];
@@ -151,8 +158,9 @@ pub(super) fn feed_party(
     };
     let (fed, vm_reset) = fed.get_reset(&script);
     let edges = FieldEdges::collect(&mut edges);
-    // The ready-check summary lines the timeout tick composed, pushed as system chat ahead of the
-    // gate: the tick runs on the frame clock, which the gate does not watch.
+    // The initiator's 30 s timer and the lines it and the packets composed, pushed as system chat
+    // ahead of the gate: the timer runs on the frame clock, which the gate does not watch.
+    script.ready_check_tick();
     for line in script
         .take_ready_check_lines()
         .into_iter()
@@ -240,6 +248,7 @@ pub(super) fn feed_party(
         .map(|m| PartyMemberInfo {
             name: m.name.clone(),
             guid: m.guid,
+            online: m.status & member_status::ONLINE != 0,
         })
         .collect();
     let leader_index = if Some(group.leader) == self_guid {
@@ -524,41 +533,33 @@ pub(super) fn feed_party(
         script.fire_event("RAID_ROSTER_UPDATE", vec![]);
     }
 
-    // ── RAID_TARGET_UPDATE ──────────────────────────────────────────────────────────────────
-    //
-    // Fired when the board moves, with no argument; `TargetFrame.lua:99` re-reads the icon on it.
-    if group.raid_targets != fed.raid_targets {
-        gate.audit("feed_party", "the raid-target board edge");
-        fed.raid_targets = group.raid_targets;
-        script.fire_event("RAID_TARGET_UPDATE", vec![]);
-    }
-
     // ── READY_CHECK ─────────────────────────────────────────────────────────
     //
-    // Fired by the reference's open handler, which also arms the 30 s deadline. `UIParent.lua:571`
-    // shows the popup on it, and UIParent's OnUpdate ticks the deadline through
-    // `CheckReadyCheckTime` (`UIParent.xml:24`): no clock here.
-    if group.ready_check != fed.ready_check {
-        gate.audit("feed_party", "the ready-check edge");
-        fed.ready_check = group.ready_check;
-        // Not on the first look after a VM reset, which would pop a check that has ended.
-        if !vm_reset {
-            script.fire_event("READY_CHECK", vec![]);
+    // The packets replay into the engine after the roster push, in arrival order. A VM reset
+    // skips what came before it, which would pop a check that has ended. The started check's
+    // event waits for the initiator's name, as the reference's name-cache callback does.
+    if vm_reset || fed.ready_checks_fed > group.ready_checks.len() {
+        fed.ready_checks_fed = group.ready_checks.len();
+        fed.initiator_unnamed = None;
+    }
+    for &wire in &group.ready_checks[fed.ready_checks_fed..] {
+        gate.audit("feed_party", "a ready-check packet");
+        match wire {
+            ReadyCheckWire::Started { initiator } => {
+                script.ready_check_armed(initiator);
+                fed.initiator_unnamed = Some(initiator);
+            }
+            ReadyCheckWire::Confirm { guid, ready } => script.ready_check_confirmed(guid, ready),
+            ReadyCheckWire::Finished => script.ready_check_finished(),
         }
     }
-    // Each request arms the engine's side (the leader's close, a member's 30 s deadline); the
-    // answer log then replays from this memo's cursor.
-    if group.ready_check_requests != fed.ready_check_requests {
-        fed.ready_check_requests = group.ready_check_requests;
-        fed.answers_forwarded = 0;
-        if !vm_reset {
-            script.ready_check_request(Some(group.leader) == self_guid);
+    fed.ready_checks_fed = group.ready_checks.len();
+    if let Some(guid) = fed.initiator_unnamed {
+        if let Some(name) = names.player(guid) {
+            fed.initiator_unnamed = None;
+            script.ready_check_initiated(name.unwrap_or(""));
         }
     }
-    for &(guid, ready) in group.ready_check_answers.iter().skip(fed.answers_forwarded) {
-        script.ready_check_answered(guid, ready);
-    }
-    fed.answers_forwarded = group.ready_check_answers.len();
 
     // ── UPDATE_INSTANCE_INFO ────────────────────────────────────────────────
     //
@@ -618,6 +619,73 @@ pub(super) fn feed_party(
             None => script.fire_event("PARTY_INVITE_CANCEL", vec![]),
         }
         fed.invite = group.pending_invite.clone();
+    }
+}
+
+/// `RAID_TARGET_UPDATE` and the mark notices. The event fires once per packet, whatever it changed
+/// (`0x57449b`), with no argument; the board edge stands in for the clears no packet carries and
+/// gives a fresh VM its catch-up. It runs after the unit snapshots, whose marks
+/// `GetRaidTargetIndex` reads on the event (`TargetFrame.lua:99`), as the reference reads the board
+/// live. Then each notice is a `CHAT_MSG_TARGETICONS` line (`0x50b0f0`): `TARGET_ICON_SET` over the
+/// setter's name twice, the icon's number and the target's name, `UNKNOWNOBJECT` while it
+/// resolves.
+pub(super) fn feed_marks(
+    script: Option<NonSendMut<UiScript>>,
+    group: Res<GroupState>,
+    mut notices: ResMut<super::GroupNotices>,
+    mut chat: ResMut<crate::ui_chat::ChatLog>,
+    mut fed: Local<crate::ui_script::VmMemo<FedMarks>>,
+) {
+    let Some(mut script) = script else {
+        notices.target_icons.clear();
+        return;
+    };
+    let (fed, vm_reset) = fed.get_reset(&script);
+    if group.is_changed() || vm_reset {
+        // The count follows the roster's rule.
+        let owed =
+            roster_updates_owed(group.raid_target_updates, fed.raid_target_updates, vm_reset);
+        fed.raid_target_updates = group.raid_target_updates;
+        let board_moved = group.raid_targets != fed.raid_targets;
+        fed.raid_targets = group.raid_targets;
+        let fires = if owed != 0 {
+            owed
+        } else {
+            u32::from(board_moved)
+        };
+        for _ in 0..fires {
+            script.fire_event("RAID_TARGET_UPDATE", vec![]);
+        }
+    }
+    if notices.target_icons.is_empty() {
+        return;
+    }
+    let pending = std::mem::take(&mut notices.target_icons);
+    let get = |key: &str| {
+        let text = script.lua().globals().get::<String>(key).ok();
+        text.filter(|t| !t.is_empty())
+    };
+    let Some(template) = get("TARGET_ICON_SET") else {
+        return;
+    };
+    for notice in pending {
+        let target = notice
+            .target
+            .or_else(|| get("UNKNOWNOBJECT"))
+            .unwrap_or_default();
+        let text = benilla_ui::strings::fill(
+            &template,
+            &[
+                benilla_ui::strings::Arg::S(&notice.setter),
+                benilla_ui::strings::Arg::S(&notice.setter),
+                benilla_ui::strings::Arg::D(i64::from(notice.icon) + 1),
+                benilla_ui::strings::Arg::S(&target),
+            ],
+        );
+        chat.push_event(crate::ui_chat::ChatEvent::text_only(
+            crate::ui_chat::ChatEventKind::TargetIcons,
+            text,
+        ));
     }
 }
 
@@ -956,6 +1024,9 @@ pub(super) fn drain_party(
                 let _ = commands.0.send(ClientCommand::GroupAccept { roles });
                 group.pending_invite = None;
             }
+            PartyRequest::OptOutOfLoot(on) => {
+                let _ = commands.0.send(ClientCommand::OptOutOfLoot { on });
+            }
             PartyRequest::Decline => {
                 let _ = commands.0.send(ClientCommand::GroupDecline);
                 group.pending_invite = None;
@@ -1161,6 +1232,9 @@ pub(super) fn drain_party(
             PartyRequest::ReadyCheckAnswer(ready) => {
                 let _ = commands.0.send(ClientCommand::ReadyCheckAnswer { ready });
             }
+            PartyRequest::ReadyCheckFinish => {
+                let _ = commands.0.send(ClientCommand::ReadyCheckFinish);
+            }
             PartyRequest::RequestRaidInfo => {
                 let _ = commands.0.send(ClientCommand::RequestRaidInfo);
             }
@@ -1357,9 +1431,10 @@ fn apply_test_intent(
             true
         }
         PartyRequest::ReadyCheckStart => {
-            // The server's echo to the whole raid, us included. Only the leader has the button,
-            // and the leader's echo takes the collection arm: no popup for the presser.
-            group.apply_ready_check_request(true);
+            // The server's echo to the whole group, us included, naming us as the initiator.
+            group.apply_ready_check(ReadyCheckWire::Started {
+                initiator: self_guid.unwrap_or(0),
+            });
             true
         }
         PartyRequest::RequestRaidInfo => {
@@ -2469,8 +2544,7 @@ mod tests {
             "9 is not a subgroup"
         );
 
-        // Echoed to us as leader, our ready check moves the request count, not the popup's.
-        let (ticket, requests) = (group.ready_check, group.ready_check_requests);
+        // Echoed to the whole group, our ready check names us as its initiator.
         assert!(test_apply_local(
             &mut group,
             &PartyRequest::ReadyCheckStart,
@@ -2478,8 +2552,8 @@ mod tests {
             None
         ));
         assert_eq!(
-            (group.ready_check, group.ready_check_requests),
-            (ticket, requests + 1)
+            group.ready_checks.last(),
+            Some(&ReadyCheckWire::Started { initiator: 0x5E1F })
         );
     }
 
@@ -2555,5 +2629,40 @@ mod tests {
             &vec![crate::ui_action::UiError::key("ERR_INVITE_SELF")],
             "our own name is refused before the send"
         );
+    }
+
+    /// `0x50b0f0`: the notice fills `TARGET_ICON_SET` with the setter twice, the icon's number and
+    /// the target, `UNKNOWNOBJECT` while the name resolves.
+    #[test]
+    fn a_mark_notice_is_a_target_icons_line() {
+        use bevy::ecs::system::RunSystemOnce;
+        let mut world = World::new();
+        let script = UiScript::new().unwrap();
+        script
+            .run(r#"TARGET_ICON_SET = "[%s|%s] %d on %s" UNKNOWNOBJECT = "Unknown""#)
+            .unwrap();
+        world.insert_non_send_resource(script);
+        world.init_resource::<crate::ui_chat::ChatLog>();
+        let notice = |icon, target: Option<&str>| super::super::TargetIconNotice {
+            setter: "Aldwyn".into(),
+            icon,
+            target: target.map(str::to_string),
+        };
+        world.insert_resource(super::super::GroupNotices {
+            target_icons: vec![notice(7, Some("Brisca")), notice(0, None)],
+        });
+        world.init_resource::<GroupState>();
+        world.run_system_once(feed_marks).unwrap();
+        assert_eq!(
+            world.resource::<crate::ui_chat::ChatLog>().pending_lines(),
+            [
+                "[Aldwyn|Aldwyn] 8 on Brisca",
+                "[Aldwyn|Aldwyn] 1 on Unknown"
+            ]
+        );
+        assert!(world
+            .resource::<super::super::GroupNotices>()
+            .target_icons
+            .is_empty());
     }
 }

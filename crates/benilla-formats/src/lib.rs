@@ -56,6 +56,8 @@ mod macro_icons;
 pub use unit_blood::{load_blood_catalog, BloodCatalog};
 mod itemsets;
 pub use itemsets::{load_item_sets, ItemSetCatalog, ItemSetInfo};
+mod gm_survey;
+pub use gm_survey::{load_gm_survey, GmSurvey, SURVEY_QUESTIONS};
 mod gm_ticket_category;
 pub use gm_ticket_category::{
     load_gm_ticket_categories, GmTicketCategory, GmTicketCategoryCatalog,
@@ -72,9 +74,13 @@ pub use vehicle::{
 mod glyphs;
 pub use glyphs::{load_glyph_catalog, GlyphCatalog, GlyphProperty, GlyphSlot};
 mod gem_properties;
+mod item_limit_category;
 mod spell_rune_cost;
 mod totem_category;
 pub use gem_properties::{load_gem_properties, GemPropertiesCatalog};
+pub use item_limit_category::{
+    load_item_limit_categories, ItemLimitCategory, ItemLimitCategoryCatalog,
+};
 pub use spell_rune_cost::{load_spell_rune_costs, SpellRuneCost, SpellRuneCostCatalog};
 pub use totem_category::{load_totem_categories, TotemCategory, TotemCategoryCatalog};
 mod cfg_categories;
@@ -123,6 +129,8 @@ mod durability;
 pub use durability::{load_durability_tables, DurabilityTables};
 mod exhaustion;
 pub use exhaustion::{load_exhaustion, ExhaustionRow};
+mod movie;
+pub use movie::{load_movies, MovieCatalog, MovieFile};
 mod bank_bag_slot_prices;
 mod currency;
 pub use bank_bag_slot_prices::{load_bank_bag_slot_prices, BankBagSlotPrices};

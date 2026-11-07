@@ -608,23 +608,20 @@ fn run_entry_load_slice(world: &mut World, covering: bool) {
 }
 
 /// Seat the VM's screen size, display modes and text measurer for the load, under the current
-/// window and `uiScale`: the load-edge half of [`super::extract::tick_script`]'s per-frame pair. A
-/// fresh VM answers 1024×768 until then, and a value computed once at load keeps it: stock
+/// window: the load-edge half of [`super::extract::tick_script`]'s per-frame pair. A fresh VM
+/// answers 1024×768 until then, and a value computed once at load keeps it: stock
 /// `WorldMapFrame_OnLoad` sizes the full-screen `BlackoutWorld` from `GetScreenWidth()` and
 /// `GetScreenHeight()` and never again (`WorldMapFrame.lua:19-28`). The font engine is built here
 /// when the glue VM loads at `Startup`, before the first `Update` would build it: the stock
 /// size-to-text `OnLoad`s read `GetTextWidth` (`CharacterCreate.xml:594`).
 fn seat_raster_seam_for_load(world: &mut World, script: &mut UiScript) {
     crate::ui_text::ensure_atlas(world);
-    let ui_scale = world
-        .get_resource::<super::UiScaleCvar>()
-        .map_or(1.0, |c| c.for_vm(script.vm_kind()));
     let (w, h) = {
         let mut q = world.query_filtered::<&Window, With<bevy::window::PrimaryWindow>>();
         q.single(world)
             .map_or((0.0, 0.0), |win| (win.width(), win.height()))
     };
-    let s = super::seam_scale(h, ui_scale);
+    let s = super::seam_scale(h);
     if w > 0.0 && h > 0.0 {
         // The VM lives in 768-tall virtual space, so logical size over the seam scale is its
         // screen. No `UIParent_ManageFramePositions` here, unlike `tick_script`: nothing is laid
@@ -784,6 +781,9 @@ fn entry_finish(world: &mut World, script: &mut UiScript, inputs: &EntryInputs) 
         let z = world.resource::<crate::minimap::MinimapZoom>();
         (z.outdoor, z.inside)
     };
+    let ui_scale = world
+        .get_resource::<super::UiScaleCvar>()
+        .map_or(1.0, |c| c.0);
     script.set_minimap_zoom(zoom.0, zoom.1);
     // The saved-variables chunk runs after the files set their defaults and before
     // `VARIABLES_LOADED`, the reference's addon-load order; reversed, the defaults always win.
@@ -799,6 +799,9 @@ fn entry_finish(world: &mut World, script: &mut UiScript, inputs: &EntryInputs) 
         |script| script.load_tracked_state(class_id),
         |script| {
             crate::ui_chat::restore_chat_looks(world, script);
+            // `UIParent` scales last, so the whole load read a bare root (`0x52a980` runs
+            // `0x5240e0` at its end, the chat settings restored and the world not yet entered).
+            script.set_ui_scale(ui_scale);
         },
     );
 }
@@ -902,8 +905,8 @@ pub(crate) struct AddOnIdentity(pub(crate) Option<(String, String)>);
 pub(crate) struct LeavingWorldArmed(bool);
 
 /// The leave-world sweep ran past its latch: a cross-map worldport (the local player's destructor),
-/// a `/reload` or leaving the world. Its legs past the clear read this, as the meeting stone's text
-/// drop does; a same-map teleport destroys nothing and never sweeps.
+/// a `/reload` or leaving the world. Its legs past the clear read this, as the instance lock clock's
+/// stop does; a same-map teleport destroys nothing and never sweeps.
 #[derive(Message)]
 pub(crate) struct WorldLeaveSweepMessage;
 
@@ -1298,8 +1301,7 @@ mod tests {
     }
 
     /// A `ReloadUI()` runs the leave-world sweep (past the armed latch) and then re-enters the
-    /// world-enter cascade, whose readers re-send the time, mail, battlefield and meeting-stone
-    /// queries, only with the active player set.
+    /// world-enter cascade, whose readers re-send the time, mail and battlefield queries, only with the active player set.
     #[test]
     fn a_reload_sweeps_and_reenters_the_world_enter_cascade_once_the_player_exists() {
         use crate::net::WorldEnterCascadeMessage;

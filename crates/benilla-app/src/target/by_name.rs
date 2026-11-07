@@ -15,8 +15,9 @@
 //! object list's order (a tail append); we rank exact, then longer prefix, then nearest
 //! ([`Rank::beats`]), because the nearest namesake is the better pick.
 //!
-//! Not built: the reference's party and raid pre-scans, which select an unstreamed groupmate;
-//! [`Selection::target`] is an `Entity`.
+//! Not built for selection: the reference's party and raid pre-scans, which select an unstreamed
+//! groupmate; [`Selection::target`] is an `Entity`. `DoEmote` needs only a guid
+//! ([`emote_name_match`]).
 
 use std::cmp::Ordering;
 
@@ -107,15 +108,16 @@ fn common_prefix_len(query: &str, name: &str) -> usize {
 /// | we are alive | `0x7e` `ERR_PLAYER_DEAD` |
 /// | we are not stunned (`UNIT_FIELD_FLAGS & 0x40000`) | `0x191` `ERR_GENERIC_STUNNED` |
 /// | we are not casting | `0x134` `ERR_TOOBUSYTOFOLLOW` |
+/// | the followee is inside the row's 30 yd (`0x715c70`, 3D) | `0x126` `ERR_AUTOFOLLOW_TOO_FAR` |
 ///
-/// There is no followee-alive check (the per-tick death test ends a follow) and no distance check:
-/// follow's row has a `0.0` threshold, so `ERR_AUTOFOLLOW_TOO_FAR` never fires.
+/// There is no followee-alive check; the distance is the arm's, past its canceller, which ran.
 fn follow_refusal_key(
     followee_is_player: bool,
     can_assist_followee: bool,
     we_are_dead: bool,
     we_are_stunned: bool,
     we_are_casting: bool,
+    within_leash: bool,
 ) -> Option<&'static str> {
     if !followee_is_player || !can_assist_followee {
         return Some("ERR_INVALID_FOLLOW_TARGET");
@@ -129,8 +131,14 @@ fn follow_refusal_key(
     if we_are_casting {
         return Some("ERR_TOOBUSYTOFOLLOW");
     }
+    if !within_leash {
+        return Some(FOLLOW_TOO_FAR);
+    }
     None
 }
+
+/// The arm's refusal, the one past its canceller.
+const FOLLOW_TOO_FAR: &str = "ERR_AUTOFOLLOW_TOO_FAR";
 
 /// Whether the prefix tier is live, the resolver's exact-only argument. The unit popup's Target and
 /// Follow pass 1 (`UnitPopup.lua:557`, `UnitPopup.lua:623`), so a menu naming its unit never lands
@@ -199,6 +207,8 @@ enum Filter {
     AcceptAll,
     /// Mode 2, the assist check and `UNIT_FIELD_HEALTH > 0`: `/follow`.
     AssistableAlive,
+    /// Mode 1, the attack check and alive: `StartAttack`'s name.
+    AttackableAlive,
 }
 
 impl ByNameScan<'_, '_> {
@@ -226,6 +236,32 @@ impl ByNameScan<'_, '_> {
         ) >= 4
     }
 
+    /// The mode-1 arm: the reads-dead triple, then the attack check.
+    fn attackable_alive(&self, store: Option<&ObjectStore>) -> bool {
+        if store.is_some_and(|s| s.0.unit_reads_dead()) {
+            return false;
+        }
+        let self_store = self.self_q.single().ok().and_then(|(_, _, _, s)| s);
+        super::can_attack(
+            store,
+            self.factions.as_deref(),
+            &self.reputations,
+            super::party_of(self.group.as_deref()),
+            self_store,
+        )
+    }
+
+    /// The closest attackable unit by name, `StartAttack`'s search (`0x523090`).
+    pub(super) fn attackable(&self, name: &str, exact: bool) -> Option<(Entity, u64)> {
+        let mode = if exact {
+            Match::ExactOnly
+        } else {
+            Match::PrefixOk
+        };
+        self.resolve(name, NameSearch::AnyUnit, Filter::AttackableAlive, mode)
+            .map(|(entity, guid, _)| (entity, guid))
+    }
+
     /// The follow start gate ([`follow_refusal_key`]): the key of the first refusal, for the UI's
     /// error display. `FollowUnit` skips the resolver but not this gate.
     fn follow_refusal(
@@ -233,8 +269,13 @@ impl ByNameScan<'_, '_> {
         followee: u64,
         followee_store: Option<&ObjectStore>,
         casting: bool,
+        at: Option<Vec3>,
     ) -> Option<&'static str> {
         let self_store = self.self_q.single().ok().and_then(|(_, _, _, s)| s);
+        let within_leash = match (at, self.origin()) {
+            (Some(at), Some(me)) => at.distance_squared(me) < crate::player::FOLLOW_LEASH_SQ,
+            _ => true,
+        };
         follow_refusal_key(
             guid::is_player(followee),
             super::ring_reaction(
@@ -247,6 +288,7 @@ impl ByNameScan<'_, '_> {
             self_store.is_some_and(|s| s.0.unit_is_dead()),
             self_store.is_some_and(|s| s.0.unit_flags() & crate::player::UNIT_FLAG_STUNNED != 0),
             casting,
+            within_leash,
         )
     }
 
@@ -267,7 +309,11 @@ impl ByNameScan<'_, '_> {
             query,
             search,
             mode,
-            |store| filter != Filter::AssistableAlive || self.assistable_alive(store),
+            |store| match filter {
+                Filter::AcceptAll => true,
+                Filter::AssistableAlive => self.assistable_alive(store),
+                Filter::AttackableAlive => self.attackable_alive(store),
+            },
         )
     }
 }
@@ -352,14 +398,28 @@ pub(crate) struct PlayerLookup<'w, 's> {
 }
 
 impl PlayerLookup<'_, '_> {
-    /// The reference's resolver with typemask `0x10`, filter mode 0 and no exact-only flag, as
-    /// `/assist <name>` calls it: any player in the object list, whole name or longest prefix.
-    /// Selects nothing.
-    pub(crate) fn find(&self, names: &NameCache, name: &str) -> Option<(Entity, u64)> {
-        self.find_as(names, name, Match::PrefixOk)
+    /// The resolver's object walk with typemask `0x10`, filter mode 0 and no exact-only flag, past
+    /// the active player, who scans at the group's distance (`0x51ffe0`): any other visible match or
+    /// group member comes first, and a hit on ourselves is untargeted anyway. Selects nothing.
+    pub(crate) fn find_other(&self, names: &NameCache, name: &str, me: Option<u64>) -> Option<u64> {
+        let origin = self.self_q.single().ok().map(|tf| tf.translation());
+        scan_units(
+            self.units
+                .iter()
+                .filter(|(_, g, _)| Some(g.0) != me)
+                .map(|(e, g, tf)| (e, g.0, tf.translation(), None)),
+            origin,
+            names,
+            name,
+            NameSearch::PlayerOnly,
+            Match::PrefixOk,
+            |_| true,
+        )
+        .map(|(_, g, _)| g)
     }
 
-    /// [`Self::find`] with the exact-only flag, as `StartDuel`'s second argument sets it.
+    /// The same walk over every player, with the exact-only flag as `StartDuel`'s second argument
+    /// sets it.
     pub(crate) fn find_as(
         &self,
         names: &NameCache,
@@ -380,6 +440,53 @@ impl PlayerLookup<'_, '_> {
         )
         .map(|(e, g, _)| (e, g))
     }
+}
+
+/// `name` starts with the whole of `query`, folded (`0x5131ad`, compared at the query's length).
+fn has_query_prefix(name: &str, query: &str) -> bool {
+    name.len() >= query.len()
+        && name.as_bytes()[..query.len()].eq_ignore_ascii_case(query.as_bytes())
+}
+
+/// `DoEmote`'s name search past the token words, which needs only a guid. The token resolver's name
+/// half (`0x60a630`) takes the active player, then the raid or else the party, by the whole name;
+/// the scan (`0x52027e`) walks the party slots, then the raid, each member with no object and a
+/// cached name, then the visible objects, whose `streamed` hit is [`PlayerLookup::find_other`]'s and
+/// outbids the group's distance (`0x520331`).
+pub(crate) fn emote_name_match(
+    names: &NameCache,
+    roster: &crate::spell::group_relation::GroupRoster,
+    me: Option<u64>,
+    streamed: Option<u64>,
+    held: impl Fn(u64) -> bool,
+    query: &str,
+) -> Option<u64> {
+    let named = |guid: u64, hit: fn(&str, &str) -> bool| {
+        names.peek(guid).is_some_and(|name| hit(name, query))
+    };
+    let whole = |name: &str, query: &str| name.eq_ignore_ascii_case(query);
+    let group = if roster.raid.is_empty() {
+        &roster.party
+    } else {
+        &roster.raid
+    };
+    if let Some(guid) = me
+        .into_iter()
+        .chain(group.iter().copied())
+        .find(|&g| named(g, whole))
+    {
+        return Some(guid);
+    }
+    streamed
+        .filter(|&g| named(g, has_query_prefix))
+        .or_else(|| {
+            roster
+                .party
+                .iter()
+                .chain(&roster.raid)
+                .copied()
+                .find(|&g| !held(g) && named(g, has_query_prefix))
+        })
 }
 
 /// `/target <name>` and the Lua `TargetByName(name, exactMatch)` through [`scan::commit`], the
@@ -473,10 +580,12 @@ pub(super) fn follow_requests(
     group: Res<crate::ui_party::GroupState>,
     index: Res<GuidIndex>,
     stores: Query<&ObjectStore>,
+    places: Query<&Transform>,
     cast: Res<crate::spell::PendingCast>,
     mut errors: ResMut<crate::ui_action::UiErrorKeys>,
     mut follow: ResMut<crate::player::FollowState>,
     mut approach: ResMut<crate::player::Approach>,
+    mut stand: MessageWriter<crate::player::StandStateRequest>,
 ) {
     for request in requests.read() {
         let resolved = match request {
@@ -505,7 +614,9 @@ pub(super) fn follow_requests(
         };
         // The start gate, whichever way the subject was found.
         if let Some((guid, _)) = &resolved {
-            let followee = index.0.get(guid).and_then(|e| stores.get(*e).ok());
+            let entity = index.0.get(guid);
+            let followee = entity.and_then(|e| stores.get(*e).ok());
+            let at = entity.and_then(|e| places.get(*e).ok().map(|t| t.translation));
             if let Some(key) = scan_params.follow_refusal(
                 *guid,
                 followee,
@@ -513,18 +624,30 @@ pub(super) fn follow_requests(
                 // (`bevy::platform::time::Instant`, not `bevy::platform::time::Instant` — see
                 // `crate::ui_script::UiClock::anchor`'s doc for why they differ on wasm32).
                 cast.in_flight(bevy::platform::time::Instant::now()),
+                at,
             ) {
                 info!("follow: refused — {key}");
                 errors.0.push(crate::ui_action::UiError::key(key));
+                if key == FOLLOW_TOO_FAR {
+                    approach.stop();
+                    follow.stop();
+                }
                 continue;
             }
         }
         match resolved {
             Some((guid, name)) => {
                 info!("follow: now following \"{name}\" guid {guid:#x}");
-                // The arm cancels what runs first: one auto-move cell.
+                // The arm cancels what runs first, one auto-move cell, and stands us up.
                 approach.stop();
                 follow.start(guid, name);
+                let seated = scan_params
+                    .self_q
+                    .single()
+                    .is_ok_and(|(_, _, _, s)| s.is_some_and(|s| s.0.unit_stand_state() != 0));
+                if seated {
+                    stand.write(crate::player::StandStateRequest { state: 0 });
+                }
             }
             None => {
                 // No subject by name or token: a follow in progress is left alone.
@@ -671,6 +794,72 @@ mod tests {
         }
     }
 
+    /// The scan's order: a member's whole name first, a visible player over an unstreamed member,
+    /// an unstreamed member over nobody, party slots before the raid, and a member with an object or
+    /// no cached name not at all.
+    #[test]
+    fn the_emote_search_finds_a_group_member_out_of_streaming_range() {
+        use crate::spell::group_relation::GroupRoster;
+
+        const ME: u64 = 1;
+        const FAR: u64 = 2;
+        const NEAR: u64 = 3;
+        const NAMELESS: u64 = 4;
+        const STRANGER: u64 = 5;
+        const RAIDER: u64 = 6;
+
+        let mut names = NameCache::default();
+        for (guid, name) in [
+            (ME, "Claude"),
+            (FAR, "Farley"),
+            (NEAR, "Nearby"),
+            (STRANGER, "Farmer"),
+            (RAIDER, "Raidley"),
+        ] {
+            names.insert_player(guid, name.to_string(), None);
+        }
+        let roster = GroupRoster {
+            party: vec![NAMELESS, FAR, NEAR],
+            raid: Vec::new(),
+        };
+        let held = |g| g == NEAR || g == ME || g == STRANGER;
+        let find =
+            |streamed, query| emote_name_match(&names, &roster, Some(ME), streamed, held, query);
+        assert_eq!(
+            find(None, "Farley"),
+            Some(FAR),
+            "the whole name, unstreamed"
+        );
+        assert_eq!(find(None, "farl"), Some(FAR), "a prefix, unstreamed");
+        assert_eq!(
+            find(Some(STRANGER), "Far"),
+            Some(STRANGER),
+            "visible outbids"
+        );
+        assert_eq!(find(None, "Claude"), Some(ME), "the whole own name");
+        assert_eq!(
+            find(None, "Near"),
+            None,
+            "a member with an object is the scan's"
+        );
+        assert_eq!(find(Some(NEAR), "Near"), Some(NEAR));
+        assert_eq!(find(None, "Zed"), None);
+        assert_eq!(
+            find(Some(STRANGER), "Farz"),
+            None,
+            "a hit must start with the whole query"
+        );
+        let raid = GroupRoster {
+            party: Vec::new(),
+            raid: vec![ME, RAIDER],
+        };
+        assert_eq!(
+            emote_name_match(&names, &raid, Some(ME), None, held, "Raid"),
+            Some(RAIDER),
+            "the raid roster, when the party slots miss"
+        );
+    }
+
     #[test]
     fn prefix_length_folds_case_and_stops_at_the_shorter_string() {
         assert_eq!(common_prefix_len("rag", "Ragnaros"), 3);
@@ -708,39 +897,51 @@ mod tests {
     #[test]
     fn the_follow_gate_refuses_in_the_references_own_order() {
         // The clean case.
-        assert_eq!(follow_refusal_key(true, true, false, false, false), None);
+        assert_eq!(
+            follow_refusal_key(true, true, false, false, false, true),
+            None
+        );
         // A creature refuses, however it was found.
         assert_eq!(
-            follow_refusal_key(false, true, false, false, false),
+            follow_refusal_key(false, true, false, false, false, true),
             Some("ERR_INVALID_FOLLOW_TARGET")
         );
         // An enemy player fails the assist check, and shares the creature's line.
         assert_eq!(
-            follow_refusal_key(true, false, false, false, false),
+            follow_refusal_key(true, false, false, false, false, true),
             Some("ERR_INVALID_FOLLOW_TARGET")
         );
         // Our own three, each shadowed by the followee checks above it.
         assert_eq!(
-            follow_refusal_key(true, true, true, false, false),
+            follow_refusal_key(true, true, true, false, false, true),
             Some("ERR_PLAYER_DEAD")
         );
         assert_eq!(
-            follow_refusal_key(true, true, false, true, false),
+            follow_refusal_key(true, true, false, true, false, true),
             Some("ERR_GENERIC_STUNNED")
         );
         assert_eq!(
-            follow_refusal_key(true, true, false, false, true),
+            follow_refusal_key(true, true, false, false, true, true),
             Some("ERR_TOOBUSYTOFOLLOW")
         );
         // Everything wrong at once: the followee's line wins.
         assert_eq!(
-            follow_refusal_key(false, false, true, true, true),
+            follow_refusal_key(false, false, true, true, true, true),
             Some("ERR_INVALID_FOLLOW_TARGET")
         );
         // Dead and stunned: dead is checked first.
         assert_eq!(
-            follow_refusal_key(true, true, true, true, true),
+            follow_refusal_key(true, true, true, true, true, true),
             Some("ERR_PLAYER_DEAD")
+        );
+        // The arm's distance comes last, past every gate above.
+        assert_eq!(
+            follow_refusal_key(true, true, false, false, false, false),
+            Some("ERR_AUTOFOLLOW_TOO_FAR")
+        );
+        assert_eq!(
+            follow_refusal_key(true, true, false, false, true, false),
+            Some("ERR_TOOBUSYTOFOLLOW")
         );
     }
 

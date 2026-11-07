@@ -92,6 +92,21 @@ pub(super) struct PickPose<'w, 's> {
     /// The world-space matrices the vertex stage skins with, read from the CPU rows.
     palettes: Res<'w, benilla_world::rig_palette::RigPalettes>,
     rigs: Query<'w, 's, &'static benilla_world::rig_palette::RigSkin>,
+    /// Worn gear drawn through its wearer's slot: its palette is the wearer's rider rows.
+    riders: Query<'w, 's, &'static benilla_world::rig_rider::RigRider>,
+}
+
+impl PickPose<'_, '_> {
+    /// The skinning matrices a part linked to `rig` draws with.
+    fn palette(&self, rig: Entity) -> Option<Vec<Mat4>> {
+        if let Ok(skin) = self.rigs.get(rig) {
+            return self
+                .palettes
+                .world_palette(skin.slot, skin.bones() as usize);
+        }
+        let rider = self.riders.get(rig).ok().filter(|r| r.row.is_some())?;
+        self.palettes.rider_world_palette(rider.slot)
+    }
 }
 
 /// The local identity and what of it and of the corpses the pick takes, one [`SystemParam`] under
@@ -265,7 +280,11 @@ pub(super) fn update_hover(
     let (Ok((camera, cam_tf)), Ok(window)) = (camera.single(), window.single()) else {
         return;
     };
-    let Some(cursor) = window.cursor_position() else {
+    let Some(cursor) = window.cursor_position().or_else(|| {
+        super::hover_probe::armed()
+            .then(super::hover_probe::now)
+            .flatten()
+    }) else {
         return;
     };
     let Ok(ray) = camera.viewport_to_world(cam_tf, cursor) else {
@@ -319,10 +338,7 @@ pub(super) fn update_hover(
         // The skinning matrices of one skeleton's parts, as of last frame's propagated pose.
         let palette_of =
             |sk: &[(&Mesh3d, &benilla_world::rig_palette::RigPart)]| -> Option<Vec<Mat4>> {
-                sk.first().and_then(|(_, part)| {
-                    let rig = pose.rigs.get(part.0).ok()?;
-                    pose.palettes.world_palette(rig.slot, rig.bones() as usize)
-                })
+                sk.first().and_then(|(_, part)| pose.palette(part.0))
             };
         // The pass-2 ladder: alive 3, dead 2, a corpse 2 when `CORPSE_DYNFLAG_LOOTABLE`, else 0. A
         // corpse has no UNIT block, so `unit_is_dead()` would answer alive for it.
@@ -529,21 +545,11 @@ fn net_entity_of(
 }
 
 /// What the GameObject gates read beside the object's store: the template cache (GENERIC's
-/// eligibility is its `data[1]`, MEETINGSTONE's its `data[2]`), the faction catalog, and the
-/// meeting-stone queue, the reference's global.
+/// eligibility is its `data[1]`) and the faction catalog.
 #[derive(bevy::ecs::system::SystemParam)]
 pub(crate) struct GoGateInputs<'w> {
     pub(crate) templates: Res<'w, crate::go_templates::GameObjectTemplates>,
     pub(crate) factions: Option<Res<'w, super::ring::Factions>>,
-    /// Absent in a net-less build, read as the reference's zeroed global: not queued.
-    pub(crate) stone: Option<Res<'w, crate::ui_dialog_verbs::MeetingStone>>,
-}
-
-impl GoGateInputs<'_> {
-    /// The area we are queued at, or 0.
-    pub(crate) fn queued_area(&self) -> u32 {
-        self.stone.as_deref().map_or(0, |s| s.area)
-    }
 }
 
 pub(super) fn update_hovered_object(
@@ -689,12 +695,6 @@ pub(super) fn update_hovered_object(
                         channel_owned: crate::target::cursor_mode::fishing_channel_owned(
                             self_store, go_guid,
                         ),
-                        meeting_stone_queued: crate::target::cursor_mode::meeting_stone_queued(
-                            go_guid
-                                .and_then(|g| go_gate.templates.get(g)?.meeting_stone)
-                                .map(|m| m.area),
-                            go_gate.queued_area(),
-                        ),
                     };
                     u32::from(crate::target::cursor_mode::go_highlightable(
                         s, reaction, overrides,
@@ -749,10 +749,6 @@ pub(super) fn update_hovered_object(
                 channel_owned: crate::target::cursor_mode::fishing_channel_owned(
                     self_store,
                     Some(guid.0),
-                ),
-                meeting_stone_queued: crate::target::cursor_mode::meeting_stone_queued(
-                    tmpl.and_then(|t| t.meeting_stone).map(|m| m.area),
-                    go_gate.queued_area(),
                 ),
             },
         ) {

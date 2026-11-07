@@ -41,6 +41,7 @@ mod reticle;
 pub(crate) mod ring;
 mod scan;
 mod script;
+pub(crate) mod stone;
 pub(crate) use script::ScriptSelect;
 
 /// `Faction.dbc`, our reputation table and the group as one [`SystemParam`], since every reaction
@@ -79,7 +80,9 @@ pub(crate) use relations::{
 // pet bar's; the melee probe's press with nothing selected.
 pub(crate) use scan::{AttackNearestRequest, AttackPick};
 // The chat layer's by-name asks (`/target`, `/assist`).
-pub(crate) use by_name::{AssistRequest, Match as NameMatch, PlayerLookup, TargetByNameRequest};
+pub(crate) use by_name::{
+    emote_name_match, AssistRequest, Match as NameMatch, PlayerLookup, TargetByNameRequest,
+};
 // The one selection-set path, for the loot response's select.
 pub(crate) use by_name::SelectCommit;
 // The reaction decode and its faction catalog, which also tint the target frame
@@ -174,10 +177,11 @@ impl Default for PickOcclusion {
     }
 }
 
-/// The pick latched on the button's down edge, which a world click of either button acts on: the
-/// reference picks once per press into the WorldFrame (state `+0x350`, guid `+0x358`, point
-/// `+0x360`, distance `+0x36c`), so a drag can orbit the camera and still select. The hover is
-/// another matter: the reference blanks it during freelook (it sets `[wf+0x38c]&2`).
+/// A [`WorldClick`] whose press the UI claimed for a payload drop: it drops and never selects.
+#[derive(Message, Clone, Copy)]
+pub(crate) struct WorldDropClick;
+
+/// The pick latched on the press, which a click acts on (`0x4fa570`: kind `+0x2d8`, guid `+0x2e0`).
 #[derive(Resource, Default, Clone, Copy)]
 pub(crate) struct PressPick {
     pub(crate) hovered: Hovered,
@@ -195,6 +199,29 @@ impl PressPick {
     /// Whether the press was an Attack-cursor press, for the reference's new-target validation.
     pub(crate) fn attack(&self) -> bool {
         self.cursor.kind == cursor_mode::CursorKind::Attack
+    }
+
+    /// The hit kind the click switches on ([`world_pick`]).
+    pub(crate) fn world_pick(&self) -> benilla_ui::script::WorldPick {
+        world_pick(&self.hovered, &self.object, &self.occlusion)
+    }
+}
+
+/// The reference's one pick out of our two: a nearer GameObject, an object hit, a ray hit, the sky.
+pub(crate) fn world_pick(
+    hovered: &Hovered,
+    object: &HoveredObject,
+    occlusion: &PickOcclusion,
+) -> benilla_ui::script::WorldPick {
+    use benilla_ui::script::WorldPick;
+    if go_is_nearest(hovered, object) {
+        WorldPick::GameObject
+    } else if hovered.any().is_some() || hovered.refused {
+        WorldPick::Object
+    } else if occlusion.distance.is_finite() {
+        WorldPick::Terrain
+    } else {
+        WorldPick::Nothing
     }
 }
 
@@ -241,6 +268,7 @@ pub(crate) fn go_is_nearest(character: &Hovered, go: &HoveredObject) -> bool {
 /// horizontal extents; the ring scales it by `OBJECT_FIELD_SCALE_X`. Stamped at attach; a
 /// model-less unit has none and takes the ring's fallback radius.
 #[derive(Component, Clone, Copy)]
+#[component(storage = "SparseSet")]
 pub(crate) struct SelectionRadius(pub(crate) f32);
 
 /// The set the targeting chain runs in: readers of [`Selection`], [`Hovered`] or [`CombatFlash`]
@@ -309,11 +337,23 @@ impl Plugin for TargetPlugin {
             .init_resource::<CombatFlash>()
             .init_resource::<scan::TabHistory>()
             .init_resource::<scan::LastEnemy>()
+            .init_resource::<scan::LastFriend>()
+            .add_message::<WorldDropClick>()
             .add_message::<AttackNearestRequest>()
             .add_message::<TargetByNameRequest>()
             .add_message::<AssistRequest>()
             .add_message::<click::DeselectGuid>()
+            .add_message::<click::ArrivalAttack>()
             .add_message::<Interact>()
+            .add_message::<stone::MeetingStoneUse>()
+            // After the target chain, which writes the stone's use, so it leaves on the click's
+            // own frame.
+            .add_systems(
+                Update,
+                stone::drain_meeting_stone_uses
+                    .after(crate::ui_script::UiInput)
+                    .after(TargetUpdate),
+            )
             .add_systems(
                 Startup,
                 (
@@ -365,10 +405,11 @@ impl Plugin for TargetPlugin {
                     click::clear_target_requests,
                     // The script calls that touch the selection, the cast or the targeting cursor
                     // (`TargetUnit`, `/target`, `ClearTarget`, `/cast`, `UseAction`, …), applied
-                    // in the order the script made them; then `DropItemOnUnit`'s pet leg.
+                    // in the order the script made them; then the two item legs.
                     (
                         crate::script_calls::apply_script_calls,
                         crate::ui_action::drop_item::drop_item_on_unit,
+                        crate::ui_action::drop_item::drop_on_world_click,
                     )
                         .chain(),
                     // The chat layer's by-name asks: `/target` and `/assist` commit through
@@ -387,7 +428,12 @@ impl Plugin for TargetPlugin {
                     // The last-enemy stamp before the ring's death-clear, so a hostile that dies
                     // selected is still remembered (the reference's `TargetLastEnemy` has no
                     // liveness gate).
-                    (scan::remember_last_enemy, ring::update_ring).chain(),
+                    (
+                        scan::remember_last_enemy,
+                        scan::remember_last_friend,
+                        ring::update_ring,
+                    )
+                        .chain(),
                 )
                     .chain()
                     .in_set(TargetUpdate)

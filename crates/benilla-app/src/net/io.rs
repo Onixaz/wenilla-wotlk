@@ -76,6 +76,8 @@ fn lfg_send(w: &mut WorldWriter, request: benilla_ui::script::LfgRequest) -> any
         R::BootVote(vote) => w.lfg_set_boot_vote(vote),
         R::Teleport(out) => w.lfg_teleport(out),
         R::SetComment(comment) => w.lfg_set_comment(&comment),
+        R::LfrJoin(key) => w.lfr_join(key),
+        R::LfrLeave(key) => w.lfr_leave(key),
     }
 }
 
@@ -887,6 +889,21 @@ async fn world(
                             session.ready_for_account_data_times()?;
                             Parked::StayPut
                         }
+                        // A success renames the roster row the world entry logs in under.
+                        Ok(ParkRequest::Char(CharRequest::Service { opcode, body })) => {
+                            if let Some((guid, name)) =
+                                session.char_service_async(opcode, &body).await?
+                            {
+                                if let Some(c) = characters.iter_mut().find(|c| c.guid == guid) {
+                                    c.name = name;
+                                }
+                            }
+                            Parked::StayPut
+                        }
+                        Ok(ParkRequest::Char(CharRequest::RealmSplit(state))) => {
+                            session.realm_split_async(state).await?;
+                            Parked::StayPut
+                        }
                         Ok(ParkRequest::Char(CharRequest::AccountData(wire))) => {
                             match wire {
                                 crate::account_data::Wire::Request { slot } => {
@@ -1671,13 +1688,18 @@ pub(super) fn dispatch(w: &mut WorldWriter, cmd: ClientCommand) -> Result<()> {
         } => w.pet_spell_autocast(pet_guid, spell_id, enabled),
         ClientCommand::PetAbandon { pet_guid } => w.pet_abandon(pet_guid),
         ClientCommand::PetRename { pet_guid, name } => w.pet_rename(pet_guid, &name),
+        ClientCommand::RequestPetInfo => w.request_pet_info(),
         ClientCommand::AttackSwing { guid } => w.attack_swing(guid),
         ClientCommand::AttackStop => w.attack_stop(),
         ClientCommand::SetSheathed { state } => w.set_sheathed(state),
         ClientCommand::StandStateChange { state } => w.stand_state_change(state),
         ClientCommand::MountSpecial => w.mount_special(),
         ClientCommand::Emote { emote_id } => w.emote(emote_id),
-        ClientCommand::TextEmote { text_id, target } => w.text_emote(text_id, target),
+        ClientCommand::TextEmote {
+            text_id,
+            file_index,
+            target,
+        } => w.text_emote(text_id, file_index, target),
         ClientCommand::GossipHello { guid } => w.gossip_hello(guid),
         ClientCommand::GossipSelectOption {
             guid,
@@ -1724,8 +1746,14 @@ pub(super) fn dispatch(w: &mut WorldWriter, cmd: ClientCommand) -> Result<()> {
         ClientCommand::GmTicketGet => w.gm_ticket_get(),
         ClientCommand::GmTicketDelete => w.gm_ticket_delete(),
         ClientCommand::GmTicketSystemStatus => w.gm_ticket_system_status(),
+        ClientCommand::GmReportLag { kind, map, pos } => w.gm_report_lag(kind, map, pos),
+        ClientCommand::GmSurveySubmit {
+            survey,
+            answers,
+            comment,
+        } => w.gm_survey_submit(survey, &answers, &comment),
         ClientCommand::BinderActivate { binder } => w.binder_activate(binder),
-        ClientCommand::SummonResponse { summoner } => w.summon_response(summoner),
+        ClientCommand::SummonResponse { summoner, agree } => w.summon_response(summoner, agree),
         ClientCommand::TalentWipeConfirm { trainer } => w.talent_wipe_confirm(trainer),
         ClientCommand::ForceLogout => w.player_logout(),
         ClientCommand::AreaSpiritHealerQueue { healer } => w.area_spirit_healer_queue(healer),
@@ -1761,8 +1789,6 @@ pub(super) fn dispatch(w: &mut WorldWriter, cmd: ClientCommand) -> Result<()> {
                 A::Decline => w.arena_team_decline(),
             }
         }
-        ClientCommand::MeetingStoneJoin { go_guid } => w.meeting_stone_join(go_guid),
-        ClientCommand::MeetingStoneLeave => w.meeting_stone_leave(),
         ClientCommand::Lfg(request) => lfg_send(w, request),
         ClientCommand::Calendar(command) => w.calendar(&command),
         ClientCommand::TutorialFlag { id } => w.tutorial_flag(id),
@@ -1843,6 +1869,7 @@ pub(super) fn dispatch(w: &mut WorldWriter, cmd: ClientCommand) -> Result<()> {
             spell_id,
             item_guid,
         } => w.cast_spell_item(spell_id, item_guid),
+        ClientCommand::CastSpellTradeItem { spell_id } => w.cast_spell_trade_item(spell_id),
         ClientCommand::CastSpellGlyph { spell_id } => w.cast_spell_glyph(spell_id),
         ClientCommand::LootMasterGive { guid, slot, target } => {
             w.loot_master_give(guid, slot, target)
@@ -1907,6 +1934,31 @@ pub(super) fn dispatch(w: &mut WorldWriter, cmd: ClientCommand) -> Result<()> {
             mail_id,
             sender,
         } => w.mail_return_to_sender(mailbox, mail_id, sender),
+        ClientCommand::SetTaxiBenchmarkMode { on } => w.set_taxi_benchmark_mode(on),
+        ClientCommand::SkillBuyRank { lines } => w.skill_buy_rank(&lines),
+        ClientCommand::SkillBuyStep { line } => w.skill_buy_step(line),
+        ClientCommand::CancelTempEnchantment { slot } => w.cancel_temp_enchantment(slot),
+        ClientCommand::AutoEquipItemSlot { item, slot } => w.auto_equip_item_slot(item, slot),
+        ClientCommand::GrantLevel { friend } => w.grant_level(friend),
+        ClientCommand::DeclineChannelInvite { name } => w.decline_channel_invite(&name),
+        ClientCommand::OptOutOfLoot { on } => w.opt_out_of_loot(on),
+        ClientCommand::ReportPvpAfk { guid } => w.report_pvp_afk(guid),
+        ClientCommand::ComplainChat {
+            sender,
+            sender_word,
+            chat_type,
+            zone_channel,
+            age_secs,
+            description,
+        } => w.complaint_chat(
+            sender,
+            sender_word,
+            chat_type,
+            zone_channel,
+            age_secs,
+            &description,
+        ),
+        ClientCommand::ComplainMail { sender, mail_id } => w.complaint_mail(sender, mail_id),
         ClientCommand::MailDelete {
             mailbox,
             mail_id,
@@ -1975,6 +2027,7 @@ pub(super) fn dispatch(w: &mut WorldWriter, cmd: ClientCommand) -> Result<()> {
         ClientCommand::Logout => w.logout_request(),
         ClientCommand::LogoutCancel => w.logout_cancel(),
         ClientCommand::OpeningCinematic => w.opening_cinematic(),
+        ClientCommand::CompleteMovie => w.complete_movie(),
         ClientCommand::CompleteCinematic => w.complete_cinematic(),
         ClientCommand::NextCinematicCamera => w.next_cinematic_camera(),
         ClientCommand::MoveModeAck {
@@ -2029,6 +2082,7 @@ pub(super) fn dispatch(w: &mut WorldWriter, cmd: ClientCommand) -> Result<()> {
             threshold,
         } => w.loot_method(method, master, threshold),
         ClientCommand::SetRaidTarget { icon, guid } => w.raid_target_set(icon, guid),
+        ClientCommand::RequestRaidTargets => w.raid_target_request(),
         ClientCommand::MinimapPing { x, y } => w.minimap_ping(x, y),
         ClientCommand::GroupChangeSubGroup { name, group } => {
             w.group_change_sub_group(&name, group)
@@ -2048,6 +2102,7 @@ pub(super) fn dispatch(w: &mut WorldWriter, cmd: ClientCommand) -> Result<()> {
             w.group_assistant_leader(guid, grant)
         }
         ClientCommand::ReadyCheckStart => w.ready_check_start(),
+        ClientCommand::ReadyCheckFinish => w.ready_check_finish(),
         ClientCommand::ReadyCheckAnswer { ready } => w.ready_check_answer(ready),
         ClientCommand::RequestRaidInfo => w.request_raid_info(),
         ClientCommand::ResetInstances => w.reset_instances(),
@@ -2076,6 +2131,7 @@ pub(super) fn dispatch(w: &mut WorldWriter, cmd: ClientCommand) -> Result<()> {
         ClientCommand::GuildAccept => w.guild_accept(),
         ClientCommand::GuildDecline => w.guild_decline(),
         ClientCommand::GuildInfoRequest => w.guild_info(),
+        ClientCommand::GuildEventLogQuery => w.guild_event_log_query(),
         ClientCommand::GuildBankMoneyWithdrawnRequest => w.guild_bank_money_withdrawn(),
         ClientCommand::GuildBank(send) => w.guild_bank(&send),
         ClientCommand::GuildPermissionsRequest => w.guild_permissions(),

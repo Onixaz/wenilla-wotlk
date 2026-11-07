@@ -31,6 +31,7 @@ mod lod;
 /// Wielded `(item class, subclass)` per hand as worn (the weapon getter's worn read, what the
 /// paperdoll shows); behaviour reads `armed_main`/`armed_off`, which apply the disarm ladder.
 #[derive(Component, Clone, Copy, Default, PartialEq, Eq)]
+#[component(storage = "SparseSet")]
 pub(crate) struct Wielded {
     pub(crate) main: Option<(u8, u8)>,
     pub(crate) off: Option<(u8, u8)>,
@@ -98,10 +99,14 @@ impl Wielded {
 #[derive(Component)]
 pub(crate) struct Engaged(pub(crate) u64);
 
+/// Our player's attack starts (`true`) and stops (`false`) in packet order, each one
+/// `PLAYER_ENTER_COMBAT` or `PLAYER_LEAVE_COMBAT` for the UI to fire (`0x756800`).
+#[derive(Resource, Default)]
+pub(crate) struct PlayerCombatEdges(pub(crate) Vec<bool>);
+
 /// The local player's auto-repeat is armed: the reference's `[+0xd58] & 0x200`, set only by the
 /// local cast-send; with the ranged sheath drawn a standing unit idles on the Load clip. Cleared
-/// only through `cancel_auto_repeat_local`, including on `SMSG_CANCEL_AUTO_REPEAT`, which vmangos
-/// sends when a volley's target dies (`SpellCaster.cpp:1829`). A remote shooter plays LoadBow once
+/// by the auto-repeat cancel, and by `SMSG_CANCEL_AUTO_REPEAT` for the unit it names. A remote shooter plays LoadBow once
 /// at its `SMSG_SPELL_START` (`CastHold`), then the fire clip per GO; the reference holds HoldBow
 /// (109) from the end of the Load until the first GO.
 #[derive(Component)]
@@ -161,9 +166,21 @@ pub(crate) fn cancel_auto_repeat_local(
     commands: &mut Commands,
     net: &crate::net::NetCommands,
 ) {
+    if clear_auto_repeat(entity, auto_repeat, commands) {
+        let _ = net.0.send(crate::net::ClientCommand::CancelAutoRepeat);
+    }
+}
+
+/// The cancel without its send, the server-ordered form (`0x807560` with argument 0): `false`, and
+/// nothing touched, when no auto-repeat runs.
+pub(crate) fn clear_auto_repeat(
+    entity: Option<Entity>,
+    auto_repeat: &mut crate::spell::AutoRepeatActive,
+    commands: &mut Commands,
+) -> bool {
     if auto_repeat.0.is_none() {
         // The reference's early-out: nothing running, nothing sent.
-        return;
+        return false;
     }
     auto_repeat.0 = None;
     if let Some(e) = entity {
@@ -171,7 +188,15 @@ pub(crate) fn cancel_auto_repeat_local(
             .entity(e)
             .remove::<(AutoRepeatArmed, RangedHold, NockedAmmo, NockLatch)>();
     }
-    let _ = net.0.send(crate::net::ClientCommand::CancelAutoRepeat);
+    true
+}
+
+/// A unit's ranged mode ends (`0x72afe0`), with its auto-repeat bit (`0x72d187`): the nock latch
+/// and the nocked ammo model drop.
+pub(crate) fn end_ranged_mode(entity: Entity, commands: &mut Commands) {
+    commands
+        .entity(entity)
+        .try_remove::<(AutoRepeatArmed, NockedAmmo, NockLatch)>();
 }
 
 /// The local StopAttack, as in the reference: when attacking, `CMSG_ATTACKSTOP`, then the
@@ -392,6 +417,7 @@ pub(crate) struct CastHold {
 /// A hand's fingers close (`HandsClosed`, 15) purely because a weapon occupies its attach point,
 /// not on combat or sheath; a shield or empty hand stays open.
 #[derive(Component, Default, Clone, Copy, PartialEq, Eq)]
+#[component(storage = "SparseSet")]
 pub(crate) struct HandGrip {
     /// A weapon on the right-hand attach point (id 1).
     pub(crate) right: bool,
@@ -511,6 +537,16 @@ pub(crate) struct SpellGoTargets {
     pub(crate) trajectory: Option<Trajectory>,
 }
 
+/// A dest-location cast's visuals, from `SMSG_NOTIFY_DEST_LOC_SPELL_CAST` (`0x810050`), in bevy
+/// coords: no caster entity is needed.
+#[derive(Message, Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DestLocCast {
+    pub(crate) spell_id: u32,
+    pub(crate) src: Vec3,
+    pub(crate) dest: Vec3,
+    pub(crate) delay_ms: u32,
+}
+
 /// A trajectory missile's launch off its GO (`0x732ff0`): the pitch it leaves at and the time it
 /// lands, with the caster and cast id `SMSG_SET_PROJECTILE_POSITION` names it by.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -572,8 +608,9 @@ use env_damage::{hard_landing_dust, load_env_damage_table};
 pub(crate) use env_damage::{EnvDamageTable, HardLanding, HARD_LANDING_DESCENT};
 use spell_visual::{
     arm_aura_state_fx, arm_go_loot_fx, arm_level_up_fx, arm_loot_fx, arm_morph_latch,
-    arm_mount_poof_fx, load_spell_visuals, play_delayed_area_kits, play_state_done_kits,
-    replay_morph_kit, route_cast_visuals, track_violence_level, MorphLatch, StateDoneKit,
+    arm_mount_poof_fx, load_spell_visuals, play_delayed_area_kits, play_dest_loc_casts,
+    play_state_done_kits, replay_morph_kit, route_cast_visuals, track_violence_level, MorphLatch,
+    StateDoneKit,
 };
 // `crate::aura_visual`'s tests drive the aura-slot watcher directly.
 #[cfg(test)]
@@ -586,6 +623,7 @@ pub(crate) use spell_visual::{
 /// The unit's own variation stream ([`benilla_assets::AnimRng::stream`]), cut on its first frame
 /// from the session seed and the entity, so the driver's rolls do not depend on the unit order.
 #[derive(Component, Default)]
+#[component(storage = "SparseSet")]
 pub(crate) struct UnitAnimRng(Option<benilla_assets::AnimRng>);
 
 impl UnitAnimRng {
@@ -603,6 +641,7 @@ impl UnitAnimRng {
 /// The per-unit animation state machine; `Transform` is required, its scale divides the rate.
 #[derive(Component)]
 #[require(Transform, UnitAnimRng)]
+#[component(storage = "SparseSet")]
 pub(crate) struct AnimDriver {
     mode: Mode,
     /// The targeted gait id, to cross-fade only on a change; `None` forces a fresh pick.
@@ -836,6 +875,7 @@ impl Plugin for CreatureAnimPlugin {
             .add_message::<DefenseAnim>()
             .add_message::<SwingSlowdown>()
             .init_resource::<PendingImpacts>()
+            .init_resource::<PlayerCombatEdges>()
             .init_resource::<PlaySeq>()
             .init_resource::<gesture::GestureQueue>()
             .add_message::<EmoteAnim>()
@@ -847,6 +887,7 @@ impl Plugin for CreatureAnimPlugin {
             .add_message::<SheathRequest>()
             .add_message::<CastEvent>()
             .add_message::<SpellGoTargets>()
+            .add_message::<DestLocCast>()
             .add_message::<SpellKitSound>()
             .add_message::<SpellKitShake>()
             .add_message::<SpellKitFx>()
@@ -879,6 +920,8 @@ impl Plugin for CreatureAnimPlugin {
                     (
                         arm_loot_fx,
                         arm_go_loot_fx,
+                        // After the stream stage, whose collider finish is an exclusive system.
+                        play_dest_loc_casts.after(WorldStage::Stream),
                         play_delayed_area_kits,
                         arm_level_up_fx,
                         arm_mount_poof_fx,
@@ -958,6 +1001,11 @@ fn resolved(
     catalog.map_or(benilla_assets::ResolvedAnim { id, dir_flags: 0 }, |cat| {
         anims.resolve(id, cat)
     })
+}
+
+/// The BehaviorID the routing sets read for `id` on this model (`0x7176f0`, then `row+0x18`).
+fn routed_behavior(anims: &ModelAnimations, id: u16, catalog: Option<&AnimDataCatalog>) -> u16 {
+    select::behavior_of(resolved_id(anims, id, catalog), catalog)
 }
 
 /// The clip for a requested id, through the `AnimationData.dbc` fallback.

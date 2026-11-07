@@ -10,6 +10,8 @@
 
 use std::collections::HashMap;
 
+use benilla_assets::LockRecover;
+
 use bevy::prelude::*;
 
 use benilla_protocol::guid;
@@ -55,6 +57,9 @@ pub(crate) struct NameCache {
     /// for an unstreamed subject. Present only when the server answered: a name learned otherwise
     /// (our own, seeded at login) has no entry, never a zero triple.
     player_traits: HashMap<u64, (u8, u8, u8)>,
+    /// A non-empty realm from `SMSG_NAME_QUERY_RESPONSE` (the record's `+0x34`): a player from
+    /// another realm of the battlegroup.
+    player_realms: HashMap<u64, String>,
     /// A `None` answer is an entry the server flagged unknown.
     creatures: QueryCache<u32, CreatureRecord>,
     /// No negative entry: the server answers for a live pet or says nothing.
@@ -62,6 +67,9 @@ pub(crate) struct NameCache {
     /// Bumped by every landed answer and the pet-rename eviction, never by an ask: the gated
     /// feeds re-run when it moves.
     generation: u64,
+    /// What moved since the VM's mirror last read, behind a lock so the read takes no write on the
+    /// cache every feed reads: the session wipe, and the player guids.
+    changed_players: std::sync::Mutex<(bool, Vec<u64>)>,
 }
 
 /// One cached creature template head.
@@ -247,9 +255,43 @@ impl NameCache {
             Some(t) => self.player_traits.insert(guid, t),
             None => self.player_traits.remove(&guid),
         };
+        self.player_realms.remove(&guid);
         self.players
             .insert(guid, (!name.is_empty()).then_some(name));
+        self.note_changed(guid);
         self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Whether the name cache answered that the server does not know `guid`.
+    pub(crate) fn answered_unknown(&self, guid: u64) -> bool {
+        self.players.answered_unknown(guid)
+    }
+
+    fn note_changed(&self, guid: u64) {
+        self.changed_players.lock_recover().1.push(guid);
+    }
+
+    /// Whether the session wipe ran and the guids changed, since the last call.
+    pub(crate) fn take_player_changes(&self) -> (bool, Vec<u64>) {
+        std::mem::take(&mut *self.changed_players.lock_recover())
+    }
+
+    /// Every answered player guid.
+    pub(crate) fn player_guids(&self) -> Vec<u64> {
+        self.players.iter().map(|(g, _)| *g).collect()
+    }
+
+    /// The name record `guid` holds, as the VM mirrors it.
+    pub(crate) fn player_record(&self, guid: u64) -> Option<benilla_ui::script::NameRecord> {
+        let name = self.players.get(guid)?.clone();
+        let traits = self.player_traits(guid);
+        Some(benilla_ui::script::NameRecord {
+            name,
+            realm: self.player_realms.get(&guid).cloned().unwrap_or_default(),
+            class: traits.and_then(|t| crate::ui_unit::class_names(t.1)),
+            race: traits.and_then(|t| crate::ui_unit::race_names(t.0)),
+            gender: traits.map_or(0, |t| t.2),
+        })
     }
 
     /// The reference's world-session wipe: every record cache whose persistence byte `[cache+0x39]`
@@ -258,7 +300,9 @@ impl NameCache {
     pub(crate) fn clear_world_session(&mut self) {
         self.players.clear();
         self.player_traits.clear();
+        self.player_realms.clear();
         self.pets.clear();
+        *self.changed_players.lock_recover() = (true, Vec::new());
         self.generation = self.generation.wrapping_add(1);
     }
 
@@ -334,13 +378,59 @@ impl crate::query_cache::AskOnce for NameCache {
     }
 }
 
+/// The name a status-3 answer caches (`0x635849`).
+const PLACEHOLDER_NAME: &str = "?";
+
 impl NameCache {
+    /// A name query answered with no name (`0x635817`). A retry asks again while the ask is still
+    /// in flight (`0x67a360`); a placeholder caches `"?"`; a deny caches the negative answer, where
+    /// the reference drops the pending record so a later lookup asks again (`0x67a2d0`): names
+    /// here are polled every frame, so that would ask every frame.
+    pub(crate) fn player_name_miss(
+        &mut self,
+        guid: u64,
+        miss: benilla_protocol::messages::NameQueryMiss,
+        commands: &NetCommands,
+    ) {
+        use benilla_protocol::messages::NameQueryMiss as M;
+        debug!("names: player {guid:#x} answered {miss:?}");
+        match miss {
+            M::Retry => {
+                if self.players.is_pending(guid) {
+                    let _ = commands.0.send(ClientCommand::NameQuery { guid });
+                }
+            }
+            M::Placeholder => self.insert_player(guid, PLACEHOLDER_NAME.into(), None),
+            M::Deny => self.insert_player(guid, String::new(), None),
+        }
+    }
+
     /// Drop a player's cached name and traits so the next resolve re-asks: the reference's
     /// remove-by-key for `SMSG_INVALIDATE_PLAYER`.
     pub(crate) fn invalidate_player(&mut self, guid: u64) {
         self.players.evict(guid);
         self.player_traits.remove(&guid);
+        self.player_realms.remove(&guid);
+        self.note_changed(guid);
         self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Files the answer's realm after [`Self::insert_player`]; an empty one is our own realm.
+    pub(crate) fn set_player_realm(&mut self, guid: u64, realm: String) {
+        if !realm.is_empty() {
+            self.player_realms.insert(guid, realm);
+            self.note_changed(guid);
+        }
+    }
+
+    /// A player's name as the reference's realm-aware callers format it: `name-realm` when the
+    /// record holds a realm (`"%s-%s"`, `0x54b58a`), else the bare name. Asks once on a miss.
+    pub(crate) fn full_name(&self, guid: u64, commands: &NetCommands) -> Option<String> {
+        let name = self.resolve(guid, commands)?;
+        Some(match self.player_realms.get(&guid) {
+            Some(realm) => format!("{name}-{realm}"),
+            None => name.to_string(),
+        })
     }
 }
 
@@ -350,12 +440,13 @@ pub(crate) mod net {
     use bevy::prelude::*;
 
     use super::{CreatureRecord, NameCache};
-    use crate::net::NetHandlerApp;
+    use crate::net::{NetCommands, NetHandlerApp};
 
-    /// Register the four handlers.
+    /// Register the five handlers.
     pub(crate) fn register(app: &mut App) {
         use SessionEventKind as K;
         app.net_handler(K::PlayerName, on_player_name)
+            .net_handler(K::PlayerNameMiss, on_player_name_miss)
             .net_handler(K::PetName, on_pet_name)
             .net_handler(K::CreatureName, on_creature_name)
             .net_handler(K::InvalidatePlayer, on_invalidate_player);
@@ -365,12 +456,24 @@ pub(crate) mod net {
         if let SessionEvent::PlayerName {
             guid,
             name,
+            realm,
             race,
             class,
             gender,
         } = ev
         {
             player_name(guid, name, race, class, gender, &mut names);
+            names.set_player_realm(guid, realm);
+        }
+    }
+
+    fn on_player_name_miss(
+        In(ev): In<SessionEvent>,
+        mut names: ResMut<NameCache>,
+        commands: Res<NetCommands>,
+    ) {
+        if let SessionEvent::PlayerNameMiss { guid, miss } = ev {
+            names.player_name_miss(guid, miss, &commands);
         }
     }
 
@@ -413,9 +516,13 @@ pub(crate) mod net {
         }
     }
 
-    fn on_invalidate_player(In(ev): In<SessionEvent>, mut names: ResMut<NameCache>) {
+    fn on_invalidate_player(
+        In(ev): In<SessionEvent>,
+        mut names: ResMut<NameCache>,
+        commands: Res<NetCommands>,
+    ) {
         if let SessionEvent::InvalidatePlayer { guid } = ev {
-            invalidate_player(guid, &mut names);
+            invalidate_player(guid, &mut names, &commands);
         }
     }
 
@@ -439,9 +546,15 @@ pub(crate) mod net {
     /// `SMSG_INVALIDATE_PLAYER`, which vmangos sends after a rename (`CharacterHandler.cpp:839`):
     /// the reference's eviction in a name cache with no TTL; its other, an empty-name answer, is a
     /// cached negative here.
-    fn invalidate_player(guid: u64, names: &mut NameCache) {
+    /// A guild guid is the guild cache's (`0x635442`). The autocomplete refresh reads the name
+    /// back at once, which re-asks it (`0x57b5fe`).
+    fn invalidate_player(guid: u64, names: &mut NameCache, commands: &NetCommands) {
+        if benilla_protocol::guid::is_guild(guid) {
+            return;
+        }
         debug!("net: invalidating cached name for player {guid:#x}");
         names.invalidate_player(guid);
+        let _ = names.resolve(guid, commands);
     }
 
     /// `SMSG_CREATURE_QUERY_RESPONSE`; a `None` name is the server's "no such entry".
@@ -623,6 +736,30 @@ mod tests {
         ));
     }
 
+    /// `"%s-%s"` (`0x54b58a`): a realm from the answer suffixes the name, an empty one does not,
+    /// and a name learned otherwise drops the old realm.
+    #[test]
+    fn the_full_name_carries_the_answers_realm() {
+        let (cmds, _rx) = commands();
+        let mut cache = NameCache::default();
+        cache.insert_player(0x11, "Moamtester".into(), Some((1, 2, 0)));
+        cache.set_player_realm(0x11, String::new());
+        assert_eq!(cache.full_name(0x11, &cmds).as_deref(), Some("Moamtester"));
+        cache.insert_player(0x12, "Aldric".into(), Some((1, 2, 0)));
+        cache.set_player_realm(0x12, "Icecrown".into());
+        assert_eq!(
+            cache.full_name(0x12, &cmds).as_deref(),
+            Some("Aldric-Icecrown")
+        );
+        cache.insert_player(0x12, "Aldric".into(), None);
+        assert_eq!(cache.full_name(0x12, &cmds).as_deref(), Some("Aldric"));
+        assert_eq!(
+            cache.full_name(0x13, &cmds),
+            None,
+            "unknown: asked, not named"
+        );
+    }
+
     #[test]
     fn a_name_replaced_without_traits_does_not_keep_the_old_ones() {
         let mut cache = NameCache::default();
@@ -656,6 +793,44 @@ mod tests {
             rx.try_recv(),
             Ok(ClientCommand::NameQuery { guid: 0x11 })
         ));
+    }
+
+    /// The three no-name answers: a retry re-sends while in flight, a placeholder names the guid
+    /// `"?"`, a deny answers unknown and asks no more.
+    #[test]
+    fn a_name_miss_retries_names_a_placeholder_or_denies() {
+        use benilla_protocol::messages::NameQueryMiss;
+
+        let (cmds, rx) = commands();
+        let mut cache = NameCache::default();
+        assert_eq!(cache.resolve(0x11, &cmds), None);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientCommand::NameQuery { guid: 0x11 })
+        ));
+
+        cache.player_name_miss(0x11, NameQueryMiss::Retry, &cmds);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientCommand::NameQuery { guid: 0x11 })
+        ));
+        cache.player_name_miss(0x12, NameQueryMiss::Retry, &cmds);
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "nothing in flight for 0x12: no retry"
+        );
+
+        cache.player_name_miss(0x11, NameQueryMiss::Placeholder, &cmds);
+        assert_eq!(cache.resolve(0x11, &cmds), Some("?"));
+
+        assert_eq!(cache.resolve(0x13, &cmds), None);
+        let _ = rx.try_recv();
+        cache.player_name_miss(0x13, NameQueryMiss::Deny, &cmds);
+        assert_eq!(cache.answer(NameKey::Player(0x13), 0x13, &cmds), Some(None));
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "a denied guid is not asked again"
+        );
     }
 
     #[test]

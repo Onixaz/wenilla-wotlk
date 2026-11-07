@@ -24,6 +24,38 @@ use super::{
 
 /// The final facing a `SMSG_MONSTER_MOVE` dictates (`moveType`), applied as a hard snap, not a
 /// turn; `Spot` and `Target` resolve once, from positions at receipt.
+/// One item-cache record of `SMSG_ITEM_QUERY_MULTIPLE_RESPONSE`; `info` `None` is a miss, and
+/// `wire` is the record's bytes, a whole `SMSG_ITEM_QUERY_SINGLE_RESPONSE` body.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ItemQueryRecord {
+    pub entry: u32,
+    pub info: Option<Box<ItemInfo>>,
+    pub wire: Vec<u8>,
+}
+
+/// A `SMSG_NAME_QUERY_RESPONSE` that carries no name: the status byte's three other arms
+/// (`0x635817`), none with a body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameQueryMiss {
+    /// Status 2: the query goes out again (`0x6358b3`).
+    Retry,
+    /// Status 3: a fixed `"?"` name is cached for the guid (`0x635849`).
+    Placeholder,
+    /// Any other status: the guid is denied, its lookups told there is no name (`0x63583f`).
+    Deny,
+}
+
+impl NameQueryMiss {
+    /// The arm for a non-zero status.
+    pub fn from_status(status: u8) -> Self {
+        match status {
+            2 => Self::Retry,
+            3 => Self::Placeholder,
+            _ => Self::Deny,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum MonsterMoveFacing {
     /// `moveType` 0 or a stop: the unit faces its travel direction.
@@ -43,6 +75,47 @@ pub enum MonsterMoveFacing {
 pub struct SplineArc {
     pub vertical_acceleration: f32,
     pub effect_start_ms: u32,
+}
+
+/// What a `SPLINEFLAG_CYCLIC` (`0x80000`) path carries past its waypoints.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SplineCycle {
+    /// `SPLINEFLAG_ENTER_CYCLE` (`0x100000`): the first wrap drops the path's entry (`0x98c940`).
+    pub enter: bool,
+    /// The Catmull-Rom control point past the path's end (`0x73cf0a`); a linear path has none.
+    pub tail: Option<[f32; 3]>,
+}
+
+/// The game clock the clock packets carry: the packed time and the zone `u32` read after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GameClock {
+    pub hours: u8,
+    pub minutes: u8,
+    /// Day count from the packed date, `year·372 + month·31 + day`; drives the moon phase.
+    pub day_serial: u32,
+    /// The packed `WowTime` word whole, the calendar's date.
+    pub packed: u32,
+    /// The server's zone offset in hours.
+    pub zone: i32,
+}
+
+impl GameClock {
+    /// Packed DateTime, LSB up: minute:6, hour:5, weekday:3, day:6, month:4, year:5. The day
+    /// serial assumes 31-day months and 372-day years, monotonic but not calendar-true.
+    pub fn new(packed: u32, zone: u32) -> Self {
+        let (day, month, year) = (
+            (packed >> 14) & 0x3F,
+            (packed >> 20) & 0x0F,
+            (packed >> 24) & 0x1F,
+        );
+        Self {
+            hours: ((packed >> 6) & 0x1F) as u8,
+            minutes: (packed & 0x3F) as u8,
+            day_serial: year * 372 + month * 31 + day,
+            packed,
+            zone: zone as i32,
+        }
+    }
 }
 
 /// One creature template's UI-visible head, from `SMSG_CREATURE_QUERY_RESPONSE`.
@@ -113,10 +186,28 @@ pub enum ServerPacket {
     CompressedMoves {
         packets: Vec<ServerPacket>,
     },
+    /// `SMSG_MULTIPLE_MOVES` (the move records undeflated) or `SMSG_MULTIPLE_PACKETS` (records
+    /// with no length), by `opcode`: each inner packet is handled as if it came alone.
+    PacketBatch {
+        opcode: u16,
+        packets: Vec<ServerPacket>,
+    },
+    /// `SMSG_SEND_ALL_COMBAT_LOG`: combat-log packets, each with how many ms its time lies before
+    /// the batch's, which backdates its log entry (`0x74ff20`).
+    CombatLogBatch {
+        entries: Vec<(i32, ServerPacket)>,
+    },
+    /// `SMSG_FLIGHT_SPLINE_SYNC`: where along its cyclic path the server has the unit, `0..1`.
+    FlightSplineSync {
+        guid: u64,
+        progress: f32,
+    },
     /// `SMSG_DESTROY_OBJECT`: a plain `u64` guid that ceased to exist server-side. The client frees
-    /// it outright, unlike an `OutOfRange` block, whose objects it keeps staged.
+    /// it outright, unlike an `OutOfRange` block, whose objects it keeps staged. `on_death` runs a
+    /// live unit's death first (`0x4d762b`).
     DestroyObject {
         guid: u64,
+        on_death: bool,
     },
     /// `SMSG_TRIGGER_CINEMATIC`: a `CinematicSequences.dbc` id, sent at first login and by type-13
     /// camera objects. vmangos anchors visibility to the camera until `CMSG_COMPLETE_CINEMATIC`.
@@ -152,6 +243,8 @@ pub enum ServerPacket {
         arc: Option<SplineArc>,
         /// `SPLINEFLAG_ORIENTATION_FIXED` (`0x4000`): the unit keeps its facing along the path.
         facing_fixed: bool,
+        /// `SPLINEFLAG_CYCLIC`: the path loops.
+        cycle: Option<SplineCycle>,
     },
     /// A relayed player `MSG_MOVE_*`: authoritative pose and live `moveFlags`; `transport` is set
     /// while `MOVEFLAG_ON_TRANSPORT`, a pose local to the transport.
@@ -159,6 +252,8 @@ pub enum ServerPacket {
         guid: u64,
         opcode: u16,
         flags: u32,
+        /// The second flags word, raw.
+        flags2: u16,
         position: Vector3d,
         orientation: f32,
         /// Swim pitch (radians, +up) while `MOVEFLAG_SWIMMING`, else `0.0`: observers integrate the
@@ -208,6 +303,14 @@ pub enum ServerPacket {
         /// The packed `WowTime` word whole, the calendar's date.
         packed: u32,
         zone: i32,
+    },
+    /// `SMSG_GAMETIME_UPDATE`: the game clock re-synced, its speed kept.
+    GameTimeUpdate(GameClock),
+    /// `SMSG_GAMETIME_SET`: the game clock set, its speed kept.
+    GameTimeSet(GameClock),
+    /// `SMSG_GAMESPEED_SET`: the game clock's speed, in game minutes per real second.
+    GameSpeed {
+        timescale: f32,
     },
     /// `SMSG_QUERY_TIME_RESPONSE` (`0x5e08a0`): wall-clock unix seconds, the base of absolute
     /// descriptor stamps, then the seconds to the daily quest reset.
@@ -367,22 +470,21 @@ pub enum ServerPacket {
         guid: u64,
         joined: bool,
     },
-    /// `SMSG_MEETINGSTONE_SETQUEUE` (`0x295`): the meeting-stone queue state.
-    MeetingStoneSetQueue {
-        area: u32,
-        status: u8,
+    /// `SMSG_CHAT_NOT_IN_PARTY`: the chat type of a party or raid line sent outside one.
+    ChatNotInParty {
+        chat_type: u32,
     },
-    /// `0x297`/`0x298`/`0x299`/`0x2BB`: the meeting stone's display-only replies.
-    MeetingStoneNotice(crate::messages::MeetingStoneNotice),
     /// `SMSG_TUTORIAL_FLAGS`: the account's tutorial bank.
     TutorialFlags(crate::messages::TutorialFlags),
     /// `SMSG_SUMMON_REQUEST`: someone asks to pull us to them; nothing moves until
-    /// `CMSG_SUMMON_RESPONSE`, and with no decline opcode the offer just expires.
+    /// `CMSG_SUMMON_RESPONSE` agrees.
     SummonRequest {
         summoner: u64,
         zone: u32,
         delay_ms: u32,
     },
+    /// `SMSG_SUMMON_CANCEL`: the summon was withdrawn; empty body.
+    SummonCancel,
     /// `SMSG_PLAYERBOUND`: the bind took (the "now your home" line), beside [`Self::BindPoint`].
     PlayerBound {
         binder: u64,
@@ -399,10 +501,20 @@ pub enum ServerPacket {
     InitializeFactions {
         standings: Vec<(u8, i32)>,
     },
-    /// `SMSG_SET_FACTION_STANDING`: `(reputationListId, standing)` per changed slot, base excluded.
+    /// `SMSG_SET_FACTION_STANDING`: the Refer-A-Friend bonus, the rank-up effect switch, then
+    /// `(reputationListId, standing)` per changed slot, base excluded.
     SetFactionStanding {
+        bonus: f32,
+        show_effect: bool,
         standings: Vec<(u32, i32)>,
     },
+    /// `SMSG_SET_FACTION_ATWAR`: one slot's at-war flag (`flags & 0x2`).
+    SetFactionAtWar {
+        list_id: u32,
+        at_war: bool,
+    },
+    /// `SMSG_EXPECTED_SPAM_RECORDS`: the server's spam patterns; empty clears them.
+    ExpectedSpamRecords(Vec<String>),
     /// `SMSG_SET_FACTION_VISIBLE`: sets `FACTION_FLAG_VISIBLE` on one slot; it carries no standing.
     SetFactionVisible {
         list_id: u32,
@@ -412,9 +524,16 @@ pub enum ServerPacket {
     NameQueryResponse {
         guid: u64,
         name: String,
+        /// The player's realm, empty for one on ours; the name cache keeps it (record `+0x34`).
+        realm: String,
         race: u32,
         gender: u32,
         class: u32,
+    },
+    /// `SMSG_NAME_QUERY_RESPONSE` with a non-zero status: no name, and what to do instead.
+    NameQueryMiss {
+        guid: u64,
+        miss: NameQueryMiss,
     },
     /// `SMSG_CREATURE_QUERY_RESPONSE`: a template's UI head; `unk` and the pet spell-list id are
     /// read and dropped. A miss is a lone `entry | 0x8000_0000` (`HandleCreatureQueryOpcode`).
@@ -441,6 +560,10 @@ pub enum ServerPacket {
         text: String,
         next_page_id: u32,
     },
+    /// `SMSG_PAGE_TEXT_QUERY_RESPONSE` for a page the server does not have.
+    PageTextMiss {
+        page_id: u32,
+    },
     /// `SMSG_GAMEOBJECT_CUSTOM_ANIM`: `u64 guid, u32 animId`; the client arms substate
     /// `8 + animId` (AnimationData 153..156, `animId >= 4` rejected). The bobber's bite is 0.
     GameObjectCustomAnim {
@@ -451,9 +574,10 @@ pub enum ServerPacket {
     OpenContainer {
         item: u64,
     },
-    /// `SMSG_INSPECT`: the target's raw `u64` guid, ignored, as the reference ignores it.
-    Inspect {
+    /// `SMSG_INSPECT_RESULTS_UPDATE`: the inspected player's worn items.
+    InspectResultsUpdate {
         guid: u64,
+        items: Vec<super::InspectItem>,
     },
     /// `SMSG_TIME_SYNC_REQ`: the server asks for our movement clock under `counter`.
     TimeSyncReq {
@@ -466,6 +590,10 @@ pub enum ServerPacket {
     /// `SMSG_GAMEOBJECT_DESPAWN_ANIM`: a bare `u64` guid. The client arms substate 12 (anim 157)
     /// and pins the object, so the same tick's `SMSG_DESTROY_OBJECT` waits for the play to end.
     GameObjectDespawnAnim {
+        guid: u64,
+    },
+    /// `SMSG_GAMEOBJECT_RESET_STATE`: a bare `u64` guid; the client re-shows the descriptor's state.
+    GameObjectResetState {
         guid: u64,
     },
     /// `SMSG_FISH_NOT_HOOKED`: the channel ended unhooked (empty body; `ERR_FISH_NOT_HOOKED`).
@@ -494,10 +622,12 @@ pub enum ServerPacket {
     },
     /// `SMSG_TEXT_EMOTE`: `u64 guid, u32 textEmote, u32 emoteNum, u32 namelen, char name[namelen]`
     /// (`EmoteChatBuilder`; a lone NUL for no target). The raw `target_name` picks the sentence
-    /// form, as in the reference; `emoteNum` is read and ignored, as the reference ignores it.
+    /// form, as in the reference; `file_index` is the sender's `emoteNum`, the voice file it picked,
+    /// which reaches the voice player (`0x504070`, `0x746f3b`).
     TextEmote {
         guid: u64,
         text_emote: u32,
+        file_index: i32,
         target_name: String,
     },
     /// `SMSG_EMOTE`: `u32 emoteId (Emotes.dbc), u64 guid`, an animation emote.
@@ -510,6 +640,9 @@ pub enum ServerPacket {
         entry: u32,
         info: Option<Box<ItemInfo>>,
     },
+    /// `SMSG_ITEM_QUERY_MULTIPLE_RESPONSE`, and `SMSG_CHEAT_DUMP_ITEMS_DEBUG_ONLY_RESPONSE` as one
+    /// record: each record with its own bytes, for the item cache's file.
+    ItemQueryMultiple(Vec<ItemQueryRecord>),
     /// `SMSG_CLIENTCACHE_VERSION`: the server's cache version, which the `.wdb` files carry.
     ClientCacheVersion {
         version: u32,
@@ -530,6 +663,8 @@ pub enum ServerPacket {
         flags: u8,
         members: Vec<(u64, u8)>,
     },
+    /// `SMSG_USERLIST_ADD`, `_REMOVE` or `_UPDATE`: one edit to the watched channel's roster.
+    ChannelUserList(super::ChannelUserList),
     /// `SMSG_CHAT_PLAYER_NOT_FOUND`: the whisper target is not online
     /// (`Server/Packets/Chat.cpp:26-29`).
     ChatPlayerNotFound {
@@ -551,6 +686,12 @@ pub enum ServerPacket {
         message_type: u32,
         text: String,
     },
+    /// `SMSG_NOTIFY_DEST_LOC_SPELL_CAST`: a dest-location cast's visuals, caster seen or not.
+    DestLocSpellCast(super::spells::DestLocSpellCast),
+    /// `SMSG_TRIGGER_MOVIE`: the `Movie.dbc` id the server starts.
+    TriggerMovie {
+        movie_id: u32,
+    },
     /// `SMSG_ZONE_UNDER_ATTACK`: one `AreaTable.dbc` id under attack by enemy players.
     ZoneUnderAttack {
         area_id: u32,
@@ -569,8 +710,16 @@ pub enum ServerPacket {
         difficulty: u32,
         dynamic: u32,
     },
-    /// `SMSG_CHAT_RESTRICTED`: a trial account hit its whisper cap; empty body.
-    ChatRestricted,
+    /// `SMSG_CHANGEPLAYER_DIFFICULTY_RESULT`: a dynamic-difficulty change's step.
+    DifficultyChangeResult(crate::messages::DifficultyChangeResult),
+    /// `SMSG_KICK_REASON`: the reason the next disconnect reports.
+    KickReason {
+        reason: u8,
+    },
+    /// `SMSG_CHAT_RESTRICTED`: the restriction's kind (`0x6e3cbf`).
+    ChatRestricted {
+        kind: u8,
+    },
     /// `SMSG_PLAYED_TIME` (`/played`): total and this-level played time, in seconds, and whether
     /// the request asked to show it.
     PlayedTime {
@@ -585,21 +734,17 @@ pub enum ServerPacket {
         roll: u32,
         guid: u64,
     },
-    /// `SMSG_INVENTORY_CHANGE_FAILURE`: an `InventoryResult`; `required_level` rides only reason 1.
-    InventoryChangeFailure {
-        reason: u8,
-        required_level: Option<u32>,
-        item_guid: u64,
-        /// The destination bag's absolute player slot (255 = the player's own array).
-        bag_slot: u8,
-    },
+    /// `SMSG_INVENTORY_CHANGE_FAILURE`: an `InventoryResult` and its tail.
+    InventoryChangeFailure(super::items::InventoryFailure),
     /// `SMSG_INITIAL_SPELLS`: the spell book and active cooldowns, once at login.
     InitialSpells {
         spell_ids: Vec<u32>,
         cooldowns: Vec<SpellCooldown>,
     },
-    /// `SMSG_ACTION_BUTTONS` (login): the occupied slots of the 120-slot action bar array.
+    /// `SMSG_ACTION_BUTTONS`: the state byte (an `ACTION_BUTTONS_*`) and the occupied slots of
+    /// the 144-slot table.
     ActionButtons {
+        state: u8,
         buttons: Vec<ActionButton>,
     },
     /// `SMSG_LEARNED_SPELL`: a spell joined the book after login.
@@ -626,9 +771,11 @@ pub enum ServerPacket {
     PetSpells(PetSpells),
     /// `SMSG_PET_MODE`: the pet's react and command state alone.
     PetMode(PetMode),
-    /// `SMSG_PET_ACTION_FEEDBACK`: one reason byte for a refused pet order.
+    /// `SMSG_PET_ACTION_FEEDBACK`: one reason byte for a refused pet order, and for reasons 2
+    /// and 3 the refused spell when sent.
     PetActionFeedback {
         reason: u8,
+        spell: u32,
     },
     /// `SMSG_PET_CAST_FAILED`: the pet's cast refusal, in `SMSG_CAST_RESULT`'s body and vocabulary.
     PetCastFailed {
@@ -639,9 +786,12 @@ pub enum ServerPacket {
     PetTameFailure {
         reason: u8,
     },
-    /// `SMSG_PET_NAME_INVALID`: the rename was refused, with the name code that picks the message.
+    /// `SMSG_PET_NAME_INVALID`: the rename was refused, with the name code that picks the message,
+    /// the refused name and its five declined forms when the server asks for them.
     PetNameInvalid {
         code: u32,
+        name: String,
+        declensions: Option<[String; 5]>,
     },
     /// `SMSG_PET_BROKEN`: the pet's loyalty hit zero and it ran away; empty body.
     PetBroken,
@@ -656,15 +806,29 @@ pub enum ServerPacket {
         model_id: u32,
         position: Vector3d,
     },
+    /// `SMSG_PET_LEARNED_SPELL`: the pet learned `spell_id`.
+    PetLearnedSpell {
+        spell_id: u32,
+    },
+    /// `SMSG_PET_UNLEARNED_SPELL`: the pet lost `spell_id`.
+    PetUnlearnedSpell {
+        spell_id: u32,
+    },
+    /// `SMSG_PET_RENAMEABLE`: empty body.
+    PetRenameable,
+    /// `SMSG_PET_GUIDS`: the controlled-pet list, in the server's order.
+    PetGuids(Vec<u64>),
     /// `SMSG_ATTACKSTART`: a unit began melee auto-attack, our own echo included.
     AttackStart {
         attacker: u64,
         victim: u64,
     },
-    /// `SMSG_ATTACKSTOP`: a unit stopped melee auto-attack.
+    /// `SMSG_ATTACKSTOP` or `SMSG_COMBAT_EVENT_FAILED`: a unit stopped melee auto-attack;
+    /// `face_victim` is the wire's nonzero `u32`.
     AttackStop {
         attacker: u64,
         victim: u64,
+        face_victim: bool,
     },
     /// `SMSG_ATTACKERSTATEUPDATE`: one completed melee swing, the attacker's swing-animation cue.
     AttackerState(AttackerState),
@@ -701,9 +865,11 @@ pub enum ServerPacket {
         caster: u64,
         delay_ms: u32,
     },
-    /// `SMSG_CANCEL_AUTO_REPEAT` (self-only, empty): stop our ranged auto-repeat; vmangos sends it
-    /// on every autorepeat interrupt, target death included (`Player::SendAutoRepeatCancel`).
-    CancelAutoRepeat,
+    /// `SMSG_CANCEL_AUTO_REPEAT` (`0x72d130`): a packed unit guid whose ranged auto-repeat ended;
+    /// AzerothCore broadcasts it to everyone in range, target death included.
+    CancelAutoRepeat {
+        guid: u64,
+    },
     /// `SMSG_SPELL_COOLDOWN`: server-pushed cooldowns for the player or pet, by caster guid.
     SpellCooldownList {
         caster: u64,
@@ -717,9 +883,10 @@ pub enum ServerPacket {
         item_guid: u64,
         spell_id: u32,
     },
-    /// `SMSG_INSPECT_TALENT`'s worn items; its talent body is read past.
-    InspectItems {
+    /// `SMSG_INSPECT_TALENT`: the inspected player's talent groups and worn items.
+    InspectTalent {
         guid: u64,
+        talents: super::TalentsInfo,
         items: Vec<super::item_ops::InspectItem>,
     },
     /// `SMSG_SOCKET_GEMS_RESULT`: the socketed item's enchants for sockets 1-3 and the bonus.
@@ -800,6 +967,12 @@ pub enum ServerPacket {
         caster: u64,
         spell_id: u32,
         duration_ms: u32,
+    },
+    /// `SMSG_RESUME_CAST_BAR` (`0x8020c0`): a cast or channel already running on a unit.
+    ResumeCastBar(super::ResumeCastBar),
+    /// `SMSG_RESET_RANGED_COMBAT_TIMER` (`0x8071c0`): a recovery in ms for each ranged book spell.
+    ResetRangedCombatTimer {
+        time_ms: u32,
     },
     /// `MSG_CHANNEL_UPDATE` (`0x801db0`): a unit's channel time left; `0` ends it, end or
     /// interrupt.
@@ -943,6 +1116,10 @@ pub enum ServerPacket {
         text_id: u32,
         blocks: Vec<super::gossip::NpcTextBlock>,
     },
+    /// `SMSG_NPC_TEXT_UPDATE` for a text the server does not have.
+    NpcTextMiss {
+        text_id: u32,
+    },
     /// `SMSG_LIST_INVENTORY`: a vendor's stock (`0x6d9960`); an empty stock carries its reason.
     VendorList {
         vendor: u64,
@@ -999,8 +1176,8 @@ pub enum ServerPacket {
         error: u32,
     },
     /// `MSG_LIST_STABLED_PETS`: opens the stable unprompted and is its only refresh when we send
-    /// it. `num_stable_slots` is slots bought (0..=2); `pets` must be read by
-    /// [`StabledPet::slot`] (`0` = current), never by position, as the current pet may be absent.
+    /// it. `num_stable_slots` is slots bought (0..=4); `pets` is in wire order, the current pet
+    /// told by [`StabledPet::is_current`], and may lack it.
     ListStabledPets {
         npc: u64,
         num_stable_slots: u8,
@@ -1037,9 +1214,11 @@ pub enum ServerPacket {
     LootRemoved {
         slot: u8,
     },
-    /// `SMSG_LOOT_MONEY_NOTIFY`: our share of the loot's coin pile, answering `CMSG_LOOT_MONEY`.
+    /// `SMSG_LOOT_MONEY_NOTIFY`: our share of the loot's coin pile, answering `CMSG_LOOT_MONEY`,
+    /// and whether we looted it alone.
     LootMoneyNotify {
         amount: u32,
+        solo: bool,
     },
     /// `SMSG_LOOT_CLEAR_MONEY`: the coin line disappears for every current looter; empty body.
     LootClearMoney,
@@ -1073,12 +1252,53 @@ pub enum ServerPacket {
         error: u32,
         name: String,
     },
+    /// A one-line world notice.
+    Notice(crate::messages::WorldNotice),
     /// `SMSG_SEND_UNLEARN_SPELLS`.
     UnlearnSpells(Vec<u32>),
     /// `SMSG_CROSSED_INEBRIATION_THRESHOLD`.
     InebriationThreshold(crate::messages::InebriationThreshold),
     /// `SMSG_LEARNED_DANCE_MOVES`.
     LearnedDanceMoves(u64),
+    /// `SMSG_DANCE_QUERY_RESPONSE`; `None` is a miss.
+    DanceQueryResponse {
+        id: u32,
+        record: Option<crate::messages::DanceRecord>,
+    },
+    /// `SMSG_INVALIDATE_DANCE`.
+    InvalidateDance {
+        id: u32,
+    },
+    /// `SMSG_RWHOIS`.
+    RWhois(crate::messages::RWhois),
+    /// `SMSG_CHECK_FOR_BOTS`: the challenge.
+    CheckForBots {
+        key: [u8; 16],
+    },
+    /// `SMSG_CHAR_RENAME`: a rename's result.
+    CharRename(crate::messages::CharRenameResult),
+    /// `SMSG_CHAR_CUSTOMIZE`: a customize's result.
+    CharCustomize(crate::messages::CharChangeResult),
+    /// `SMSG_CHAR_FACTION_CHANGE`: a race or faction change's result.
+    CharFactionChange(crate::messages::CharChangeResult),
+    /// `SMSG_SET_PLAYER_DECLINED_NAMES_RESULT`: a declension's result.
+    DeclinedNamesResult(crate::messages::DeclinedNamesResult),
+    /// `SMSG_MOTD`: the message of the day, a line each.
+    Motd(Vec<String>),
+    /// `SMSG_CHANNEL_MEMBER_COUNT`: read and dropped.
+    ChannelMemberCount {
+        channel: String,
+        flags: u8,
+        count: u32,
+    },
+    /// `SMSG_WHOIS`: a GM's whois answer.
+    Whois(String),
+    /// `SMSG_REALM_SPLIT`: the realm split state.
+    RealmSplit(crate::messages::RealmSplit),
+    /// `SMSG_SERVER_FIRST_ACHIEVEMENT`: a realm-first award.
+    ServerFirstAchievement(crate::messages::ServerFirstAchievement),
+    /// `MSG_GUILD_EVENT_LOG_QUERY`: the guild's event log, oldest first.
+    GuildEventLog(Vec<crate::messages::GuildEventLogEntry>),
     /// `SMSG_LOOT_MASTER_LIST`: master-loot candidates; precedes its `SMSG_LOOT_RESPONSE`.
     LootMasterList {
         candidates: Vec<u64>,
@@ -1178,6 +1398,12 @@ pub enum ServerPacket {
     GroupDecline {
         name: String,
     },
+    /// `SMSG_GROUP_CANCEL`: the inviter withdrew our invite.
+    GroupCancel {
+        inviter: String,
+    },
+    /// `SMSG_GROUPACTION_THROTTLED`: too many group commands; empty body.
+    GroupActionThrottled,
     /// `SMSG_GROUP_UNINVITE`: we were removed from our group (kicked or left); empty body.
     GroupUninvited,
     /// `SMSG_GROUP_SET_LEADER`: the group's leader changed.
@@ -1206,6 +1432,10 @@ pub enum ServerPacket {
         lfg_slot: u32,
         /// Group-type bit `0x01`: a battleground's group, which leaves the real group's counts.
         battleground: bool,
+
+        /// The group's guid and the list's update counter, which tell a stale list apart.
+        group_guid: u64,
+        counter: u32,
     },
     /// `SMSG_REAL_GROUP_UPDATE`: the group outside the battleground, while in one.
     RealGroupUpdate {
@@ -1219,6 +1449,8 @@ pub enum ServerPacket {
         operation: u32,
         member: String,
         result: u32,
+        /// The seconds an LFG boot result names, signed.
+        value: i32,
     },
     /// `SMSG_PARTY_MEMBER_STATS` (delta) or `_FULL` (answering our request, or an offline miss).
     PartyMemberStats {
@@ -1232,22 +1464,38 @@ pub enum ServerPacket {
         x: f32,
         y: f32,
     },
-    /// `MSG_RAID_TARGET_UPDATE`, delta shape: one raid-target icon changed; `guid == 0` clears it.
+    /// `MSG_RAID_TARGET_UPDATE`, delta shape: who set the marks, then each changed icon and its
+    /// target, 0 clearing it.
     RaidTargetSet {
-        icon: u8,
-        guid: u64,
+        setter: u64,
+        marks: Vec<(u8, u64)>,
     },
     /// `MSG_RAID_TARGET_UPDATE`, full shape: every icon currently set.
     RaidTargetList {
         entries: Vec<(u8, u64)>,
     },
-    /// `MSG_RAID_READY_CHECK`, empty body: the raid leader started a ready check.
-    ReadyCheckRequest,
-    /// `MSG_RAID_READY_CHECK`, non-empty body: one member's answer, forwarded to the leader only.
-    ReadyCheckAnswer {
-        guid: u64,
-        ready: u8,
+    /// `MSG_RAID_READY_CHECK`: a ready check started, echoed to the whole group.
+    ReadyCheckStarted {
+        initiator: u64,
     },
+    /// `SMSG_RAID_READY_CHECK_ERROR`: our ready check came too soon; empty body.
+    ReadyCheckError,
+    /// `MSG_NOTIFY_PARTY_SQUELCH`: a leader silenced or restored our voice.
+    PartySquelch {
+        silenced: bool,
+    },
+    /// `SMSG_ECHO_PARTY_SQUELCH`: we silenced or restored a member's voice.
+    EchoPartySquelch {
+        guid: u64,
+        silenced: bool,
+    },
+    /// `MSG_RAID_READY_CHECK_CONFIRM`: one member's answer.
+    ReadyCheckConfirm {
+        guid: u64,
+        ready: bool,
+    },
+    /// `MSG_RAID_READY_CHECK_FINISHED`: the check closed.
+    ReadyCheckFinished,
     /// `SMSG_RAID_INSTANCE_INFO`: our saved raid lockouts, answering `CMSG_REQUEST_RAID_INFO`.
     RaidInstanceInfo {
         entries: Vec<super::group::RaidInstanceEntry>,
@@ -1338,6 +1586,13 @@ pub enum ServerPacket {
     ContactList(ContactList),
     /// `SMSG_FRIEND_STATUS`: an add or remove ack, or a friend's login or logout.
     FriendStatus(FriendStatusUpdate),
+    /// `SMSG_COMPLAIN_RESULT`: the answer to a `CMSG_COMPLAIN`.
+    ComplaintResult(super::ComplaintResult),
+    /// `SMSG_FEATURE_SYSTEM_STATUS`: the complaint system's status (0 off, 2 on with auto-ignore);
+    /// the voice status after it is read and dropped, as voice is not built.
+    FeatureSystemStatus {
+        complaints: u8,
+    },
     /// `SMSG_WHO`: the `/who` answer, up to 49 rows plus the true match total.
     WhoResults(WhoResults),
     /// `SMSG_GUILD_QUERY_RESPONSE`: a guild's name, ten rank names and tabard, cached by guild id.
@@ -1417,6 +1672,19 @@ pub enum ServerPacket {
         transport: Option<TransportPose>,
         speed: f32,
     },
+    /// `MSG_MOVE_SET_COLLISION_HGT`: another unit's collision height, with the speed relays' pose.
+    MoveCollisionHeight {
+        guid: u64,
+        flags: u32,
+        position: Vector3d,
+        orientation: f32,
+        pitch: f32,
+        time: u32,
+        fall_time: u32,
+        jump: Option<JumpInfo>,
+        transport: Option<TransportPose>,
+        height: f32,
+    },
     /// `SMSG_MOUNTRESULT` / `SMSG_DISMOUNTRESULT` (by `mount`): a raw `UnitMountResult` (OK = 10)
     /// or `UnitDismountResult` (OK = 3).
     MountResult {
@@ -1435,8 +1703,8 @@ pub enum ServerPacket {
         mover: u64,
         allow_move: bool,
     },
-    /// `SMSG_SHOWTAXINODES` (`TaxiHandler.cpp:82-96`): the taxi map; vmangos always writes
-    /// `window` 1, and `nearest_node` is the flight master's own node.
+    /// `SMSG_SHOWTAXINODES` (`0x6d6050`): the taxi map when `window` is nonzero; `nearest_node` is
+    /// the flight master's own node.
     ShowTaxiNodes {
         window: u32,
         flightmaster: u64,
@@ -1527,13 +1795,44 @@ pub enum ServerPacket {
         id: u32,
         value: u32,
     },
+    /// `SMSG_SET_PHASE_SHIFT`: the player's phase mask.
+    SetPhaseShift {
+        mask: u32,
+    },
     /// `SMSG_ADDON_INFO` (`0x2ef`): one record per addon we sent in `CMSG_AUTH_SESSION`, in that
-    /// order with no count or names, so record i is `STOCK_SECURE_ADDONS[i]`. Status 2 drops the
-    /// addon from the client's Lua index, which hides Blizzard's addons from the AddOns list.
+    /// order with no count or names, so record i is `STOCK_SECURE_ADDONS_WOTLK[i]`, then the
+    /// banned-addon list. Status 2 drops the addon from the client's Lua index, which hides
+    /// Blizzard's addons from the AddOns list.
     AddonInfo {
         /// One status per record, in arrival order.
         statuses: Vec<u8>,
+        /// The trailing banned list, read whole; nothing applies it.
+        banned: Vec<crate::messages::BannedAddon>,
     },
+    /// `SMSG_HEALTH_UPDATE`: a unit's predicted health.
+    HealthUpdate {
+        guid: u64,
+        value: u32,
+    },
+    /// `SMSG_FORCE_DISPLAY_UPDATE`: rebuild the unit's model from its fields.
+    ForceDisplayUpdate {
+        guid: u64,
+    },
+    /// `SMSG_CAMERA_SHAKE`: a `SpellEffectCameraShakes` group and a sound kit, at the player.
+    CameraShake {
+        group: u32,
+        sound_kit: u32,
+    },
+    /// `SMSG_PLAYER_SKINNED`: our corpse's insignia was taken; the flag is the event's argument.
+    PlayerSkinned {
+        flag: bool,
+    },
+    /// `SMSG_RESURRECT_FAILED` (empty).
+    ResurrectFailed,
+    /// `SMSG_FORCED_DEATH_UPDATE` (empty).
+    ForcedDeathUpdate,
+    /// `SMSG_CLEAR_FAR_SIGHT_IMMEDIATE` (empty).
+    ClearFarSightImmediate,
     /// `SMSG_POWER_UPDATE`: a unit's power of one type, set outright.
     PowerUpdate {
         guid: u64,
@@ -1598,6 +1897,10 @@ pub enum ServerPacket {
     ForcedReactions {
         reactions: Vec<(u32, u32)>,
     },
+    /// A packet read in full that 12340 takes to no game effect; not a dropped packet.
+    Ignored {
+        opcode: u16,
+    },
     Other {
         opcode: u16,
     },
@@ -1615,6 +1918,11 @@ impl ServerPacket {
             ServerPacket::CharacterLoginFailed { .. } => "SMSG_CHARACTER_LOGIN_FAILED".into(),
             ServerPacket::UpdateObject { .. } => "SMSG_UPDATE_OBJECT".into(),
             ServerPacket::CompressedMoves { .. } => "SMSG_COMPRESSED_MOVES".into(),
+            ServerPacket::CombatLogBatch { .. } => "SMSG_SEND_ALL_COMBAT_LOG".into(),
+            ServerPacket::PacketBatch { opcode, .. } => {
+                crate::messages::opcode_name(*opcode).unwrap_or("?").into()
+            }
+            ServerPacket::FlightSplineSync { .. } => "SMSG_FLIGHT_SPLINE_SYNC".into(),
             ServerPacket::DestroyObject { .. } => "SMSG_DESTROY_OBJECT".into(),
             ServerPacket::TriggerCinematic { .. } => "SMSG_TRIGGER_CINEMATIC".into(),
             ServerPacket::MoveTimeSkipped { .. } => "MSG_MOVE_TIME_SKIPPED".into(),
@@ -1632,6 +1940,9 @@ impl ServerPacket {
             ServerPacket::TransferAborted { .. } => "SMSG_TRANSFER_ABORTED".into(),
             ServerPacket::LoginVerifyWorld { .. } => "SMSG_LOGIN_VERIFY_WORLD".into(),
             ServerPacket::TimeSpeed { .. } => "SMSG_LOGIN_SETTIMESPEED".into(),
+            ServerPacket::GameTimeUpdate(_) => "SMSG_GAMETIME_UPDATE".into(),
+            ServerPacket::GameTimeSet(_) => "SMSG_GAMETIME_SET".into(),
+            ServerPacket::GameSpeed { .. } => "SMSG_GAMESPEED_SET".into(),
             ServerPacket::QueryTimeResponse { .. } => "SMSG_QUERY_TIME_RESPONSE".into(),
             ServerPacket::BindPoint { .. } => "SMSG_BINDPOINTUPDATE".into(),
             ServerPacket::GmTicketAnswer { .. } => "SMSG_GMTICKET_GETTICKET".into(),
@@ -1646,6 +1957,7 @@ impl ServerPacket {
             ServerPacket::BinderConfirm { .. } => "SMSG_BINDER_CONFIRM".into(),
             ServerPacket::PlayerBound { .. } => "SMSG_PLAYERBOUND".into(),
             ServerPacket::SummonRequest { .. } => "SMSG_SUMMON_REQUEST".into(),
+            ServerPacket::SummonCancel => "SMSG_SUMMON_CANCEL".into(),
             ServerPacket::TalentWipeConfirm { .. } => "MSG_TALENT_WIPE_CONFIRM".into(),
             ServerPacket::TalentsInfo(_) => "SMSG_TALENTS_INFO".into(),
             ServerPacket::AllAchievementData(_) => "SMSG_ALL_ACHIEVEMENT_DATA".into(),
@@ -1690,27 +2002,30 @@ impl ServerPacket {
             ServerPacket::BattlegroundPlayer { joined: false, .. } => {
                 "SMSG_BATTLEGROUND_PLAYER_LEFT".into()
             }
-            ServerPacket::MeetingStoneSetQueue { .. } => "SMSG_MEETINGSTONE_SETQUEUE".into(),
-            ServerPacket::MeetingStoneNotice(crate::messages::MeetingStoneNotice::InProgress) => {
-                "SMSG_MEETINGSTONE_IN_PROGRESS".into()
-            }
-            ServerPacket::MeetingStoneNotice(
-                crate::messages::MeetingStoneNotice::MemberAdded { .. },
-            ) => "SMSG_MEETINGSTONE_MEMBER_ADDED".into(),
+            ServerPacket::ChatNotInParty { .. } => "SMSG_CHAT_NOT_IN_PARTY".into(),
+            ServerPacket::ResetRangedCombatTimer { .. } => "SMSG_RESET_RANGED_COMBAT_TIMER".into(),
+            ServerPacket::ResumeCastBar(_) => "SMSG_RESUME_CAST_BAR".into(),
             ServerPacket::TutorialFlags(_) => "SMSG_TUTORIAL_FLAGS".into(),
             ServerPacket::SetProficiency { .. } => "SMSG_SET_PROFICIENCY".into(),
             ServerPacket::InitializeFactions { .. } => "SMSG_INITIALIZE_FACTIONS".into(),
             ServerPacket::SetFactionStanding { .. } => "SMSG_SET_FACTION_STANDING".into(),
             ServerPacket::SetFactionVisible { .. } => "SMSG_SET_FACTION_VISIBLE".into(),
-            ServerPacket::NameQueryResponse { .. } => "SMSG_NAME_QUERY_RESPONSE".into(),
+            ServerPacket::SetFactionAtWar { .. } => "SMSG_SET_FACTION_ATWAR".into(),
+            ServerPacket::ExpectedSpamRecords(_) => "SMSG_EXPECTED_SPAM_RECORDS".into(),
+            ServerPacket::NameQueryResponse { .. } | ServerPacket::NameQueryMiss { .. } => {
+                "SMSG_NAME_QUERY_RESPONSE".into()
+            }
             ServerPacket::CreatureQueryResponse { .. } => "SMSG_CREATURE_QUERY_RESPONSE".into(),
             ServerPacket::PetNameQueryResponse { .. } => "SMSG_PET_NAME_QUERY_RESPONSE".into(),
             ServerPacket::GameObjectQueryResponse { .. } => "SMSG_GAMEOBJECT_QUERY_RESPONSE".into(),
-            ServerPacket::PageTextQueryResponse { .. } => "SMSG_PAGE_TEXT_QUERY_RESPONSE".into(),
+            ServerPacket::PageTextQueryResponse { .. } | ServerPacket::PageTextMiss { .. } => {
+                "SMSG_PAGE_TEXT_QUERY_RESPONSE".into()
+            }
             ServerPacket::GameObjectCustomAnim { .. } => "SMSG_GAMEOBJECT_CUSTOM_ANIM".into(),
             ServerPacket::GameObjectDespawnAnim { .. } => "SMSG_GAMEOBJECT_DESPAWN_ANIM".into(),
+            ServerPacket::GameObjectResetState { .. } => "SMSG_GAMEOBJECT_RESET_STATE".into(),
             ServerPacket::OpenContainer { .. } => "SMSG_OPEN_CONTAINER".into(),
-            ServerPacket::Inspect { .. } => "SMSG_INSPECT".into(),
+            ServerPacket::InspectResultsUpdate { .. } => "SMSG_INSPECT_RESULTS_UPDATE".into(),
             ServerPacket::TimeSyncReq { .. } => "SMSG_TIME_SYNC_REQ".into(),
             ServerPacket::StandStateUpdate { .. } => "SMSG_STANDSTATE_UPDATE".into(),
             ServerPacket::FishNotHooked => "SMSG_FISH_NOT_HOOKED".into(),
@@ -1722,24 +2037,35 @@ impl ServerPacket {
             ServerPacket::TextEmote { .. } => "SMSG_TEXT_EMOTE".into(),
             ServerPacket::Emote { .. } => "SMSG_EMOTE".into(),
             ServerPacket::ItemQueryResponse { .. } => "SMSG_ITEM_QUERY_SINGLE_RESPONSE".into(),
+            ServerPacket::ItemQueryMultiple(_) => "SMSG_ITEM_QUERY_MULTIPLE_RESPONSE".into(),
             ServerPacket::ClientCacheVersion { .. } => "SMSG_CLIENTCACHE_VERSION".into(),
             ServerPacket::AccountDataTimes(_) => "SMSG_ACCOUNT_DATA_TIMES".into(),
             ServerPacket::AccountDataUpdate(_) => "SMSG_UPDATE_ACCOUNT_DATA".into(),
-            ServerPacket::InventoryChangeFailure { .. } => "SMSG_INVENTORY_CHANGE_FAILURE".into(),
+            ServerPacket::InventoryChangeFailure(_) => "SMSG_INVENTORY_CHANGE_FAILURE".into(),
             ServerPacket::MessageChat(_) => "SMSG_MESSAGECHAT".into(),
             ServerPacket::ChannelNotify(_) => "SMSG_CHANNEL_NOTIFY".into(),
             ServerPacket::ChannelList { .. } => "SMSG_CHANNEL_LIST".into(),
+            ServerPacket::ChannelUserList(u) => match u.kind {
+                super::ChannelUserListKind::Add => "SMSG_USERLIST_ADD",
+                super::ChannelUserListKind::Remove => "SMSG_USERLIST_REMOVE",
+                super::ChannelUserListKind::Update => "SMSG_USERLIST_UPDATE",
+            }
+            .into(),
             ServerPacket::ChatPlayerNotFound { .. } => "SMSG_CHAT_PLAYER_NOT_FOUND".into(),
             ServerPacket::ChatWrongFaction => "SMSG_CHAT_WRONG_FACTION".into(),
             ServerPacket::Notification { .. } => "SMSG_NOTIFICATION".into(),
             ServerPacket::AreaTriggerMessage { .. } => "SMSG_AREA_TRIGGER_MESSAGE".into(),
             ServerPacket::ServerMessage { .. } => "SMSG_SERVER_MESSAGE".into(),
+            ServerPacket::TriggerMovie { .. } => "SMSG_TRIGGER_MOVIE".into(),
+            ServerPacket::DestLocSpellCast(_) => "SMSG_NOTIFY_DEST_LOC_SPELL_CAST".into(),
             ServerPacket::ZoneUnderAttack { .. } => "SMSG_ZONE_UNDER_ATTACK".into(),
             ServerPacket::DefenseMessage { .. } => "SMSG_DEFENSE_MESSAGE".into(),
             ServerPacket::Lfg(p) => p.name().into(),
             ServerPacket::Calendar(p) => p.name().into(),
             ServerPacket::InstanceDifficulty { .. } => "SMSG_INSTANCE_DIFFICULTY".into(),
-            ServerPacket::ChatRestricted => "SMSG_CHAT_RESTRICTED".into(),
+            ServerPacket::DifficultyChangeResult(_) => "SMSG_CHANGEPLAYER_DIFFICULTY_RESULT".into(),
+            ServerPacket::KickReason { .. } => "SMSG_KICK_REASON".into(),
+            ServerPacket::ChatRestricted { .. } => "SMSG_CHAT_RESTRICTED".into(),
             ServerPacket::PlayedTime { .. } => "SMSG_PLAYED_TIME".into(),
             ServerPacket::RandomRoll { .. } => "MSG_RANDOM_ROLL".into(),
             ServerPacket::InitialSpells { .. } => "SMSG_INITIAL_SPELLS".into(),
@@ -1756,6 +2082,10 @@ impl ServerPacket {
             ServerPacket::PetBroken => "SMSG_PET_BROKEN".into(),
             ServerPacket::PetActionSound { .. } => "SMSG_PET_ACTION_SOUND".into(),
             ServerPacket::PetDismissSound { .. } => "SMSG_PET_DISMISS_SOUND".into(),
+            ServerPacket::PetLearnedSpell { .. } => "SMSG_PET_LEARNED_SPELL".into(),
+            ServerPacket::PetUnlearnedSpell { .. } => "SMSG_PET_UNLEARNED_SPELL".into(),
+            ServerPacket::PetRenameable => "SMSG_PET_RENAMEABLE".into(),
+            ServerPacket::PetGuids(_) => "SMSG_PET_GUIDS".into(),
             ServerPacket::PetCastFailed { .. } => "SMSG_PET_CAST_FAILED".into(),
             ServerPacket::AttackStart { .. } => "SMSG_ATTACKSTART".into(),
             ServerPacket::AttackStop { .. } => "SMSG_ATTACKSTOP".into(),
@@ -1777,10 +2107,10 @@ impl ServerPacket {
             ServerPacket::SpellFailed { other: true, .. } => "SMSG_SPELL_FAILED_OTHER".into(),
             ServerPacket::SpellFailed { other: false, .. } => "SMSG_SPELL_FAILURE".into(),
             ServerPacket::SpellDelayed { .. } => "SMSG_SPELL_DELAYED".into(),
-            ServerPacket::CancelAutoRepeat => "SMSG_CANCEL_AUTO_REPEAT".into(),
+            ServerPacket::CancelAutoRepeat { .. } => "SMSG_CANCEL_AUTO_REPEAT".into(),
             ServerPacket::SpellCooldownList { .. } => "SMSG_SPELL_COOLDOWN".into(),
             ServerPacket::ItemCooldown { .. } => "SMSG_ITEM_COOLDOWN".into(),
-            ServerPacket::InspectItems { .. } => "SMSG_INSPECT_TALENT".into(),
+            ServerPacket::InspectTalent { .. } => "SMSG_INSPECT_TALENT".into(),
             ServerPacket::SocketGemsResult { .. } => "SMSG_SOCKET_GEMS_RESULT".into(),
             ServerPacket::ItemRefundInfo { .. } => "SMSG_ITEM_REFUND_INFO_RESPONSE".into(),
             ServerPacket::ItemRefundResult { .. } => "SMSG_ITEM_REFUND_RESULT".into(),
@@ -1872,7 +2202,9 @@ impl ServerPacket {
             ServerPacket::GossipMessage(_) => "SMSG_GOSSIP_MESSAGE".into(),
             ServerPacket::GossipComplete => "SMSG_GOSSIP_COMPLETE".into(),
             ServerPacket::GossipPoi(..) => "SMSG_GOSSIP_POI".into(),
-            ServerPacket::NpcText { .. } => "SMSG_NPC_TEXT_UPDATE".into(),
+            ServerPacket::NpcText { .. } | ServerPacket::NpcTextMiss { .. } => {
+                "SMSG_NPC_TEXT_UPDATE".into()
+            }
             ServerPacket::VendorList { .. } => "SMSG_LIST_INVENTORY".into(),
             ServerPacket::BuyItem { .. } => "SMSG_BUY_ITEM".into(),
             ServerPacket::SellItemResult { .. } => "SMSG_SELL_ITEM".into(),
@@ -1902,9 +2234,24 @@ impl ServerPacket {
             ServerPacket::ArenaError { .. } => "SMSG_ARENA_ERROR".into(),
             ServerPacket::ProposeLevelGrant { .. } => "SMSG_PROPOSE_LEVEL_GRANT".into(),
             ServerPacket::ReferAFriendFailure { .. } => "SMSG_REFER_A_FRIEND_FAILURE".into(),
+            ServerPacket::Notice(n) => n.opcode_name().into(),
             ServerPacket::UnlearnSpells(_) => "SMSG_SEND_UNLEARN_SPELLS".into(),
             ServerPacket::InebriationThreshold(_) => "SMSG_CROSSED_INEBRIATION_THRESHOLD".into(),
             ServerPacket::LearnedDanceMoves(_) => "SMSG_LEARNED_DANCE_MOVES".into(),
+            ServerPacket::DanceQueryResponse { .. } => "SMSG_DANCE_QUERY_RESPONSE".into(),
+            ServerPacket::InvalidateDance { .. } => "SMSG_INVALIDATE_DANCE".into(),
+            ServerPacket::RWhois(_) => "SMSG_RWHOIS".into(),
+            ServerPacket::CheckForBots { .. } => "SMSG_CHECK_FOR_BOTS".into(),
+            ServerPacket::CharRename(_) => "SMSG_CHAR_RENAME".into(),
+            ServerPacket::CharCustomize(_) => "SMSG_CHAR_CUSTOMIZE".into(),
+            ServerPacket::CharFactionChange(_) => "SMSG_CHAR_FACTION_CHANGE".into(),
+            ServerPacket::DeclinedNamesResult(_) => "SMSG_SET_PLAYER_DECLINED_NAMES_RESULT".into(),
+            ServerPacket::Motd(_) => "SMSG_MOTD".into(),
+            ServerPacket::ChannelMemberCount { .. } => "SMSG_CHANNEL_MEMBER_COUNT".into(),
+            ServerPacket::Whois(_) => "SMSG_WHOIS".into(),
+            ServerPacket::RealmSplit(_) => "SMSG_REALM_SPLIT".into(),
+            ServerPacket::ServerFirstAchievement(_) => "SMSG_SERVER_FIRST_ACHIEVEMENT".into(),
+            ServerPacket::GuildEventLog(_) => "MSG_GUILD_EVENT_LOG_QUERY".into(),
             ServerPacket::LootMasterList { .. } => "SMSG_LOOT_MASTER_LIST".into(),
             ServerPacket::ItemPushResult(_) => "SMSG_ITEM_PUSH_RESULT".into(),
             ServerPacket::CorpseQuery(_) => "MSG_CORPSE_QUERY".into(),
@@ -1916,6 +2263,13 @@ impl ServerPacket {
                 "SMSG_CORPSE_MAP_POSITION_QUERY_RESPONSE".into()
             }
             ServerPacket::CorpseNotInInstance => "SMSG_CORPSE_NOT_IN_INSTANCE".into(),
+            ServerPacket::HealthUpdate { .. } => "SMSG_HEALTH_UPDATE".into(),
+            ServerPacket::ForceDisplayUpdate { .. } => "SMSG_FORCE_DISPLAY_UPDATE".into(),
+            ServerPacket::CameraShake { .. } => "SMSG_CAMERA_SHAKE".into(),
+            ServerPacket::PlayerSkinned { .. } => "SMSG_PLAYER_SKINNED".into(),
+            ServerPacket::ResurrectFailed => "SMSG_RESURRECT_FAILED".into(),
+            ServerPacket::ForcedDeathUpdate => "SMSG_FORCED_DEATH_UPDATE".into(),
+            ServerPacket::ClearFarSightImmediate => "SMSG_CLEAR_FAR_SIGHT_IMMEDIATE".into(),
             ServerPacket::ResurrectRequest(_) => "SMSG_RESURRECT_REQUEST".into(),
             ServerPacket::SpiritHealerConfirm { .. } => "SMSG_SPIRIT_HEALER_CONFIRM".into(),
             ServerPacket::MoveSetCollisionHeight { .. } => "SMSG_MOVE_SET_COLLISION_HGT".into(),
@@ -1932,6 +2286,12 @@ impl ServerPacket {
                 (MoveMode::CanFly, false) => "SMSG_MOVE_UNSET_CAN_FLY".into(),
                 (MoveMode::DisableGravity, true) => "SMSG_MOVE_GRAVITY_DISABLE".into(),
                 (MoveMode::DisableGravity, false) => "SMSG_MOVE_GRAVITY_ENABLE".into(),
+                (MoveMode::SwimFlyTransition, true) => {
+                    "SMSG_MOVE_SET_CAN_TRANSITION_BETWEEN_SWIM_AND_FLY".into()
+                }
+                (MoveMode::SwimFlyTransition, false) => {
+                    "SMSG_MOVE_UNSET_CAN_TRANSITION_BETWEEN_SWIM_AND_FLY".into()
+                }
             },
             ServerPacket::SplineMoveMode { mode, apply, .. } => match (mode, apply) {
                 (SplineMode::Root, true) => "SMSG_SPLINE_MOVE_ROOT".into(),
@@ -1962,6 +2322,8 @@ impl ServerPacket {
             }
             ServerPacket::GroupInvite { .. } => "SMSG_GROUP_INVITE".into(),
             ServerPacket::GroupDecline { .. } => "SMSG_GROUP_DECLINE".into(),
+            ServerPacket::GroupCancel { .. } => "SMSG_GROUP_CANCEL".into(),
+            ServerPacket::GroupActionThrottled => "SMSG_GROUPACTION_THROTTLED".into(),
             ServerPacket::GroupUninvited => "SMSG_GROUP_UNINVITE".into(),
             ServerPacket::GroupLeaderChanged { .. } => "SMSG_GROUP_SET_LEADER".into(),
             ServerPacket::GroupDestroyed => "SMSG_GROUP_DESTROYED".into(),
@@ -1976,9 +2338,12 @@ impl ServerPacket {
             ServerPacket::RaidTargetSet { .. } | ServerPacket::RaidTargetList { .. } => {
                 "MSG_RAID_TARGET_UPDATE".into()
             }
-            ServerPacket::ReadyCheckRequest | ServerPacket::ReadyCheckAnswer { .. } => {
-                "MSG_RAID_READY_CHECK".into()
-            }
+            ServerPacket::ReadyCheckStarted { .. } => "MSG_RAID_READY_CHECK".into(),
+            ServerPacket::ReadyCheckConfirm { .. } => "MSG_RAID_READY_CHECK_CONFIRM".into(),
+            ServerPacket::ReadyCheckFinished => "MSG_RAID_READY_CHECK_FINISHED".into(),
+            ServerPacket::ReadyCheckError => "SMSG_RAID_READY_CHECK_ERROR".into(),
+            ServerPacket::PartySquelch { .. } => "MSG_NOTIFY_PARTY_SQUELCH".into(),
+            ServerPacket::EchoPartySquelch { .. } => "SMSG_ECHO_PARTY_SQUELCH".into(),
             ServerPacket::RaidInstanceInfo { .. } => "SMSG_RAID_INSTANCE_INFO".into(),
             ServerPacket::DuelRequested { .. } => "SMSG_DUEL_REQUESTED".into(),
             ServerPacket::RaidInstanceMessage { .. } => "SMSG_RAID_INSTANCE_MESSAGE".into(),
@@ -2005,6 +2370,8 @@ impl ServerPacket {
             ServerPacket::MirrorTimerStop { .. } => "SMSG_STOP_MIRROR_TIMER".into(),
             ServerPacket::ContactList(_) => "SMSG_CONTACT_LIST".into(),
             ServerPacket::FriendStatus(..) => "SMSG_FRIEND_STATUS".into(),
+            ServerPacket::ComplaintResult(_) => "SMSG_COMPLAIN_RESULT".into(),
+            ServerPacket::FeatureSystemStatus { .. } => "SMSG_FEATURE_SYSTEM_STATUS".into(),
             ServerPacket::WhoResults(..) => "SMSG_WHO".into(),
             ServerPacket::GuildQueryResponse(..) => "SMSG_GUILD_QUERY_RESPONSE".into(),
             ServerPacket::GuildRoster(..) => "SMSG_GUILD_ROSTER".into(),
@@ -2029,6 +2396,7 @@ impl ServerPacket {
                 format!("SMSG_SPLINE_SET_{kind:?}_SPEED")
             }
             ServerPacket::MoveSetSpeed { kind, .. } => format!("MSG_MOVE_SET_{kind:?}_SPEED"),
+            ServerPacket::MoveCollisionHeight { .. } => "MSG_MOVE_SET_COLLISION_HGT".into(),
             ServerPacket::MountResult { mount: true, .. } => "SMSG_MOUNTRESULT".into(),
             ServerPacket::MountResult { mount: false, .. } => "SMSG_DISMOUNTRESULT".into(),
             ServerPacket::MountSpecialAnim { .. } => "SMSG_MOUNTSPECIAL_ANIM".into(),
@@ -2058,7 +2426,10 @@ impl ServerPacket {
             ServerPacket::TradeStatusExtended { .. } => "SMSG_TRADE_STATUS_EXTENDED".into(),
             ServerPacket::InitWorldStates(_) => "SMSG_INIT_WORLD_STATES".into(),
             ServerPacket::UpdateWorldState { .. } => "SMSG_UPDATE_WORLD_STATE".into(),
+            ServerPacket::SetPhaseShift { .. } => "SMSG_SET_PHASE_SHIFT".into(),
             ServerPacket::AddonInfo { .. } => "SMSG_ADDON_INFO".into(),
+            ServerPacket::Ignored { opcode } => super::opcode_name(*opcode)
+                .map_or_else(|| format!("opcode {opcode:#06x}"), str::to_string),
             ServerPacket::Other { opcode } => format!("opcode {opcode:#06x}"),
         }
     }

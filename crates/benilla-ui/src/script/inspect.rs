@@ -83,8 +83,9 @@ impl super::UiScript {
         drain_field!(self, inspect_notifies)
     }
 
-    /// Whether `ClearInspectPlayer` was called since the last drain; the app drops its target.
-    pub fn take_inspect_clear(&mut self) -> bool {
+    /// Where `ClearInspectPlayer` last ran since the drain, as a count of the notifies queued before
+    /// it; the app drops its target there.
+    pub fn take_inspect_clear(&mut self) -> Option<usize> {
         drain_field!(self, inspect_clear)
     }
 }
@@ -150,6 +151,33 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
+    // UnitInRange(unit) (`0x612f10`): 1 within 40 yards for the player, their pet and the group
+    // with its pets, else nil.
+    g.set(
+        "UnitInRange",
+        lua.create_function(|lua, unit: Value| {
+            let unit = super::binding_abi::string_arg(lua, unit, "Usage: UnitInRange(\"unit\")")?;
+            let model = lua
+                .app_data_ref::<crate::script::ModelCell>()
+                .expect("model app_data");
+            let guids = &model.unit_guids;
+            let Some(guid) = guids.resolve(&unit).ok().flatten() else {
+                return Ok(Value::Nil);
+            };
+            let ours = guid == guids.player
+                || guid == guids.pet
+                || guids.party.contains(&guid)
+                || guids.party_pets.contains(&guid)
+                || guids.raid.contains(&guid)
+                || guids.raid_pets.contains(&guid);
+            let near = model
+                .unit_reach
+                .get(&guid)
+                .is_some_and(|r| r.dist_sq <= 1600.0);
+            Ok(super::binding_abi::flag(ours && near))
+        })?,
+    )?;
+
     // NotifyInspect(unit) (`Blizzard_InspectUI.lua:9`): fire-and-forget, as nothing waits on the
     // reply.
     g.set(
@@ -160,11 +188,19 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // ClearInspectPlayer(): called from `InspectFrame_OnHide` (`Blizzard_InspectUI.lua:58`).
+    // ClearInspectPlayer(): called from `InspectFrame_OnHide` (`Blizzard_InspectUI.lua:58`). The
+    // honor latch and its pending flag clear at once (`0x5e78b8`), so a `RequestInspectHonorData`
+    // in the same chunk asks again; the target itself clears in the app.
     g.set(
         "ClearInspectPlayer",
         lua.create_function(|lua, ()| {
-            crate::script::model_mut_of(lua).inspect_clear = true;
+            let mut model = crate::script::model_mut_of(lua);
+            model.inspect_clear = Some(model.inspect_notifies.len());
+            model.inspect_honor = None;
+            model.inspect_honor_pending = false;
+            // The inspected talent tabs go at once (`0x5c9f70` with no player).
+            model.inspect_talents.tabs.clear();
+            model.inspect_talents.talents.clear();
             Ok(())
         })?,
     )?;

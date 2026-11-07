@@ -467,7 +467,6 @@ fn dev_map_jump(
     buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
-    ui_scale: Res<crate::ui_script::UiScaleCvar>,
     script: Option<NonSendMut<UiScript>>,
     net: Res<crate::net::NetCommands>,
 ) {
@@ -485,8 +484,8 @@ fn dev_map_jump(
     let Some(cursor) = window.cursor_position() else {
         return;
     };
-    // Window px (y-down) to the VM's y-up 768-unit space, as the pointer feed converts them.
-    let s = crate::ui_script::seam_scale(window.height(), ui_scale.0);
+    // Window px (y-down) to the VM's y-up 768-unit root, as the pointer feed converts them.
+    let s = crate::ui_script::seam_scale(window.height());
     let Some((u, v)) = script.world_map_uv_at(cursor.x / s, (window.height() - cursor.y) / s)
     else {
         return;
@@ -515,7 +514,10 @@ impl Plugin for WorldMapUiPlugin {
         app.add_systems(
             Update,
             (
-                feed_world_map.after(UiInput),
+                // Ahead of the world-state event, as the handler refreshes the map first (`0x5269c5`).
+                feed_world_map
+                    .after(UiInput)
+                    .before(crate::world_state_ui::feed_world_state_ui),
                 // After the script tick, so the jump hit-tests this tick's frame rects.
                 dev_map_jump.after(UiInput),
             ),

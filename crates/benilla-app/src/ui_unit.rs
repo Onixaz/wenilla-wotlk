@@ -137,6 +137,7 @@ impl Plugin for UiUnitPlugin {
                 .run_if(crate::ui_script::ingame_ui_up),
         )
         .init_resource::<UnitFeedState>()
+        .init_resource::<RestStates>()
         // A UI-only harness has no sound or net stack, and a missing resource or message is a
         // system-validation panic; declaring twice is idempotent.
         .init_resource::<crate::sound::MessageSounds>()
@@ -174,10 +175,16 @@ impl Plugin for UiUnitPlugin {
                 .after(feed_units)
                 .after(crate::ui_aura::AuraEvents),
         )
+        .add_systems(Update, feed_name_records.in_set(UnitFeed))
+        .add_systems(Update, taxi_benchmark.in_set(UnitFeed))
         .add_systems(Update, drain_pvp_toggles.after(UiInput))
         .net_handler(
             benilla_protocol::SessionEventKind::PowerUpdate,
             on_power_update,
+        )
+        .net_handler(
+            benilla_protocol::SessionEventKind::HealthUpdate,
+            on_health_update,
         )
         .add_systems(Update, drain_worn_display_toggles.after(UiInput))
         .add_systems(Update, drain_action_bar_toggles.after(UiInput))
@@ -375,11 +382,26 @@ fn feed_default_language(
     }
 }
 
+/// `Exhaustion.dbc`'s rows as `(id, name, factor)`, which the XP line reads (`[0xad3838]`); empty
+/// until the first VM loads them.
+#[derive(Resource, Default)]
+pub(crate) struct RestStates(pub(crate) Vec<(u8, String, f32)>);
+
+impl RestStates {
+    pub(crate) fn get(&self, id: u8) -> Option<(&str, f32)> {
+        self.0
+            .iter()
+            .find(|r| r.0 == id)
+            .map(|r| (r.1.as_str(), r.2))
+    }
+}
+
 /// Seed each VM's `Exhaustion.dbc` table; a failed load keeps the shipped-table fallback.
 fn load_exhaustion_rows(
     script: Option<NonSendMut<UiScript>>,
     assets: Option<Res<benilla_assets::WorldAssets>>,
     mut seeded: Local<crate::ui_script::VmMemo<bool>>,
+    mut rest_states: ResMut<RestStates>,
 ) {
     let (Some(mut script), Some(assets)) = (script, assets) else {
         return;
@@ -395,6 +417,10 @@ fn load_exhaustion_rows(
     match loaded {
         Ok(rows) => {
             info!("ui_unit: {} Exhaustion.dbc rest states", rows.len());
+            rest_states.0 = rows
+                .iter()
+                .map(|r| (r.id as u8, r.name.clone(), r.factor))
+                .collect();
             script.set_exhaustion_rows(
                 rows.into_iter()
                     .map(|r| (r.id as u8, r.name, f64::from(r.factor)))
@@ -504,6 +530,67 @@ fn fire_unit_combat(
     }
 }
 
+/// `SetTaxiBenchmarkMode`'s send, and the two events off `PLAYER_FLAGS` 0x20000's edge.
+fn taxi_benchmark(
+    script: Option<NonSendMut<UiScript>>,
+    self_q: Query<&ObjectStore, With<SelfPlayer>>,
+    commands: Res<crate::net::NetCommands>,
+    mut was_on: Local<crate::ui_script::VmMemo<Option<bool>>>,
+) {
+    let Some(mut script) = script else {
+        return;
+    };
+    let was_on = was_on.get(&script);
+    for on in script.take_taxi_benchmark_requests() {
+        let _ = commands
+            .0
+            .send(crate::net::ClientCommand::SetTaxiBenchmarkMode { on });
+    }
+    let on = self_q
+        .iter()
+        .next()
+        .is_some_and(|s| s.0.player_flags() & 0x20000 != 0);
+    if was_on.is_some_and(|was| was != on) {
+        let event = if on {
+            "ENABLE_TAXI_BENCHMARK"
+        } else {
+            "DISABLE_TAXI_BENCHMARK"
+        };
+        script.fire_event(event, vec![]);
+    }
+    *was_on = Some(on);
+}
+
+/// Mirror the name cache's changed players into the VM, every answered one into a new VM, and
+/// send `GetPlayerInfoByGUID`'s asks.
+fn feed_name_records(
+    script: Option<NonSendMut<UiScript>>,
+    names: Res<crate::names::NameCache>,
+    commands: Res<crate::net::NetCommands>,
+    mut fed: Local<crate::ui_script::VmMemo<bool>>,
+) {
+    let Some(mut script) = script else {
+        return;
+    };
+    let (wiped, changed) = names.take_player_changes();
+    if wiped {
+        script.clear_name_records();
+    }
+    let seeded = fed.get(&script);
+    let guids = if *seeded {
+        changed
+    } else {
+        *seeded = true;
+        names.player_guids()
+    };
+    for guid in guids {
+        script.set_name_record(guid, names.player_record(guid));
+    }
+    for guid in script.take_name_asks() {
+        let _ = names.resolve(guid, &commands);
+    }
+}
+
 /// The race id to `UnitRace`'s display name and `raceFile` token (`"Scourge"`, `"NightElf"`); the
 /// display name is also what `$R`/`$r` expand to.
 pub(crate) fn race_names(race: u8) -> Option<(&'static str, &'static str)> {
@@ -601,6 +688,7 @@ pub(crate) struct UnitTokens<'w, 's> {
     interact: Option<Res<'w, crate::ui_session::InteractNpc>>,
     quest: Option<Res<'w, crate::ui_quest::QuestGiver>>,
     encounter: Option<Res<'w, crate::ui_instance::EncounterUnits>>,
+    arena: Option<Res<'w, crate::ui_arena::ArenaOpponents>>,
     group: Res<'w, crate::ui_party::GroupState>,
     pub(crate) stores: Query<'w, 's, &'static ObjectStore>,
     me: Query<'w, 's, (Entity, &'static Guid), With<SelfPlayer>>,
@@ -662,12 +750,22 @@ impl UnitTokens<'_, '_> {
                 let guid = self.encounter.as_ref()?.boss(usize::try_from(row).ok()?);
                 (guid != 0).then(|| self.held(guid)).flatten()
             }
+            // The opponent slot (`0x608180`), and its pet (`0x60a2f0`).
+            UnitBase::Arena(row) | UnitBase::ArenaPet(row) => {
+                let arena = self.arena.as_ref()?;
+                let row = usize::try_from(row).ok()?;
+                let guid = if matches!(base, UnitBase::Arena(_)) {
+                    *arena.opponents().get(row)?
+                } else {
+                    let index = self.index.as_ref()?;
+                    *arena
+                        .pets(&crate::ui_arena::pet_of(index, &self.stores))
+                        .get(row)?
+                };
+                (guid != 0).then(|| self.held(guid)).flatten()
+            }
             // 12340's bases the app has no unit for yet (#90).
-            UnitBase::Vehicle
-            | UnitBase::Focus
-            | UnitBase::Arena(_)
-            | UnitBase::ArenaPet(_)
-            | UnitBase::Commentator(_) => None,
+            UnitBase::Vehicle | UnitBase::Focus | UnitBase::Commentator(_) => None,
         }
     }
 
@@ -915,6 +1013,7 @@ pub(crate) fn snapshot(
         ghost: store.0.player_is_ghost(),
         // `UnitIsCharmed`: `UNIT_FIELD_CHARMEDBY != 0`.
         charmed: store.0.unit_charmed_by().is_some(),
+        controlling: store.0.unit_charm().is_some() || store.0.unit_summon().is_some(),
         // `UNIT_DYNAMIC_FLAGS` bits `0x4`/`0x8`; a unit with no descriptor reads `false`.
         tapped: store.0.unit_tapped(),
         tapped_by_player: store.0.unit_tapped_by_player(),
@@ -1268,12 +1367,13 @@ pub(crate) fn fire_transitions(
 }
 
 /// The sources `feed_units` snapshots besides the selection: the `"npc"` and `"questnpc"` units,
-/// and the encounter's `"bossN"`.
+/// the encounter's `"bossN"` and the arena's `"arenaN"` and `"arenapetN"`.
 #[derive(bevy::ecs::system::SystemParam)]
 struct Interactions<'w> {
     npc: Option<Res<'w, crate::ui_session::InteractNpc>>,
     quest: Option<Res<'w, crate::ui_quest::QuestGiver>>,
     encounter: Option<ResMut<'w, crate::ui_instance::EncounterUnits>>,
+    arena: Option<Res<'w, crate::ui_arena::ArenaOpponents>>,
 }
 
 fn feed_units(
@@ -1309,6 +1409,27 @@ fn feed_units(
     {
         script.set_billing_time_rested(entered);
     }
+    // Ahead of the gate too: `PLAYER_LEVEL_UP` from `SMSG_LEVELUP_INFO` alone (`0x6e3691`), its
+    // nine `%d`s: level, health, the first power gain, a talent point at level 10 or more, the
+    // five stats.
+    let level_ups = if sink.chat.has_level_ups() {
+        sink.chat.take_level_ups()
+    } else {
+        Vec::new()
+    };
+    for l in level_ups {
+        let args = [
+            l.level as i32,
+            l.health,
+            l.powers[0],
+            i32::from(l.level >= 10),
+        ]
+        .into_iter()
+        .chain(l.stats)
+        .map(|v| ScriptValue::Int(i64::from(v)))
+        .collect();
+        script.fire_event("PLAYER_LEVEL_UP", args);
+    }
     let chr = tables.classes();
     let types = tables.types(&names);
     let (memo, vm_reset) = feed.vm.get_reset(&script);
@@ -1328,7 +1449,8 @@ fn feed_units(
     // The interaction NPC moves when nothing else does, and `MERCHANT_SHOW` reads `"npc"`.
     let interact_changed = interact.npc.as_ref().is_some_and(|r| r.is_changed())
         || interact.quest.as_ref().is_some_and(|r| r.is_changed())
-        || interact.encounter.as_ref().is_some_and(|r| r.is_changed());
+        || interact.encounter.as_ref().is_some_and(|r| r.is_changed())
+        || interact.arena.as_ref().is_some_and(|r| r.is_changed());
     gate::trace(
         "feed_units",
         &[
@@ -1594,35 +1716,12 @@ fn feed_units(
         }
     }
 
-    // `PLAYER_LEVEL_UP` on any level change off the descriptor, demotions included (vmangos
-    // `GiveLevel` sends `SMSG_LEVELUP_INFO` for those too); the reference's trigger is untraced.
+    // The player's level watch (`0x6d66e0`): the battleground types' `canEnter` moved.
     if let Some((store, _)) = self_q.iter().next() {
         if let Some(level) = store.0.unit_level() {
             let prev = memo.last_level.replace(level);
             if prev.is_some_and(|p| level != p) {
                 gate.audit("feed_units", "the level edge");
-                // All nine, as the reference formats them (`%d` nine times) and
-                // `ChatFrame.lua:1283-1320` reads them; missing gains are zeros, since stock's
-                // `if ( argN > 0 )` raises on nil.
-                let (info, talent_points) = sink.chat.take_level_up_gains(level).unzip();
-                let gain = |f: fn(&benilla_protocol::messages::LevelUpInfo) -> i32| {
-                    ScriptValue::Int(i64::from(info.as_ref().map_or(0, f)))
-                };
-                script.fire_event(
-                    "PLAYER_LEVEL_UP",
-                    vec![
-                        ScriptValue::Int(i64::from(level)),
-                        gain(|l| l.health),
-                        gain(|l| l.powers[0]),
-                        ScriptValue::Int(i64::from(talent_points.unwrap_or(0))),
-                        gain(|l| l.stats[0]),
-                        gain(|l| l.stats[1]),
-                        gain(|l| l.stats[2]),
-                        gain(|l| l.stats[3]),
-                        gain(|l| l.stats[4]),
-                    ],
-                );
-                // The player's level watch (`0x6d66e0`): the battleground types' `canEnter` moved.
                 script.fire_event("PVPQUEUE_ANYWHERE_UPDATE_AVAILABLE", vec![]);
             }
         }
@@ -1675,14 +1774,40 @@ fn feed_units(
             Some(held.state(stores.all.get(entity).ok()?, guid))
         })
         .collect();
-    for (token, snap) in crate::ui_instance::BOSS_TOKENS.iter().zip(&bosses) {
-        let dirty = match (snap, memo.last.get(*token)) {
+    // `"arenaN"` then `"arenapetN"`: each slot's unit while held, read as `"bossN"` is.
+    let arena_guids = match (interact.arena.as_deref(), index.as_deref()) {
+        (Some(arena), Some(index)) => {
+            let pets = arena.pets(&crate::ui_arena::pet_of(index, &stores.all));
+            let mut guids = arena.opponents().to_vec();
+            guids.extend(pets);
+            guids
+        }
+        _ => vec![0; 2 * crate::ui_arena::ARENA_SLOTS],
+    };
+    let arenas: Vec<Option<UnitState>> = arena_guids
+        .iter()
+        .map(|&guid| {
+            let entity = *index.as_ref()?.0.get(&guid)?;
+            Some(held.state(stores.all.get(entity).ok()?, guid))
+        })
+        .collect();
+    let arena_tokens = || {
+        crate::ui_arena::ARENA_TOKENS
+            .into_iter()
+            .chain(crate::ui_arena::ARENA_PET_TOKENS)
+    };
+    for (token, snap) in crate::ui_instance::BOSS_TOKENS
+        .into_iter()
+        .zip(&bosses)
+        .chain(arena_tokens().zip(&arenas))
+    {
+        let dirty = match (snap, memo.last.get(token)) {
             (Some(cur), Some(prev)) => cur != prev,
             (None, None) => false,
             _ => true,
         };
         if dirty {
-            gate.audit("feed_units", "a boss snapshot");
+            gate.audit("feed_units", "a boss or arena snapshot");
             script.set_unit(token, snap.clone());
         }
     }
@@ -1695,6 +1820,7 @@ fn feed_units(
     ]
     .into_iter()
     .chain(crate::ui_instance::BOSS_TOKENS.into_iter().zip(&bosses))
+    .chain(arena_tokens().zip(&arenas))
     {
         match snap {
             Some(cur) => {
@@ -1856,6 +1982,30 @@ fn on_power_update(
         .bypass_change_detection()
         .0
         .set_predicted_power(power_type, value)
+    {
+        store.set_changed();
+    }
+}
+
+/// `SMSG_HEALTH_UPDATE` (`0x716d20`): the unit's predicted health, which `UnitHealth` reads
+/// until the health field moves ([`benilla_protocol::ObjectFields::set_predicted_health`]). The
+/// reference fires no event here; the feed's diff fires `UNIT_HEALTH` on the read's move. The
+/// `predictedHealth` gate (`0x71c2c5`) is not read, as `predictedPower`'s is not: both boot on.
+fn on_health_update(
+    In(ev): In<benilla_protocol::SessionEvent>,
+    index: Res<crate::net::GuidIndex>,
+    mut stores: Query<&mut ObjectStore>,
+) {
+    let benilla_protocol::SessionEvent::HealthUpdate { guid, value } = ev else {
+        return;
+    };
+    let Some(mut store) = index.0.get(&guid).and_then(|&e| stores.get_mut(e).ok()) else {
+        return;
+    };
+    if store
+        .bypass_change_detection()
+        .0
+        .set_predicted_health(value)
     {
         store.set_changed();
     }

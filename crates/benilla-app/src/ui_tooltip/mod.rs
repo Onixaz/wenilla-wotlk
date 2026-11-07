@@ -140,12 +140,12 @@ fn drive_mouseover_tooltip(
     go_inputs: crate::target::lock::GoLockInputs,
     // The known-spell set the resolver's SKILL arm scans.
     player_actions: Res<crate::ui_action::PlayerActions>,
-    // The cursor seat crosses the VM seam: the anchor below is UI units, not px.
-    ui_scale: Res<crate::ui_script::UiScaleCvar>,
     mut memo: HoverMemo,
     // `ChrClasses.dbc` field 16, `UnitHasRelicSlot`'s input, and the form table the creature type
     // reads.
     tables: SnapshotTables,
+    // The meeting stone's area line.
+    areas: Option<Res<crate::area::AreaTableRes>>,
 ) {
     let Some(mut script) = script else {
         return;
@@ -259,11 +259,11 @@ fn drive_mouseover_tooltip(
             .templates
             .get(guid)
             .is_some_and(|t| t.floating_tooltip);
-        // Window px to the VM's y-up UI units, as the input seam converts.
+        // Window px to the VM's y-up root units, as the input seam converts.
         let cursor_ui = cursor_seated
             .then(|| {
                 window.iter().next().and_then(|w| {
-                    let s = crate::ui_script::seam_scale(w.height(), ui_scale.0);
+                    let s = crate::ui_script::seam_scale(w.height());
                     // The hover probe's aim stands in for a missing cursor; a real pointer wins.
                     w.cursor_position()
                         .or_else(crate::target::hover_probe_point)
@@ -300,7 +300,7 @@ fn drive_mouseover_tooltip(
         }
         let Some(template) = go_inputs.templates.get(guid).cloned() else {
             // Template in flight: ask once, and show it when it lands.
-            go_inputs.templates.request(guid, &commands);
+            go_inputs.templates.request(guid, None, &commands);
             return;
         };
         // "Locked" iff `GO_FLAG_LOCKED`, then `Lock.dbc` slot 0's line past its gate (`0x62689d`).
@@ -316,6 +316,13 @@ fn drive_mouseover_tooltip(
             .filter(|_| template.lock_id != 0)
             .and_then(|l| l.0.slots(template.lock_id));
         let mut lines: Vec<(String, TooltipTint)> = Vec::new();
+        // The type's own lines come first (`0x70ba40`): a meeting stone names its area.
+        if let Some(name) = template
+            .meeting_stone
+            .and_then(|s| areas.as_deref()?.0.name(s.area))
+        {
+            lines.push((name.to_string(), TooltipTint::Title));
+        }
         // The lock lines' keys all read "Requires %s" in enUS; only the binary tells them apart.
         let go_get = |key: &str| benilla_ui::strings::global(script.lua(), key);
         // Both lock lines ask the lock test (`0x70f160`), the resolver the click uses.

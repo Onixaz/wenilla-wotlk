@@ -91,11 +91,22 @@ pub(in crate::net) fn trace_relay(
         benilla_protocol::RelayVerb::Teleport => "tp",
         benilla_protocol::RelayVerb::Root(_) => "rt",
         benilla_protocol::RelayVerb::Pose => "tr",
+        benilla_protocol::RelayVerb::Value => "vl",
+        benilla_protocol::RelayVerb::SwimFlyTransition(_) => "sf",
     };
+    // The jump tail's horizontal launch in world XY, and the pose's facing beside it.
+    let jump = mv.jump.map_or(String::new(), |j| {
+        format!(
+            " o={:.3} jump=[{:+.2},{:+.2}]",
+            mv.orientation,
+            j.cos_angle * j.xy_speed,
+            j.sin_angle * j.xy_speed
+        )
+    });
     benilla_assets::trace::line(
         "rly",
         &format!(
-            "guid={guid:#x} {kind} wire={} flags={:#x} pitch={:+.3} out={} lead={lead:7.1} q={queued}",
+            "guid={guid:#x} {kind} wire={} flags={:#x} pitch={:+.3} out={} lead={lead:7.1} q={queued}{jump}",
             mv.wire_ms,
             mv.flags,
             mv.pitch,
@@ -292,6 +303,15 @@ pub(in crate::net) fn apply_move(
             rm.flags = (rm.flags | move_flags::ROOT) & super::modes::ROOT_APPLY_WIPE;
         }
         benilla_protocol::RelayVerb::Root(false) => rm.flags &= !move_flags::ROOT,
+        // The second word's swim-to-fly bit follows the relay's (`0x6ef1f5`-`0x6ef20a`).
+        benilla_protocol::RelayVerb::SwimFlyTransition(true) => {
+            commands.entity(e).insert(super::modes::SwimFlyTransition);
+        }
+        benilla_protocol::RelayVerb::SwimFlyTransition(false) => {
+            commands
+                .entity(e)
+                .remove::<super::modes::SwimFlyTransition>();
+        }
         _ => {}
     }
     rm.pitch = ev.pitch;
@@ -301,9 +321,7 @@ pub(in crate::net) fn apply_move(
     rm.last_apply_pos = ev.position;
 }
 
-/// Fires every due queued move; runs before [`extrapolate_remote_units`]. Real time: the
-/// reference's clock is the OS wall clock, and Bevy's virtual clock clamps each delta to 250 ms, so
-/// a throttled window would fall behind the schedule.
+/// Fires every due queued move on real time, the reference's OS clock.
 #[allow(clippy::type_complexity)]
 pub(in crate::net) fn drain_pending_moves(
     time: Res<Time<Real>>,
@@ -357,7 +375,8 @@ pub(in crate::net) fn extrapolate_remote_units(
     >,
 ) {
     use crate::creature_anim::{ease_strafe_yaw, strafe_body_offset, wrap_pi};
-    let dt = time.delta_secs();
+    let step_time = crate::player::mover::move_step(&time);
+    let dt = step_time.as_secs_f32();
     let now_ms = time.elapsed_secs_f64() * 1000.0;
     for (e, mut t, mut rm, speeds, twist, latched, riding, guid, granted) in &mut q {
         if benilla_assets::trace::enabled() {
@@ -398,7 +417,7 @@ pub(in crate::net) fn extrapolate_remote_units(
                 Vec3::ZERO
             };
             let resolved_center = if airborne {
-                crate::player::mover::airborne_step(&world, &capsule.0, from, vel, time.delta())
+                crate::player::mover::airborne_step(&world, &capsule.0, from, vel, step_time)
             } else {
                 // The mover's granted modes: `HOVER` raises it a yard, and `WATER_WALKING` makes
                 // the liquid plane floor unless swimming. The local mover's aim-pitch gate has no
@@ -417,7 +436,7 @@ pub(in crate::net) fn extrapolate_remote_units(
                     &capsule.0,
                     from,
                     vel,
-                    time.delta(),
+                    step_time,
                     crate::player::mover::Support {
                         // The reference's step-height predicate is true for an uncharmed player, so
                         // the step height is 1.0.

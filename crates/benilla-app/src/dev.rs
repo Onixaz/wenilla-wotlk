@@ -4,7 +4,7 @@
 //! through a `use` from gameplay.
 //!
 //! Not here, because they ship: `benilla_world::dev_state` (its defaults are the player behaviour),
-//! `pipe_warm` (without it a player on macOS eats every synchronous pipeline stall) and `art_scope`
+//! `pipe_warm` (without it every variant pops in on its first draw) and `art_scope`
 //! (engine, it travels with `WorldPlugins`).
 
 use bevy::prelude::*;
@@ -209,6 +209,10 @@ impl Plugin for DevProbesPlugin {
             if std::env::var("WOW_PROBE").as_deref() == Ok("crossing") {
                 app.add_plugins(crate::capture::ProbeCrossingPlugin);
             }
+            // `WOW_PROBE_INTERACT=<npc flag mask>`: right-clicks the nearest unit with the flag.
+            if std::env::var("WOW_PROBE_INTERACT").is_ok() {
+                app.add_plugins(crate::capture::ProbeInteractPlugin);
+            }
             // `WOW_PROBE=taxi`: flies Stormwind to Sentinel Hill on the real wire.
             if std::env::var("WOW_PROBE").as_deref() == Ok("taxi") {
                 app.add_plugins(crate::capture::ProbeTaxiPlugin);
@@ -264,10 +268,6 @@ impl Plugin for DevProbesPlugin {
             // `WOW_PROBE_BOOK=1`: the item-text reader's per-frame cost at the Old Town plaque.
             if std::env::var("WOW_PROBE_BOOK").is_ok() {
                 app.add_plugins(crate::capture::ProbeBookPlugin);
-            }
-            // `WOW_PROBE_STONE=1`: clicks a meeting stone and reads the LFG queue back.
-            if std::env::var("WOW_PROBE_STONE").is_ok() {
-                app.add_plugins(crate::capture::ProbeStonePlugin);
             }
             // `WOW_PROBE_CHEST=1`: the self unit's base anim id around opening a chest.
             if std::env::var("WOW_PROBE_CHEST").is_ok() {

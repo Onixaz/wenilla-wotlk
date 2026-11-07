@@ -6,6 +6,17 @@ pub const SMSG_CHAR_ENUM: u16 = 0x003B;
 // Character delete: CMSG a full u64 guid, SMSG one result byte (`CHAR_DELETE_SUCCESS` = 0x39).
 pub const CMSG_CHAR_DELETE: u16 = 0x0038;
 pub const SMSG_CHAR_DELETE: u16 = 0x003C;
+// The paid character services at character select, each answered by its result (`0x4da090`,
+// `0x4d9190`, `0x4d92d0`, `0x4da190`); a race change is answered as a faction change.
+pub const CMSG_CHAR_RENAME: u16 = 0x02C7; // 711
+pub const SMSG_CHAR_RENAME: u16 = 0x02C8; // 712
+pub const CMSG_CHAR_CUSTOMIZE: u16 = 0x0473; // 1139
+pub const SMSG_CHAR_CUSTOMIZE: u16 = 0x0474; // 1140
+pub const CMSG_CHAR_FACTION_CHANGE: u16 = 0x04D9; // 1241
+pub const SMSG_CHAR_FACTION_CHANGE: u16 = 0x04DA; // 1242
+pub const CMSG_CHAR_RACE_CHANGE: u16 = 0x04F8; // 1272
+pub const CMSG_SET_PLAYER_DECLINED_NAMES: u16 = 0x0419; // 1049
+pub const SMSG_SET_PLAYER_DECLINED_NAMES_RESULT: u16 = 0x041A; // 1050
 /// The server's refusal of a `CMSG_PLAYER_LOGIN`: one result byte.
 pub const SMSG_CHARACTER_LOGIN_FAILED: u16 = 0x0041;
 pub const SMSG_NAME_QUERY_RESPONSE: u16 = 0x0051; // 81
@@ -31,6 +42,12 @@ pub const SMSG_NEW_WORLD: u16 = 0x003E;
 pub const SMSG_TRANSFER_PENDING: u16 = 0x003F;
 pub const SMSG_TRANSFER_ABORTED: u16 = 0x0040;
 pub const SMSG_LOGIN_SETTIMESPEED: u16 = 0x0042;
+/// The game clock re-synced at the current speed: the packed time and the zone `u32` (`0x7e29c0`).
+pub const SMSG_GAMETIME_UPDATE: u16 = 0x0043;
+/// The game clock set at the current speed: the packed time and the zone `u32` (`0x7e2b40`).
+pub const SMSG_GAMETIME_SET: u16 = 0x0045;
+/// The game clock's speed alone: one `f32` of game minutes per real second (`0x7e2840`).
+pub const SMSG_GAMESPEED_SET: u16 = 0x0047;
 pub const SMSG_BINDPOINTUPDATE: u16 = 0x0155;
 /// The proficiency mask for one item class (vmangos `Skill.h`).
 pub const SMSG_SET_PROFICIENCY: u16 = 0x0127;
@@ -38,6 +55,11 @@ pub const SMSG_LOGOUT_RESPONSE: u16 = 0x004C;
 pub const SMSG_LOGOUT_COMPLETE: u16 = 0x004D;
 /// The ack for [`CMSG_LOGOUT_CANCEL`]; empty body.
 pub const SMSG_LOGOUT_CANCEL_ACK: u16 = 0x004F;
+/// Why the server is about to drop the session: `u8` reason, and at the glue a 16-byte
+/// authenticator seed (`0x4d9500`).
+pub const SMSG_KICK_REASON: u16 = 0x03C5; // 965
+/// A dynamic-difficulty change's progress: `u32` result and its tail (`0x52c460`).
+pub const SMSG_CHANGEPLAYER_DIFFICULTY_RESULT: u16 = 0x020E; // 526
 pub const SMSG_UPDATE_OBJECT: u16 = 0x00A9;
 pub const SMSG_DESTROY_OBJECT: u16 = 0x00AA;
 // Cinematics: a first login's race intro, or a type-13 GameObject camera. Until the COMPLETE ack,
@@ -45,6 +67,12 @@ pub const SMSG_DESTROY_OBJECT: u16 = 0x00AA;
 /// Lua's `OpeningCinematic()`; empty body. vmangos does not handle it.
 pub const CMSG_OPENING_CINEMATIC: u16 = 0x00F9;
 pub const SMSG_TRIGGER_CINEMATIC: u16 = 0x00FA;
+/// A server-started movie: one `u32` `Movie.dbc` id (`0x526c7a`).
+pub const SMSG_TRIGGER_MOVIE: u16 = 0x0464; // 1124
+/// The movie ended, from `StopMovie` (`0x518870`); empty body.
+pub const CMSG_COMPLETE_MOVIE: u16 = 0x0465; // 1125
+/// A dest-location cast, for a caster this client may not see (`0x810050`).
+pub const SMSG_NOTIFY_DEST_LOC_SPELL_CAST: u16 = 0x048E; // 1166
 /// The next camera of a multi-camera `CinematicSequences` row began; empty body.
 pub const CMSG_NEXT_CINEMATIC_CAMERA: u16 = 0x00FB;
 pub const CMSG_COMPLETE_CINEMATIC: u16 = 0x00FC;
@@ -74,6 +102,15 @@ pub const SMSG_COMPRESSED_UPDATE_OBJECT: u16 = 0x01F6;
 /// A zlib envelope of whole movement packets. Routine: vmangos switches a session to it after 300
 /// movement packets in ten seconds (`Compression.Movement.Count`).
 pub const SMSG_COMPRESSED_MOVES: u16 = 0x02FB;
+/// [`SMSG_COMPRESSED_MOVES`] without the deflate: a `u32` the reader skips, then the same records
+/// (`0x7169a0` with its flag clear).
+pub const SMSG_MULTIPLE_MOVES: u16 = 0x051E; // 1310
+/// A run of `[u16 opcode][body]` records with no length, each body read by its own handler
+/// (`0x714ad0`).
+pub const SMSG_MULTIPLE_PACKETS: u16 = 0x04CD; // 1229
+/// `f32` progress, then a unit's packed guid: its cyclic spline's next lap is re-timed toward that
+/// point (`0x716940`).
+pub const SMSG_FLIGHT_SPLINE_SYNC: u16 = 0x0388; // 904
 pub const SMSG_LOGIN_VERIFY_WORLD: u16 = 0x0236;
 /// The account's tutorial bits: the whole body (32 bytes from vmangos after login), copied into
 /// both of the client's banks. No tutorial fires before it arrives.
@@ -173,6 +210,19 @@ pub const SMSG_PET_ACTION_SOUND: u16 = 0x0324; // 804
 /// that model's `CreatureSoundData` column 29 there at `z + 1.0`, with no unit. vmangos never sends
 /// it.
 pub const SMSG_PET_DISMISS_SOUND: u16 = 0x0325; // 805
+/// The pet learned a spell mid-session: one `u32` spell id (`0x5d4c30`). The reference only
+/// prints the chat line; the bar follows the `SMSG_PET_SPELLS` the server sends after it.
+pub const SMSG_PET_LEARNED_SPELL: u16 = 0x0499; // 1177
+/// The pet lost a spell: one `u32` spell id, the same handler's other arm.
+pub const SMSG_PET_UNLEARNED_SPELL: u16 = 0x049A; // 1178
+/// Empty body: the reference fires `PET_RENAMEABLE` (`0x5d3140`), which opens the rename popup.
+pub const SMSG_PET_RENAMEABLE: u16 = 0x0475; // 1141
+/// The controlled-pet list: `u32 count`, then `count` `u64` guids (`0x5d6550`); its head is the
+/// pet every pet verb reads.
+pub const SMSG_PET_GUIDS: u16 = 0x04AA; // 1194
+/// Empty body, sent at each world entry while our charm or summon field is set (`0x5d6e60`);
+/// the server answers with a fresh `SMSG_PET_SPELLS`.
+pub const CMSG_REQUEST_PET_INFO: u16 = 0x0279; // 633
 
 /// Our own server-driven spline (Charge, taxi) finished: `MovementInfo` at the endpoint, the
 /// `splineId`, and a float the server skips (`MoveSplineDone::ReadFromWorldPacket`).
@@ -191,6 +241,8 @@ pub const CMSG_TIME_SYNC_RESP: u16 = 0x0391; // 913
 pub const MSG_MOVE_TIME_SKIPPED: u16 = 0x0319; // 793
 pub const SMSG_ATTACKSTART: u16 = 0x0143; // 323
 pub const SMSG_ATTACKSTOP: u16 = 0x0144; // 324
+/// [`SMSG_ATTACKSTOP`]'s body, read by the same arm (`0x756aed`).
+pub const SMSG_COMBAT_EVENT_FAILED: u16 = 0x0261; // 609
 pub const SMSG_ATTACKERSTATEUPDATE: u16 = 0x014A; // 330
 
 // The server's refusals of a `CMSG_ATTACKSWING`, all with empty bodies (`Combat.cpp`). `0x147` is
@@ -254,6 +306,9 @@ pub const SMSG_SPELL_DELAYED: u16 = 0x01E2; // 482
 // `u32 remaining_ms`, 0 when the channel is over.
 pub const MSG_CHANNEL_START: u16 = 0x0139; // 313
 pub const MSG_CHANNEL_UPDATE: u16 = 0x013A; // 314
+/// A cast or channel already running: packed caster and target, `u32 spell`, `u32` ms left, `u32`
+/// total ms (`0x8020c0`).
+pub const SMSG_RESUME_CAST_BAR: u16 = 0x014D; // 333
 
 /// Our own aura's remaining time: `u8 slot`, `u32 remaining_ms`; never for others' or permanent
 /// auras (`SpellAuras.cpp:7511-7523`). It arrives before the `UNIT_FIELD_AURA` delta for the slot.
@@ -274,6 +329,8 @@ pub const SMSG_PVP_CREDIT: u16 = 0x028C; // 652
 pub const SMSG_ENVIRONMENTALDAMAGELOG: u16 = 0x01FC; // 508
 pub const SMSG_LOG_XPGAIN: u16 = 0x01D0; // 464
 pub const SMSG_SPELLLOGMISS: u16 = 0x024B; // 587
+/// Combat-log packets batched with their times (`0x6d4110`).
+pub const SMSG_SEND_ALL_COMBAT_LOG: u16 = 0x0514; // 1300
 pub const SMSG_PERIODICAURALOG: u16 = 0x024E; // 590
 pub const SMSG_SPELLDAMAGESHIELD: u16 = 0x024F; // 591
 pub const SMSG_SPELLNONMELEEDAMAGELOG: u16 = 0x0250; // 592
@@ -351,6 +408,8 @@ pub const SMSG_GAMEOBJECT_CUSTOM_ANIM: u16 = 0x00B3; // 179
 /// The client arms substate 12 (AnimationData 157) and the object outlives its
 /// `SMSG_DESTROY_OBJECT` for that play.
 pub const SMSG_GAMEOBJECT_DESPAWN_ANIM: u16 = 0x0215; // 533
+/// A GameObject's shown state reset to its descriptor's: a raw `u64` guid (handler `0x7fd900`).
+pub const SMSG_GAMEOBJECT_RESET_STATE: u16 = 0x02A7; // 679
 /// We walked into an area trigger: its `AreaTrigger.dbc` id (reference `0x6dbe30`).
 pub const CMSG_AREATRIGGER: u16 = 0x00B4; // 180
 /// An area trigger's refusal (level, ghost, faction), shown like `SMSG_NOTIFICATION`.
@@ -384,6 +443,12 @@ pub const CMSG_CHANNEL_MODERATE: u16 = 0x00A8; // 168
 pub const CMSG_CHANNEL_DISPLAY_LIST: u16 = 0x03D2; // 978
 /// 3.3.5a only: the channel the pane now shows (`0x504555`), `cstring channelName`.
 pub const CMSG_SET_CHANNEL_WATCH: u16 = 0x03EF; // 1007
+/// A member joined the watched channel (`0x504130`).
+pub const SMSG_USERLIST_ADD: u16 = 0x03F0; // 1008
+/// A member left the watched channel (`0x5042f0`).
+pub const SMSG_USERLIST_REMOVE: u16 = 0x03F1; // 1009
+/// A member's flags changed in the watched channel (`0x500380`).
+pub const SMSG_USERLIST_UPDATE: u16 = 0x03F2; // 1010
 
 /// The ignore notice ("Name is now ignoring you"): a raw `u64` guid (`Misc.cpp:127-130`).
 pub const CMSG_CHAT_IGNORED: u16 = 0x0225; // 549
@@ -407,6 +472,14 @@ pub const SMSG_ZONE_UNDER_ATTACK: u16 = 0x0254; // 596
 pub const SMSG_SERVER_MESSAGE: u16 = 0x0291; // 657
 /// A trial account hit its whisper cap: empty body; the client shows error `0x1c3`.
 pub const SMSG_CHAT_RESTRICTED: u16 = 0x02FD; // 765
+/// The message of the day: `u32` line count, then the lines (`0x551660`).
+pub const SMSG_MOTD: u16 = 0x033D; // 829
+/// A channel's member count: name, flags, count, read and dropped (`0x4fb540`).
+pub const SMSG_CHANNEL_MEMBER_COUNT: u16 = 0x03D5; // 981
+/// A GM's `.whois` answer: one string to the console (`0x6b3280`).
+pub const SMSG_WHOIS: u16 = 0x0065; // 101
+/// A realm-first award, announced to the realm (`0x50b010`).
+pub const SMSG_SERVER_FIRST_ACHIEVEMENT: u16 = 0x0498; // 1176
 /// A defense broadcast (the Eastern Plaguelands towers): `u32 zoneId`, `u32 length`, the text
 /// (`Map.cpp:1868-1884`); 12340 reads it at `0x50c850`.
 pub const SMSG_DEFENSE_MESSAGE: u16 = 0x033A; // 826
@@ -441,11 +514,11 @@ pub const CMSG_DISMISS_CRITTER: u16 = 0x048D; // 1165
 pub const CMSG_REMOVE_GLYPH: u16 = 0x048A; // 1162
 /// Cancel our channel: a `u32` spell id the server ignores (`Spell.h:69`) and 1.12 still sends.
 pub const CMSG_CANCEL_CHANNELLING: u16 = 0x013B; // 315
-/// Inspect a player: a raw 8-byte guid. The server selects it, then answers `SMSG_INSPECT` unless
-/// it is beyond 10 yd or attackable (`MiscHandler.cpp:943-960`).
+/// Inspect a player: a raw 8-byte guid. The server selects it, then answers
+/// `SMSG_INSPECT_TALENT` unless it is beyond 10 yd or attackable (`MiscHandler.cpp:943-960`).
 pub const CMSG_INSPECT: u16 = 0x0114; // 276
-/// The inspect reply, the echoed `u64` guid; the reference discards it, so we drop it.
-pub const SMSG_INSPECT: u16 = 0x0115; // 277
+/// The inspected player's worn items after a change: a packed guid and the items (`0x6ce070`).
+pub const SMSG_INSPECT_RESULTS_UPDATE: u16 = 0x0115; // 277
 /// The inspect Honor tab, both ways: we send a raw 8-byte guid, the reply is a 50-byte body.
 /// Refused silently like [`CMSG_INSPECT`], but without selecting (`MiscHandler.cpp:962-972`).
 pub const MSG_INSPECT_HONOR_STATS: u16 = 0x02D6; // 726
@@ -576,6 +649,10 @@ pub const MSG_MOVE_TELEPORT_ACK: u16 = 0x00C7; // 199
 pub const MSG_MOVE_FALL_LAND: u16 = 0x00C9; // 201
 pub const MSG_MOVE_START_SWIM: u16 = 0x00CA; // 202
 pub const MSG_MOVE_STOP_SWIM: u16 = 0x00CB; // 203
+/// Another unit's start and stop swim under their cheat opcodes, sent to the same arms as
+/// [`MSG_MOVE_START_SWIM`] and [`MSG_MOVE_STOP_SWIM`] (`0x740fa9`, `0x740fbe`).
+pub const MSG_MOVE_START_SWIM_CHEAT: u16 = 0x0341; // 833
+pub const MSG_MOVE_STOP_SWIM_CHEAT: u16 = 0x0342; // 834
 pub const MSG_MOVE_WORLDPORT_ACK: u16 = 0x00DC; // 220
 pub const MSG_MOVE_SET_FACING: u16 = 0x00DA; // 218
 pub const MSG_MOVE_SET_PITCH: u16 = 0x00DB; // 219
@@ -716,8 +793,7 @@ pub const SMSG_BUY_BANK_SLOT_RESULT: u16 = 0x01BA; // 442
 pub const CMSG_AUTOSTORE_BANK_ITEM: u16 = 0x0282; // 642
 pub const CMSG_AUTOBANK_ITEM: u16 = 0x0283; // 643
 
-/// Forget a cached player name: `u64 guid`, the cache's only eviction for a player (it has no TTL).
-/// vmangos never sends it.
+/// Forget a cached player name, or a guild record for a guild guid (`0x635400`).
 pub const SMSG_INVALIDATE_PLAYER: u16 = 0x031C; // 796
 
 // The pet stable. `MSG_LIST_STABLED_PETS` runs both ways: the server sends the list to open the
@@ -758,6 +834,10 @@ pub const SMSG_UPDATE_ACCOUNT_DATA: u16 = 0x020C;
 pub const SMSG_UPDATE_ACCOUNT_DATA_COMPLETE: u16 = 0x0463;
 /// The character screen is up: send the account's times (`ReadyForAccountDataTimes` `0x4de390`).
 pub const CMSG_READY_FOR_ACCOUNT_DATA_TIMES: u16 = 0x04FF;
+/// The realm split ask or choice: one `u32`, `0xFFFFFFFF` to ask (`0x4de2e0`, `0x4de250`).
+pub const CMSG_REALM_SPLIT: u16 = 0x038C; // 908
+/// The realm split answer: client state, split state, the date (`0x4d8200`).
+pub const SMSG_REALM_SPLIT: u16 = 0x038B; // 907
 /// 3.3.5a only: drop one completed achievement (`0x5b3610`).
 pub const SMSG_ACHIEVEMENT_DELETED: u16 = 0x049F;
 /// 3.3.5a only: the player's completed achievements and criteria at login (`0x5b32f0`).
@@ -878,35 +958,30 @@ pub const CMSG_AREA_SPIRIT_HEALER_QUEUE: u16 = 0x02E3; // 739
 /// The healer's next resurrection: `u64 guid`, `u32 ms`. For the cached healer and a positive
 /// time it arms the deadline and fires `AREA_SPIRIT_HEALER_IN_RANGE`.
 pub const SMSG_AREA_SPIRIT_HEALER_TIME: u16 = 0x02E4; // 740
-/// Right-click a meeting stone (GameObject type 23): `u64` guid, sent. A stone never sends
-/// [`CMSG_GAMEOBJ_USE`], which vmangos ignores for type 23 (`GameObject.cpp:1836`).
-pub const CMSG_MEETINGSTONE_JOIN: u16 = 0x0292; // 658
 /// The 3.3.5a meaning of 0x292: a saved lockout's extend toggle (`0x50dc10`).
 pub const CMSG_SET_SAVED_INSTANCE_EXTEND: u16 = 0x0292; // 658
 /// A main tank or main assist set or cleared (`0x6d7200`).
 pub const MSG_PARTY_ASSIGNMENT: u16 = 0x038E; // 910
-/// `CancelMeetingStoneRequest()`: empty, party leader only; the server's `0x295` reply clears the
-/// state. The name is the emulators'; the number is the client's.
-pub const CMSG_MEETINGSTONE_LEAVE: u16 = 0x0293; // 659
-/// The meeting-stone queue state: `u32 areaId`, `u8 status`; always stored, a message per
-/// status, then `MEETINGSTONE_CHANGED`.
-pub const SMSG_MEETINGSTONE_SETQUEUE: u16 = 0x0295; // 661
+/// A string 12340 writes to its developer console (`0x6d8521`).
+pub const SMSG_TEST_DROP_RATE_RESULT: u16 = 0x0295; // 661
 /// `u64` mailbox guid: the server opens the mail window on it (`0x56dbc0`).
 pub const SMSG_SHOW_MAILBOX: u16 = 0x0297; // 663
-/// Display only: empty; `ERR_MEETING_STONE_IN_PROGRESS`.
-pub const SMSG_MEETINGSTONE_IN_PROGRESS: u16 = 0x0298; // 664
-/// Display only: `u64 guid`; `ERR_MEETING_STONE_MEMBER_ADDED_S` once the name resolves.
-pub const SMSG_MEETINGSTONE_MEMBER_ADDED: u16 = 0x0299; // 665
+/// `u32` ms: each ranged book spell starts that recovery (`0x8071c0`).
+pub const SMSG_RESET_RANGED_COMBAT_TIMER: u16 = 0x0298; // 664
+/// `u32` chat type of a party or raid line sent outside one (`0x6e397b`).
+pub const SMSG_CHAT_NOT_IN_PARTY: u16 = 0x0299; // 665
 /// `ConfirmPetUnlearn()`: the latched `u64 trainerGuid`, never an argument.
 pub const CMSG_PET_UNLEARN: u16 = 0x02F0; // 752
 /// The pet trainer asks: `u64 trainerGuid`, `u32 costCopper`, latched for
 /// `CONFIRM_PET_UNLEARN`; a zero guid shows `ERR_TALENT_WIPE_ERROR` instead.
 pub const SMSG_PET_UNLEARN_CONFIRM: u16 = 0x02F1; // 753
 
-/// A summon offer (warlock, meeting stone, GM). The client can only accept, with
-/// `CMSG_SUMMON_RESPONSE`; a decline is silence until the two-minute timeout.
+/// A summon offer (warlock, meeting stone, GM), answered by `CMSG_SUMMON_RESPONSE` with an agree
+/// byte: `ConfirmSummon` 1, `CancelSummon` and a dead player's refusal 0.
 pub const SMSG_SUMMON_REQUEST: u16 = 0x02AB; // 683
 pub const CMSG_SUMMON_RESPONSE: u16 = 0x02AC; // 684
+/// The summon withdrawn: empty body, `CANCEL_SUMMON` (`0x6cbcf0`).
+pub const SMSG_SUMMON_CANCEL: u16 = 0x0424; // 1060
 
 /// Abandon a skill line; no ack, the removal arrives as a `PLAYER_SKILL_INFO` update.
 pub const CMSG_UNLEARN_SKILL: u16 = 0x0202; // 514
@@ -994,6 +1069,50 @@ pub const SMSG_SEND_UNLEARN_SPELLS: u16 = 0x041E; // 1054
 pub const SMSG_CROSSED_INEBRIATION_THRESHOLD: u16 = 0x03C1; // 961
 /// The learned dance moves' mask (`0x5758a0`).
 pub const SMSG_LEARNED_DANCE_MOVES: u16 = 0x0455; // 1109
+/// Binding at the innkeeper already bound to (`0x6e3492`).
+pub const SMSG_PLAYERBINDERROR: u16 = 0x01B6; // 438
+/// Removed from the PvP queues, by reason (`0x526569`).
+pub const SMSG_REMOVED_FROM_PVP_QUEUE: u16 = 0x0170; // 368
+/// A refused promotion code (`0x52654a`).
+pub const SMSG_INVALID_PROMOTION_CODE: u16 = 0x01E7; // 487
+/// A charter offered to a player already in an arena team (`0x5cea00`).
+pub const SMSG_OFFER_PETITION_ERROR: u16 = 0x038F; // 911
+/// An arena team change refused while queued (`0x6e40a8`).
+pub const SMSG_ARENA_TEAM_CHANGE_FAILED_QUEUED: u16 = 0x04C8; // 1224
+/// Battleground info asked for too often (`0x6cbea0`).
+pub const SMSG_BATTLEGROUND_INFO_THROTTLED: u16 = 0x04A6; // 1190
+/// A play-time limit approaching (`0x6cd270`).
+pub const SMSG_PLAY_TIME_WARNING: u16 = 0x02F5; // 757
+/// The PvP AFK-report system switched on or off (`0x6e3fb5`).
+pub const SMSG_REPORT_PVP_AFK_RESULT: u16 = 0x03E5; // 997
+/// A refer-a-friend link ended (`0x5265fb`).
+pub const SMSG_REFER_A_FRIEND_EXPIRED: u16 = 0x001E; // 30
+/// The server reset the talents (`0x526eb0`).
+pub const SMSG_TALENTS_INVOLUNTARILY_RESET: u16 = 0x04FA; // 1274
+/// A count of item records, each `SMSG_ITEM_QUERY_SINGLE_RESPONSE`'s body (`0x6351f0`).
+pub const SMSG_ITEM_QUERY_MULTIPLE_RESPONSE: u16 = 0x0059; // 89
+/// A debug item dump: one `SMSG_ITEM_QUERY_SINGLE_RESPONSE` record (`0x6354d0`).
+pub const SMSG_CHEAT_DUMP_ITEMS_DEBUG_ONLY_RESPONSE: u16 = 0x039B; // 923
+/// One dance-cache record, or a miss (`0x635ab0`).
+pub const SMSG_DANCE_QUERY_RESPONSE: u16 = 0x0452; // 1106
+/// Drop one dance from the dance cache (`0x6354f0`).
+pub const SMSG_INVALIDATE_DANCE: u16 = 0x0453; // 1107
+/// A GM's account lookup, printed to the console (`0x6b32c0`).
+pub const SMSG_RWHOIS: u16 = 0x01FE; // 510
+/// A 16-byte anti-cheat challenge (`0x6b9670`).
+pub const SMSG_CHECK_FOR_BOTS: u16 = 0x0015; // 21
+/// The insignia was taken from our corpse: a `u8` flag, `PLAYER_SKINNED`'s argument (`0x6cdf00`).
+pub const SMSG_PLAYER_SKINNED: u16 = 0x02BC; // 700
+/// A resurrection failed: no body; the dead or alive event is re-sent (`0x6ce470`).
+pub const SMSG_RESURRECT_FAILED: u16 = 0x0252; // 594
+/// Far sight ends now: no body (`0x6e38d4`).
+pub const SMSG_CLEAR_FAR_SIGHT_IMMEDIATE: u16 = 0x020D; // 525
+/// The release timer is derived again: no body (`0x6e3f08`).
+pub const SMSG_FORCED_DEATH_UPDATE: u16 = 0x037A; // 890
+/// A camera-shake group and a sound kit, played at the player (`0x6e40f3`).
+pub const SMSG_CAMERA_SHAKE: u16 = 0x050A; // 1290
+/// A unit's model is rebuilt from its fields: a packed guid (`0x716cd0`).
+pub const SMSG_FORCE_DISPLAY_UPDATE: u16 = 0x0403; // 1027
 
 // Mover modes, acked (`IsFlagAckOpcode`): the SMSG is a packed guid and `u32 counter`; the ack
 // echoes the packed guid, the counter and a `MovementInfo`, plus an `f32` apply for all but root
@@ -1027,6 +1146,14 @@ pub const SMSG_MOVE_SET_COLLISION_HGT: u16 = 0x0516; // 1302
 pub const CMSG_MOVE_SET_COLLISION_HGT_ACK: u16 = 0x0517; // 1303
 /// 3.3.5a only: our mover's flight start or stop, a plain `MovementInfo` report (`0x6ef860`).
 pub const CMSG_MOVE_SET_FLY: u16 = 0x0346; // 838
+/// 3.3.5a only: the second flags word's swim-to-fly bit set and cleared on a unit, `u32 counter`
+/// (handler `0x732450`, arms `0x730ad1`, `0x730af1`), one ack for both.
+pub const SMSG_MOVE_SET_CAN_TRANSITION_BETWEEN_SWIM_AND_FLY: u16 = 0x033E; // 830
+pub const SMSG_MOVE_UNSET_CAN_TRANSITION_BETWEEN_SWIM_AND_FLY: u16 = 0x033F; // 831
+pub const CMSG_MOVE_SET_CAN_TRANSITION_BETWEEN_SWIM_AND_FLY_ACK: u16 = 0x0340; // 832
+/// 3.3.5a only: another unit's collision height, `MSG_MOVE_SET_*_SPEED`'s shape with the height
+/// for the speed (`0x7406a0`).
+pub const MSG_MOVE_SET_COLLISION_HGT: u16 = 0x0518; // 1304
 
 // The observers' leg of those modes and of teleports (`MovementPacketSender.h:30-60`): the relay
 // shape `[packed guid][MovementInfo]`, handled like the relay opcodes. Only root has two opcodes;
@@ -1040,6 +1167,8 @@ pub const MSG_MOVE_FEATHER_FALL: u16 = 0x02B0; // 688
 pub const MSG_MOVE_WATER_WALK: u16 = 0x02B1; // 689
 /// 3.3.5a only: another unit's can-fly change, the relay shape (`0x741b60`).
 pub const MSG_MOVE_UPDATE_CAN_FLY: u16 = 0x03AD; // 941
+/// 3.3.5a only: another unit's swim-to-fly bit, the relay shape (`0x741b60`, arm `0x740fe8`).
+pub const MSG_MOVE_UPDATE_CAN_TRANSITION_BETWEEN_SWIM_AND_FLY: u16 = 0x034A; // 842
 /// 3.3.5a only: another unit's gravity change, the relay shape (`0x741b60`).
 pub const MSG_MOVE_GRAVITY_CHNG: u16 = 0x04D2; // 1234
 
@@ -1055,6 +1184,12 @@ pub const MSG_MOVE_KNOCK_BACK: u16 = 0x00F1; // 241
 pub const CMSG_WHO: u16 = 0x0062; // 98
 pub const SMSG_WHO: u16 = 0x0063; // 99
 pub const CMSG_CONTACT_LIST: u16 = 0x0066; // 102
+/// A report of a mail or a chat line ([`super::complaint_mail`], `0x56faf0`).
+pub const CMSG_COMPLAIN: u16 = 0x03C7; // 967
+/// The report's answer: `u8` result, `u8` reason (`0x6e3e94`).
+pub const SMSG_COMPLAIN_RESULT: u16 = 0x03C8; // 968
+/// The complaint and voice systems' statuses, one `u8` each (`0x6e3f39`).
+pub const SMSG_FEATURE_SYSTEM_STATUS: u16 = 0x03C9; // 969
 pub const SMSG_CONTACT_LIST: u16 = 0x0067; // 103
 pub const SMSG_FRIEND_STATUS: u16 = 0x0068; // 104
 pub const CMSG_ADD_FRIEND: u16 = 0x0069; // 105
@@ -1097,6 +1232,8 @@ pub const CMSG_GUILD_BANK_DEPOSIT_MONEY: u16 = 0x03EC; // 1004
 pub const CMSG_GUILD_BANK_WITHDRAW_MONEY: u16 = 0x03ED; // 1005
 /// Both ways: our tab ask, and the tab's log (`0x5a4800`).
 pub const MSG_GUILD_BANK_LOG_QUERY: u16 = 0x03EE; // 1006
+/// Both ways: our empty ask (`0x5cc470`), and the guild's event log (`0x5ca6a0`).
+pub const MSG_GUILD_EVENT_LOG_QUERY: u16 = 0x03FF; // 1023
 /// Both ways: our tab ask, and the tab's text (`0x5a4ae0`).
 pub const MSG_QUERY_GUILD_BANK_TEXT: u16 = 0x040A; // 1034
 pub const CMSG_SET_GUILD_BANK_TEXT: u16 = 0x040B; // 1035
@@ -1137,6 +1274,8 @@ pub const MSG_PETITION_RENAME: u16 = 0x02C1; // 705
 
 pub const CMSG_GROUP_INVITE: u16 = 0x006E; // 110
 pub const SMSG_GROUP_INVITE: u16 = 0x006F; // 111
+/// The inviter withdrew the invite: their name, then `PARTY_INVITE_CANCEL` (`0x6cbd10`).
+pub const SMSG_GROUP_CANCEL: u16 = 0x0071; // 113
 pub const CMSG_GROUP_ACCEPT: u16 = 0x0072; // 114
 pub const CMSG_GROUP_DECLINE: u16 = 0x0073; // 115
 pub const SMSG_GROUP_DECLINE: u16 = 0x0074; // 116
@@ -1159,11 +1298,23 @@ pub const CMSG_GROUP_SWAP_SUB_GROUP: u16 = 0x0280; // 640
 pub const CMSG_GROUP_RAID_CONVERT: u16 = 0x028E; // 654
 pub const CMSG_GROUP_ASSISTANT_LEADER: u16 = 0x028F; // 655
 pub const SMSG_PARTY_MEMBER_STATS_FULL: u16 = 0x02F2; // 754
-/// Both ways; the server's side is mode-prefixed (`Packets/Group.cpp:77-82` read, `:132-147`
-/// write).
+/// Both ways; the server's side is mode-prefixed, and its one-mark mode names the setter
+/// (`0x5743b0`).
 pub const MSG_RAID_TARGET_UPDATE: u16 = 0x0321; // 801
 /// Both ways: an empty body starts a check, a non-empty one answers (`Packets/Group.cpp:84-96`).
 pub const MSG_RAID_READY_CHECK: u16 = 0x0322; // 802
+/// A member's ready-check answer: `u64` guid, then the ready byte (`0x5744f0`).
+pub const MSG_RAID_READY_CHECK_CONFIRM: u16 = 0x03AE; // 942
+/// The ready check closed; empty body both ways (`0x572560`, sent from `0x573390`).
+pub const MSG_RAID_READY_CHECK_FINISHED: u16 = 0x03C6; // 966
+/// A ready check refused as too soon: empty body (`0x5725a0`).
+pub const SMSG_RAID_READY_CHECK_ERROR: u16 = 0x0408; // 1032
+/// Too many group commands: empty body (`0x6cbe80`).
+pub const SMSG_GROUPACTION_THROTTLED: u16 = 0x0411; // 1041
+/// Our voice privileges set by a leader: `u32` silenced (`0x5725c0`).
+pub const MSG_NOTIFY_PARTY_SQUELCH: u16 = 0x03DF; // 991
+/// The echo of our silencing a member: `u64` member, `u32` silenced (`0x572610`).
+pub const SMSG_ECHO_PARTY_SQUELCH: u16 = 0x03F6; // 1014
 /// Ask for our raid lockouts: empty body, sent by `RequestRaidInfo()` on every RaidFrame show.
 pub const CMSG_REQUEST_RAID_INFO: u16 = 0x02CD; // 717
 /// Our permanent binds: `u32 count`, count × `{u32 mapId, u32 secondsUntilReset, u32 instanceId}`.
@@ -1247,6 +1398,8 @@ pub const SMSG_AUCTION_LIST_PENDING_SALES: u16 = 0x0490; // 1168
 // The world-state table; these two are its only writers. NPC text's `$<n>w`/`$<n>e` tokens read it.
 pub const SMSG_INIT_WORLD_STATES: u16 = 0x02C2; // 706
 pub const SMSG_UPDATE_WORLD_STATE: u16 = 0x02C3; // 707
+/// The player's phase mask: one `u32` (`0x526cf4`).
+pub const SMSG_SET_PHASE_SHIFT: u16 = 0x047C; // 1148
 
 // ── Instance and raid lockouts ──
 
@@ -1317,6 +1470,8 @@ pub const SMSG_LFG_QUEUE_STATUS: u16 = 0x0365; // 869
 pub const SMSG_LFG_UPDATE_PLAYER: u16 = 0x0367; // 871
 pub const SMSG_LFG_UPDATE_PARTY: u16 = 0x0368; // 872
 pub const SMSG_LFG_UPDATE_SEARCH: u16 = 0x0369; // 873
+/// The joined raid browser search's list (`0x55b770`).
+pub const SMSG_UPDATE_LFG_LIST: u16 = 0x0360; // 864
 pub const SMSG_LFG_BOOT_PROPOSAL_UPDATE: u16 = 0x036D; // 877
 pub const SMSG_LFG_PLAYER_INFO: u16 = 0x036F; // 879
 pub const SMSG_LFG_PARTY_INFO: u16 = 0x0372; // 882
@@ -1370,6 +1525,12 @@ pub const SMSG_REAL_GROUP_UPDATE: u16 = 0x0397; // 919
 
 /// A unit's power, set outright (`0x7236c0`).
 pub const SMSG_POWER_UPDATE: u16 = 0x0480; // 1152
+/// A unit's health, set as its predicted copy (`0x716d20`).
+pub const SMSG_HEALTH_UPDATE: u16 = 0x047F; // 1151
+/// The server's chat spam patterns, replacing the last list (`0x501c70`).
+pub const SMSG_EXPECTED_SPAM_RECORDS: u16 = 0x0332; // 818
+/// One reputation slot's at-war flag, set or cleared (`0x5d0850`).
+pub const SMSG_SET_FACTION_ATWAR: u16 = 0x0313; // 787
 /// Our combo points and the unit they sit on (the game UI's message handler, `0x526530`).
 pub const SMSG_UPDATE_COMBO_POINTS: u16 = 0x039D; // 925
 /// The pet's combo points (`0x5d36a0`).
@@ -1450,3 +1611,43 @@ pub const SMSG_ITEM_REFUND_RESULT: u16 = 0x04B5; // 1205
 pub const SMSG_SOCKET_GEMS_RESULT: u16 = 0x050B; // 1291
 /// An inspected player's talents and worn items, packed guid first (`0x6ce0c0`).
 pub const SMSG_INSPECT_TALENT: u16 = 0x03F4; // 1012
+
+// GM and debug packets 12340 reads to no game effect: a developer-console line, a read body
+// dropped, or nothing read. Each decodes to `ServerPacket::Ignored`.
+pub const SMSG_FORCEACTIONSHOW: u16 = 0x001B; // 27
+pub const SMSG_PETGODMODE: u16 = 0x001D; // 29
+pub const SMSG_GODMODE: u16 = 0x0023; // 35
+pub const SMSG_SERVERTIME: u16 = 0x0049; // 73
+pub const MSG_MOVE_TOGGLE_COLLISION_CHEAT: u16 = 0x00D9; // 217
+pub const SMSG_BINDZONEREPLY: u16 = 0x0157; // 343
+pub const SMSG_LOOT_ITEM_NOTIFY: u16 = 0x0164; // 356
+pub const CMSG_GM_REQUEST_PLAYER_INFO: u16 = 0x022F; // 559
+pub const SMSG_GM_PLAYER_INFO: u16 = 0x0230; // 560
+pub const SMSG_DAMAGE_CALC_LOG: u16 = 0x027C; // 636
+pub const SMSG_IGNORE_REQUIREMENTS_CHEAT: u16 = 0x03A9; // 937
+pub const SMSG_IGNORE_DIMINISHING_RETURNS_CHEAT: u16 = 0x0406; // 1030
+pub const SMSG_FORCE_ANIM: u16 = 0x04D8; // 1240
+pub const SMSG_TOGGLE_XP_GAIN: u16 = 0x04ED; // 1261
+pub const SMSG_DEBUG_SERVER_GEO: u16 = 0x04FC; // 1276
+
+// The sends behind stock interface verbs.
+/// `EquipItemByName(item, slot)`: `u64` item guid, `u8` slot (`0x6e013e`).
+pub const CMSG_AUTOEQUIP_ITEM_SLOT: u16 = 0x010F; // 271
+/// `BuySkillTier(index)`: `u32` skill line (`0x5ce826`).
+pub const CMSG_SKILL_BUY_STEP: u16 = 0x021F; // 543
+/// `AcceptSkillUps()`: `u32` count, then `u32` line and `u32` points per line (`0x5ce67a`).
+pub const CMSG_SKILL_BUY_RANK: u16 = 0x0220; // 544
+/// `GMSurveySubmit()` ([`super::gm_survey_submit`], `0x5acd50`).
+pub const CMSG_GMSURVEY_SUBMIT: u16 = 0x032A; // 810
+/// `CancelItemTempEnchantment(slot)`: `u32` inventory slot (`0x6d7120`).
+pub const CMSG_CANCEL_TEMP_ENCHANTMENT: u16 = 0x0379; // 889
+/// `SetTaxiBenchmarkMode(on)`: one `u8` (`0x517b50`).
+pub const CMSG_SET_TAXI_BENCHMARK_MODE: u16 = 0x0389; // 905
+/// `SetOptOutOfLoot(on)`: one `u32` (`0x52cb40`).
+pub const CMSG_OPT_OUT_OF_LOOT: u16 = 0x0409; // 1033
+/// `GrantLevel(unit)`: the friend's packed guid (`0x523160`).
+pub const CMSG_GRANT_LEVEL: u16 = 0x040D; // 1037
+/// `DeclineInvite(channel)`: the channel name (`0x4fe4ef`).
+pub const CMSG_DECLINE_CHANNEL_INVITE: u16 = 0x0410; // 1040
+/// `GMReportLag(type)` ([`super::gm_report_lag`], `0x5acf30`).
+pub const CMSG_GM_REPORT_LAG: u16 = 0x0502; // 1282

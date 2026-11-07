@@ -1,11 +1,16 @@
 //! Small server notices and what they drive: the light override, the server's UI clock, the arena
-//! and refer-a-friend errors, the level grant offer and the inebriation lines. The dance moves are
-//! read and dropped: nothing built reads them, as `PlayDance` is not.
+//! and refer-a-friend errors, the level grant offer, the inebriation lines, the message of the day,
+//! a GM's whois and rwhois answers, realm-first awards and the one-line [`WorldNotice`]s. The dance
+//! moves and dance-cache answers are read and dropped: nothing built reads them, as `PlayDance` is
+//! not.
 
 use bevy::platform::time::Instant;
 use std::time::Duration;
 
-use benilla_protocol::messages::{InebriationThreshold, ObjectType};
+use benilla_protocol::messages::{
+    ChatMessage, InebriationThreshold, ObjectType, RWhois, ServerFirstAchievement, WorldNotice,
+    CHAT_MSG_ACHIEVEMENT,
+};
 use benilla_protocol::{SessionEvent, SessionEventKind};
 use benilla_ui::script::{ScriptValue, UiScript};
 use bevy::prelude::*;
@@ -56,6 +61,23 @@ struct LevelGrant {
 #[derive(Resource, Default)]
 struct InebriationLines(Vec<(InebriationThreshold, u16)>);
 
+/// The message of the day (`0xbea7fc`), its lines joined by `\n`, bumped by each `SMSG_MOTD`, and
+/// the `KNOWLEDGE_BASE_SYSTEM_MOTD_UPDATED` fires owed.
+#[derive(Resource, Default)]
+struct KbMotd {
+    text: String,
+    generation: u64,
+    owed: u32,
+}
+
+/// Realm-first awards waiting for the VM's line templates.
+#[derive(Resource, Default)]
+struct ServerFirsts(Vec<ServerFirstAchievement>);
+
+/// The events a [`WorldNotice`] fires, in packet order.
+#[derive(Resource, Default)]
+struct NoticeEvents(Vec<(&'static str, Vec<ScriptValue>)>);
+
 pub(crate) struct NoticesPlugin;
 
 impl Plugin for NoticesPlugin {
@@ -64,6 +86,9 @@ impl Plugin for NoticesPlugin {
         app.init_resource::<UiClock>()
             .init_resource::<LevelGrant>()
             .init_resource::<InebriationLines>()
+            .init_resource::<KbMotd>()
+            .init_resource::<ServerFirsts>()
+            .init_resource::<NoticeEvents>()
             .net_handler(K::OverrideLight, on_override_light)
             .net_handler(K::UiTime, on_ui_time)
             .net_handler(K::ArenaError, on_arena_error)
@@ -71,6 +96,13 @@ impl Plugin for NoticesPlugin {
             .net_handler(K::ProposeLevelGrant, on_propose_level_grant)
             .net_handler(K::InebriationThreshold, on_inebriation)
             .net_handler(K::LearnedDanceMoves, on_dance_moves)
+            .net_handler(K::DanceRecord, on_dance_cache)
+            .net_handler(K::InvalidateDance, on_dance_cache)
+            .net_handler(K::Motd, on_motd)
+            .net_handler(K::Whois, on_whois)
+            .net_handler(K::RWhois, on_rwhois)
+            .net_handler(K::ServerFirstAchievement, on_server_first)
+            .net_handler(K::Notice, on_notice)
             .net_handler(K::Disconnected, on_session_end)
             .add_systems(
                 Update,
@@ -159,6 +191,112 @@ fn on_refer_a_friend_failure(In(ev): In<SessionEvent>, mut errors: ResMut<UiErro
     }
 }
 
+/// The line a [`WorldNotice`] shows, if any. The petition offer's name comes from the cache alone,
+/// never asked for (`0x5cea37`); the AFK report shows none here ([`afk_report`]).
+fn notice_line(notice: WorldNotice, names: &NameCache) -> Option<UiError> {
+    Some(match notice {
+        WorldNotice::PlayerBindError => UiError::key("ERR_DEATHBINDALREADYBOUND"),
+        // `0x522180`: reasons 0-2, any other silent.
+        WorldNotice::RemovedFromPvpQueue { reason } => UiError::key(match reason {
+            0 => "ERR_REMOVE_FROM_PVP_QUEUE_GRANT_LEVEL",
+            1 => "ERR_REMOVE_FROM_PVP_QUEUE_XP_GAIN",
+            2 => "ERR_REMOVE_FROM_PVP_QUEUE_FACTION_CHANGE",
+            _ => return None,
+        }),
+        WorldNotice::InvalidPromotionCode => UiError::key("ERR_INVALID_PROMOTION_CODE"),
+        WorldNotice::OfferPetitionError { player } => {
+            UiError::s("ERR_ALREADY_IN_ARENA_TEAM_S", names.peek(player)?)
+        }
+        WorldNotice::ArenaTeamChangeFailedQueued { failed } => {
+            if failed == 0 {
+                return None;
+            }
+            UiError::key("ERR_ARENA_TEAM_CHANGE_FAILED_QUEUED")
+        }
+        WorldNotice::BattlegroundInfoThrottled => UiError::key("ERR_BATTLEGROUND_INFO_THROTTLED"),
+        WorldNotice::PlayTimeWarning { flags, seconds } => play_time_warning(flags, seconds)?,
+        WorldNotice::ReportPvpAfkResult { .. }
+        | WorldNotice::ReferAFriendExpired { .. }
+        | WorldNotice::TalentsInvoluntarilyReset { .. } => return None,
+    })
+}
+
+/// `SMSG_PLAY_TIME_WARNING` (`0x6cd2de`-`0x6cd367`): the first warning flag set names the time left
+/// as `"%2d:%02d"` hours and minutes (`0x6cd2d3`); with none, the sign bit is the bare unhealthy
+/// line.
+fn play_time_warning(flags: u32, seconds: i32) -> Option<UiError> {
+    let minutes = seconds / 60;
+    let left = format!("{:2}:{:02}", minutes / 60, minutes % 60);
+    for (bit, key) in [
+        (0x1000, "ERR_APPROACHING_PARTIAL_PLAY_TIME"),
+        (0x4000_0000, "ERR_APPROACHING_PARTIAL_PLAY_TIME_2"),
+        (0x2000, "ERR_APPROACHING_NO_PLAY_TIME"),
+        (0x2000_0000, "ERR_APPROACHING_NO_PLAY_TIME_2"),
+    ] {
+        if flags & bit != 0 {
+            return Some(UiError::s(key, left));
+        }
+    }
+    ((flags as i32) < 0).then(|| UiError::key("ERR_UNHEALTHY_TIME"))
+}
+
+/// `SMSG_REPORT_PVP_AFK_RESULT` (`0x6e3fe5`): result 5 turns `enablePVPNotifyAFK` on and 6 off,
+/// each only from the other state, and the switch prints its system line's key.
+fn afk_report(result: u8, enabled: bool) -> Option<(&'static str, &'static str)> {
+    match (result, enabled) {
+        (5, false) => Some(("1", "PVP_REPORT_AFK_SYSTEM_ENABLED")),
+        (6, true) => Some(("0", "PVP_REPORT_AFK_SYSTEM_DISABLED")),
+        _ => None,
+    }
+}
+
+fn on_notice(
+    In(ev): In<SessionEvent>,
+    mut errors: ResMut<UiErrorKeys>,
+    names: Res<NameCache>,
+    cvars: Option<ResMut<crate::cvars::Cvars>>,
+    script: Option<NonSend<UiScript>>,
+    mut chat: ResMut<ChatLog>,
+    mut events: ResMut<NoticeEvents>,
+) {
+    let SessionEvent::Notice(notice) = ev else {
+        return;
+    };
+    debug!("net: {notice:?}");
+    match notice {
+        // `0x526642`: no refer-a-friend link is kept to clear, so only the event remains.
+        WorldNotice::ReferAFriendExpired { .. } => {
+            events.0.push(("FRIENDLIST_UPDATE", Vec::new()));
+            return;
+        }
+        // `0x526eca`: the byte as `%b`.
+        WorldNotice::TalentsInvoluntarilyReset { flag } => {
+            events
+                .0
+                .push(("TALENTS_INVOLUNTARILY_RESET", vec![ScriptValue::Bool(flag)]));
+            return;
+        }
+        _ => {}
+    }
+    if let WorldNotice::ReportPvpAfkResult { result } = notice {
+        let Some(mut cvars) = cvars else {
+            return;
+        };
+        let enabled = cvars.flag("enablePVPNotifyAFK") == Some(true);
+        if let Some((value, key)) = afk_report(result, enabled) {
+            cvars.set("enablePVPNotifyAFK", value);
+            // The VM's text lookup shows a missing key as itself (`0x819d40`).
+            let text = script
+                .as_deref()
+                .and_then(|s| crate::ui_chat::combat::global_string(s, key))
+                .unwrap_or_else(|| key.to_string());
+            crate::ui_chat::away::push_system(&mut chat, text);
+        }
+        return;
+    }
+    errors.0.extend(notice_line(notice, &names));
+}
+
 /// `SMSG_PROPOSE_LEVEL_GRANT` (`0x513fd0`): an offer while one is pending is ignored.
 fn on_propose_level_grant(In(ev): In<SessionEvent>, mut grant: ResMut<LevelGrant>) {
     if let SessionEvent::ProposeLevelGrant { granter } = ev {
@@ -184,16 +322,143 @@ fn on_dance_moves(In(ev): In<SessionEvent>) {
     }
 }
 
+/// `SMSG_DANCE_QUERY_RESPONSE` (`0x635ab0`) and `SMSG_INVALIDATE_DANCE` (`0x6354f0`) fill and trim
+/// the cache only the unbuilt dance studio reads.
+fn on_dance_cache(In(ev): In<SessionEvent>) {
+    match ev {
+        SessionEvent::DanceRecord { id, record } => {
+            debug!(
+                "net: dance {id} {} — no dance studio, dropped",
+                if record.is_some() {
+                    "answered"
+                } else {
+                    "unknown"
+                }
+            );
+        }
+        SessionEvent::InvalidateDance { id } => {
+            debug!("net: dance {id} invalidated — no dance studio, nothing cached");
+        }
+        _ => {}
+    }
+}
+
+/// `SMSG_MOTD` (`0x551660`): each line a `CHAT_MSG_SYSTEM` line whose arg6 is `"MOTD"`, the lines
+/// kept for `KBSystem_GetMOTD`, then `KNOWLEDGE_BASE_SYSTEM_MOTD_UPDATED`.
+fn on_motd(In(ev): In<SessionEvent>, mut motd: ResMut<KbMotd>, mut chat: ResMut<ChatLog>) {
+    if let SessionEvent::Motd(lines) = ev {
+        debug!("net: message of the day, {} line(s)", lines.len());
+        for line in &lines {
+            chat.push_event(motd_line(line));
+        }
+        motd.text = lines.join("\n");
+        motd.generation += 1;
+        motd.owed += 1;
+    }
+}
+
+fn motd_line(line: &str) -> ChatEvent {
+    ChatEvent {
+        flag: "MOTD".into(),
+        ..ChatEvent::text_only(ChatEventKind::System, line.to_string())
+    }
+}
+
+/// `SMSG_WHOIS` (`0x6b3280`) writes its text to the console, which prints to the log here.
+fn on_whois(In(ev): In<SessionEvent>, echo: Option<ResMut<crate::console::ConsoleEcho>>) {
+    if let SessionEvent::Whois(text) = ev {
+        match echo {
+            Some(mut echo) => echo.print(text),
+            None => info!("console: {text}"),
+        }
+    }
+}
+
+/// `SMSG_RWHOIS` (`0x6b32c0`) goes to the console alone.
+fn on_rwhois(In(ev): In<SessionEvent>, mut echo: Option<ResMut<crate::console::ConsoleEcho>>) {
+    if let SessionEvent::RWhois(answer) = ev {
+        for line in rwhois_lines(&answer) {
+            match echo.as_mut() {
+                Some(echo) => echo.print(line),
+                None => info!("console: {line}"),
+            }
+        }
+    }
+}
+
+/// The rwhois console lines: one for a failure or no match, else per account its name, then each
+/// line. Deviation: the wording is benilla's own, and the highlighted line (`0x6b33a5`) is marked
+/// with `>` where the reference colours it, the echo having no colour.
+fn rwhois_lines(answer: &RWhois) -> Vec<String> {
+    match answer {
+        RWhois::Failed => vec!["rwhois: the lookup failed".into()],
+        RWhois::NotFound => vec!["rwhois: no account found".into()],
+        RWhois::Accounts(accounts) => accounts
+            .iter()
+            .flat_map(|a| {
+                let lines = a.lines.iter().enumerate().map(|(i, line)| {
+                    let mark = if i as u32 == a.highlight { '>' } else { ' ' };
+                    format!("{mark} {line}")
+                });
+                std::iter::once(format!("rwhois: account {}", a.account)).chain(lines)
+            })
+            .collect(),
+    }
+}
+
+fn on_server_first(In(ev): In<SessionEvent>, mut firsts: ResMut<ServerFirsts>) {
+    if let SessionEvent::ServerFirstAchievement(a) = ev {
+        debug!(
+            "net: server first {} by {:?} (linked {})",
+            a.achievement, a.name, a.linked
+        );
+        firsts.0.push(a);
+    }
+}
+
+/// The realm-first line (`0x50b010`): `PLAYER_SERVER_FIRST_ACHIEVEMENT` with the name twice when
+/// it links, else `SERVER_FIRST_ACHIEVEMENT` with it once, as `CHAT_MSG_ACHIEVEMENT` from the
+/// earner to the earner, whose `$a` names the award.
+fn server_first_line(
+    get: &dyn Fn(&str) -> Option<String>,
+    a: &ServerFirstAchievement,
+) -> Option<ChatMessage> {
+    use benilla_ui::strings::{fill, Arg};
+    let name = Arg::S(&a.name);
+    let text = if a.linked {
+        fill(&get("PLAYER_SERVER_FIRST_ACHIEVEMENT")?, &[name, name])
+    } else {
+        fill(&get("SERVER_FIRST_ACHIEVEMENT")?, &[name])
+    };
+    Some(ChatMessage {
+        chat_type: CHAT_MSG_ACHIEVEMENT,
+        language: 0,
+        sender_guid: a.guid,
+        target_guid: a.guid,
+        sender_name: Some(a.name.clone()),
+        channel: None,
+        text,
+        chat_tag: 0,
+        achievement: a.achievement,
+        wire_type: 0,
+        sender_word: 0,
+    })
+}
+
 /// The session's end zeroes the clock (`0x548570`) and drops the offer (`0x528c30`).
 fn on_session_end(
     In(_): In<SessionEvent>,
     mut clock: ResMut<UiClock>,
     mut grant: ResMut<LevelGrant>,
     mut lines: ResMut<InebriationLines>,
+    mut firsts: ResMut<ServerFirsts>,
+    mut events: ResMut<NoticeEvents>,
 ) {
     *clock = UiClock::default();
     *grant = LevelGrant::default();
     lines.0.clear();
+    firsts.0.clear();
+    events.0.clear();
 }
 
 /// `CMSG_WORLD_STATE_UI_TIMER_UPDATE` every 20 s in world, the first at once (`0x5488f0`).
@@ -237,29 +502,54 @@ fn inebriation_line(
     get(&key).map(|t| fill(&t, &args))
 }
 
-/// Push the UI clock offset, announce a pending level grant once its granter is named, and post
-/// the inebriation lines whose inputs have landed.
+/// Push the UI clock offset and the message of the day, announce a pending level grant once its
+/// granter is named, and post the realm-first lines and the inebriation lines whose inputs have
+/// landed.
 #[allow(clippy::too_many_arguments)]
 fn feed_notices(
     script: Option<NonSendMut<UiScript>>,
     clock: Res<UiClock>,
     mut grant: ResMut<LevelGrant>,
     mut lines: ResMut<InebriationLines>,
+    (mut motd, mut firsts, mut events): (
+        ResMut<KbMotd>,
+        ResMut<ServerFirsts>,
+        ResMut<NoticeEvents>,
+    ),
     names: Res<NameCache>,
     items: Res<Items>,
     net: Res<NetCommands>,
     self_guid: Res<SelfGuid>,
     objects: crate::net::Objects,
     mut chat: ResMut<ChatLog>,
-    mut pushed: Local<crate::ui_script::VmMemo<Option<i32>>>,
+    mut pushed: Local<crate::ui_script::VmMemo<(Option<i32>, u64)>>,
 ) {
     let Some(mut script) = script else {
         return;
     };
     let pushed = pushed.get(&script);
-    if *pushed != Some(clock.offset) {
-        *pushed = Some(clock.offset);
+    if pushed.0 != Some(clock.offset) {
+        pushed.0 = Some(clock.offset);
         script.set_ui_time_offset(clock.offset);
+    }
+    if pushed.1 != motd.generation {
+        pushed.1 = motd.generation;
+        script.set_kb_motd(&motd.text);
+    }
+    for _ in 0..std::mem::take(&mut motd.owed) {
+        script.fire_event("KNOWLEDGE_BASE_SYSTEM_MOTD_UPDATED", Vec::new());
+    }
+    for (event, args) in std::mem::take(&mut events.0) {
+        script.fire_event(event, args);
+    }
+    if !firsts.0.is_empty() {
+        let lua = script.lua();
+        let get = |key: &str| benilla_ui::strings::global(lua, key);
+        for a in std::mem::take(&mut firsts.0) {
+            if let Some(msg) = server_first_line(&get, &a) {
+                chat.push_wire(msg);
+            }
+        }
     }
 
     // `0x513fd0`: the event carries the granter's name, from its query's callback on a miss.
@@ -321,10 +611,77 @@ fn drain_level_grant(
     script: Option<NonSendMut<UiScript>>,
     mut grant: ResMut<LevelGrant>,
     net: Res<NetCommands>,
+    names: Res<NameCache>,
+    mut errors: ResMut<UiErrorKeys>,
+    mut chat: ResMut<crate::ui_chat::ChatLog>,
+    mut waiting: Local<crate::ui_script::VmMemo<Vec<(u8, u64)>>>,
+    mut echo: Option<ResMut<crate::console::ConsoleEcho>>,
 ) {
+    use benilla_ui::script::UnitRequest as R;
     let Some(mut script) = script else {
         return;
     };
+    // `ConsoleAddMessage`'s lines (`0x512090`).
+    for line in script.take_console_prints() {
+        if let Some(echo) = echo.as_mut() {
+            echo.print(line);
+        }
+    }
+    let waiting = waiting.get(&script);
+    for request in script.take_unit_requests() {
+        match request {
+            R::GrantLevel(friend) => {
+                let _ = net.0.send(ClientCommand::GrantLevel { friend });
+            }
+            // 9 and 13 show the name, which the name cache may still have to answer (`0x523210`).
+            R::ReferAFriendRefused {
+                code: code @ (9 | 13),
+                guid,
+            } => {
+                let _ = names.resolve(guid, &net);
+                waiting.push((code, guid));
+            }
+            R::ReferAFriendRefused { code, .. } => {
+                errors.0.extend(refer_a_friend_error(u32::from(code), ""));
+            }
+            R::SummonFriend {
+                guid,
+                spell,
+                restore,
+            } => {
+                if restore.is_some() {
+                    let _ = net.0.send(ClientCommand::SetSelection { guid });
+                }
+                let _ = net.0.send(ClientCommand::CastSpell {
+                    spell_id: spell,
+                    target: Some(guid),
+                });
+                if let Some(guid) = restore {
+                    let _ = net.0.send(ClientCommand::SetSelection { guid });
+                }
+            }
+            R::ReportPvpAfk(guid) => {
+                let _ = net.0.send(ClientCommand::ReportPvpAfk { guid });
+                if let Some(name) = names.peek(guid) {
+                    let get = |key: &str| script.lua().globals().get::<String>(key).ok();
+                    if let Some(format) = get("REPORT_PVP_AFK_SENT") {
+                        use benilla_ui::strings::{fill, Arg};
+                        crate::ui_chat::away::push_system(
+                            &mut chat,
+                            fill(&format, &[Arg::S(name)]),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    waiting.retain(|&(code, guid)| {
+        let Some(name) = names.peek(guid) else {
+            return !names.answered_unknown(guid);
+        };
+        errors.0.extend(refer_a_friend_error(u32::from(code), name));
+        false
+    });
     for accept in script.take_level_grant_answers() {
         let Some(granter) = grant.granter.take() else {
             continue;
@@ -339,6 +696,22 @@ fn drain_level_grant(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rwhois_prints_its_arms_and_marks_the_highlighted_line() {
+        assert_eq!(rwhois_lines(&RWhois::Failed).len(), 1);
+        assert_eq!(rwhois_lines(&RWhois::NotFound).len(), 1);
+        assert!(rwhois_lines(&RWhois::Accounts(Vec::new())).is_empty());
+        let account = benilla_protocol::messages::RWhoisAccount {
+            account: "ACC".into(),
+            lines: vec!["one".into(), "two".into()],
+            highlight: 1,
+        };
+        assert_eq!(
+            rwhois_lines(&RWhois::Accounts(vec![account])),
+            ["rwhois: account ACC", "  one", "> two"]
+        );
+    }
 
     fn text(e: &UiError) -> Option<String> {
         let get = |key: &str| {
@@ -376,6 +749,93 @@ mod tests {
         );
         assert!(refer_a_friend_error(0, "").is_none());
         assert!(refer_a_friend_error(14, "").is_none());
+    }
+
+    /// `0x6e3492`, `0x522180`, `0x526656`, `0x5cea46`, `0x6e40b7`, `0x6cbea0`: each notice's line,
+    /// the petition offer's only with a cached name and the queue removal's only for reasons 0-2.
+    #[test]
+    fn each_world_notice_shows_its_line() {
+        let mut names = NameCache::default();
+        names.insert_player(0x2A, "Brisca".into(), None);
+        let line = |n| notice_line(n, &names);
+        use WorldNotice as N;
+        assert_eq!(
+            line(N::PlayerBindError),
+            Some(UiError::key("ERR_DEATHBINDALREADYBOUND"))
+        );
+        for (reason, key) in [
+            (0, "ERR_REMOVE_FROM_PVP_QUEUE_GRANT_LEVEL"),
+            (1, "ERR_REMOVE_FROM_PVP_QUEUE_XP_GAIN"),
+            (2, "ERR_REMOVE_FROM_PVP_QUEUE_FACTION_CHANGE"),
+        ] {
+            assert_eq!(
+                line(N::RemovedFromPvpQueue { reason }),
+                Some(UiError::key(key))
+            );
+        }
+        assert_eq!(line(N::RemovedFromPvpQueue { reason: 3 }), None);
+        assert_eq!(
+            line(N::InvalidPromotionCode),
+            Some(UiError::key("ERR_INVALID_PROMOTION_CODE"))
+        );
+        assert_eq!(
+            line(N::OfferPetitionError { player: 0x2A }),
+            Some(UiError::s("ERR_ALREADY_IN_ARENA_TEAM_S", "Brisca"))
+        );
+        assert_eq!(line(N::OfferPetitionError { player: 0x2B }), None);
+        assert_eq!(
+            line(N::ArenaTeamChangeFailedQueued { failed: 1 }),
+            Some(UiError::key("ERR_ARENA_TEAM_CHANGE_FAILED_QUEUED"))
+        );
+        assert_eq!(line(N::ArenaTeamChangeFailedQueued { failed: 0 }), None);
+        assert_eq!(
+            line(N::BattlegroundInfoThrottled),
+            Some(UiError::key("ERR_BATTLEGROUND_INFO_THROTTLED"))
+        );
+        assert_eq!(line(N::ReportPvpAfkResult { result: 5 }), None);
+    }
+
+    /// `0x6cd2de`-`0x6cd367`: the first flag in the handler's order wins, the seconds read as
+    /// `"%2d:%02d"`, and the sign bit alone is the bare unhealthy line.
+    #[test]
+    fn a_play_time_warning_names_the_time_left_by_its_first_flag() {
+        assert_eq!(
+            play_time_warning(0x1000 | 0x2000, 3_900),
+            Some(UiError::s("ERR_APPROACHING_PARTIAL_PLAY_TIME", " 1:05"))
+        );
+        assert_eq!(
+            play_time_warning(0x4000_0000, 45_000),
+            Some(UiError::s("ERR_APPROACHING_PARTIAL_PLAY_TIME_2", "12:30"))
+        );
+        assert_eq!(
+            play_time_warning(0x2000, 59),
+            Some(UiError::s("ERR_APPROACHING_NO_PLAY_TIME", " 0:00"))
+        );
+        assert_eq!(
+            play_time_warning(0x2000_0000 | 0x8000_0000, 600),
+            Some(UiError::s("ERR_APPROACHING_NO_PLAY_TIME_2", " 0:10"))
+        );
+        assert_eq!(
+            play_time_warning(0x8000_0000, 600),
+            Some(UiError::key("ERR_UNHEALTHY_TIME"))
+        );
+        assert_eq!(play_time_warning(0x1, 600), None);
+    }
+
+    /// `0x6e3fe5`-`0x6e4040`: each result flips the CVar only from the other state.
+    #[test]
+    fn the_afk_report_result_switches_the_cvar_once() {
+        assert_eq!(
+            afk_report(5, false),
+            Some(("1", "PVP_REPORT_AFK_SYSTEM_ENABLED"))
+        );
+        assert_eq!(afk_report(5, true), None);
+        assert_eq!(
+            afk_report(6, true),
+            Some(("0", "PVP_REPORT_AFK_SYSTEM_DISABLED"))
+        );
+        assert_eq!(afk_report(6, false), None);
+        assert_eq!(afk_report(4, false), None);
     }
 
     /// `0x6cfff0`'s four forms.
@@ -418,6 +878,9 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut w = World::new();
         w.init_resource::<LevelGrant>();
+        w.init_resource::<NameCache>();
+        w.init_resource::<UiErrorKeys>();
+        w.init_resource::<crate::ui_chat::ChatLog>();
         w.insert_resource(NetCommands(tx));
         for granter in [0x2A, 0x2B] {
             w.run_system_once_with(
@@ -438,5 +901,55 @@ mod tests {
             "declined first, then none pending"
         );
         assert_eq!(w.resource::<LevelGrant>().granter, None);
+    }
+
+    /// `0x50b010`: the linked form fills the name twice, the plain form once; both keep `$a` for
+    /// the achievement lane's expansion, from and about the earner.
+    #[test]
+    fn a_server_first_formats_by_its_link_flag() {
+        let get = |key: &str| {
+            Some(
+                match key {
+                    "PLAYER_SERVER_FIRST_ACHIEVEMENT" => "[%s|%s] $a",
+                    "SERVER_FIRST_ACHIEVEMENT" => "<%s> $a",
+                    _ => return None,
+                }
+                .to_string(),
+            )
+        };
+        let mut a = ServerFirstAchievement {
+            name: "Bob".into(),
+            guid: 0x2A,
+            achievement: 457,
+            linked: true,
+        };
+        let msg = server_first_line(&get, &a).unwrap();
+        assert_eq!(msg.text, "[Bob|Bob] $a");
+        assert_eq!(msg.chat_type, CHAT_MSG_ACHIEVEMENT);
+        assert_eq!((msg.sender_guid, msg.target_guid), (0x2A, 0x2A));
+        assert_eq!(msg.sender_name.as_deref(), Some("Bob"));
+        assert_eq!(msg.achievement, 457);
+        a.linked = false;
+        assert_eq!(server_first_line(&get, &a).unwrap().text, "<Bob> $a");
+        assert!(server_first_line(&|_: &str| None, &a).is_none());
+    }
+
+    /// `0x551660`: a system line flagged `MOTD`, and the joined message for `KBSystem_GetMOTD`.
+    #[test]
+    fn the_motd_prints_each_line_and_keeps_the_whole() {
+        use bevy::ecs::system::RunSystemOnce;
+        let line = motd_line("Hello");
+        assert_eq!(line.kind, Some(ChatEventKind::System));
+        assert_eq!((line.text.as_str(), line.flag.as_str()), ("Hello", "MOTD"));
+        let mut w = World::new();
+        w.init_resource::<KbMotd>();
+        w.init_resource::<ChatLog>();
+        w.run_system_once_with(on_motd, SessionEvent::Motd(vec!["a".into(), "b".into()]))
+            .unwrap();
+        let motd = w.resource::<KbMotd>();
+        assert_eq!(
+            (motd.text.as_str(), motd.generation, motd.owed),
+            ("a\nb", 1, 1)
+        );
     }
 }

@@ -2,7 +2,7 @@
 //! server clocks, reputations and the player's login-scoped stores. Registered ahead of every
 //! window plugin, so the teardown runs before the windows' own `Disconnected` listeners.
 
-use benilla_protocol::messages::Character;
+use benilla_protocol::messages::{Character, GameClock};
 use benilla_protocol::JumpInfo;
 use bevy::prelude::*;
 
@@ -40,6 +40,7 @@ pub(super) fn register(app: &mut App) {
         .net_handler(K::Connected, on_connected)
         .net_handler(K::LoggedOut, on_logged_out)
         .net_handler(K::Disconnected, on_disconnected)
+        .net_handler(K::KickReason, on_kick_reason)
         .net_handler(K::Teleport, on_mover_edge)
         .net_handler(K::KnockBack, on_mover_edge)
         .net_handler(K::ClientControl, on_mover_edge)
@@ -47,9 +48,13 @@ pub(super) fn register(app: &mut App) {
         .net_handler(K::TransferPending, on_transfer)
         .net_handler(K::TransferAborted, on_transfer)
         .net_handler(K::TimeSpeed, on_clock)
+        .net_handler(K::GameTimeSet, on_clock)
+        .net_handler(K::GameTimeSync, on_clock)
+        .net_handler(K::GameSpeed, on_clock)
         .net_handler(K::ServerUnixTime, on_clock)
         .net_handler(K::Reputations, on_reputations)
         .net_handler(K::ReputationDelta, on_reputation_delta)
+        .net_handler(K::ReputationAtWar, on_reputation_at_war)
         .net_handler(K::ReputationVisible, on_reputations)
         .net_handler(K::ForcedReactions, on_reputations)
         .add_systems(
@@ -213,11 +218,26 @@ fn on_logged_out(In(ev): In<SessionEvent>, mut e: Edges, mut b: Bridge) {
 }
 
 /// The bridge's half of the session end; each window's own listener runs after it.
-fn on_disconnected(In(ev): In<SessionEvent>, mut e: Edges, mut b: Bridge) {
+/// `SMSG_KICK_REASON` in the world: stored for the disconnect to report (`0x4d9572`). The glue's
+/// authenticator-seed arm (`0x4d9543`) never reaches the world stream.
+fn on_kick_reason(In(ev): In<SessionEvent>, mut kick: ResMut<super::KickReason>) {
+    if let SessionEvent::KickReason { reason } = ev {
+        info!("net: kick reason {reason}");
+        kick.0 = reason;
+    }
+}
+
+fn on_disconnected(
+    In(ev): In<SessionEvent>,
+    mut e: Edges,
+    mut b: Bridge,
+    kick: Res<super::KickReason>,
+) {
     if let SessionEvent::Disconnected { reason, end } = ev {
         disconnected(
             reason,
             end,
+            kick.0,
             &mut b.commands,
             &mut b.index,
             &mut b.self_guid,
@@ -233,7 +253,12 @@ fn on_disconnected(In(ev): In<SessionEvent>, mut e: Edges, mut b: Bridge) {
 
 /// Teleport, knockback and client control, forwarded unjudged to the controller, which applies
 /// and answers them.
-fn on_mover_edge(In(ev): In<SessionEvent>, mut e: Edges, b: Bridge) {
+fn on_mover_edge(
+    In(ev): In<SessionEvent>,
+    mut e: Edges,
+    b: Bridge,
+    movers: Query<&super::Guid, With<super::ActiveMover>>,
+) {
     match ev {
         SessionEvent::Teleport {
             guid,
@@ -252,7 +277,14 @@ fn on_mover_edge(In(ev): In<SessionEvent>, mut e: Edges, b: Bridge) {
             guid,
             counter,
             launch,
-        } => knock_back(guid, counter, launch, &b.self_guid, &mut e.knockbacks),
+        } => knock_back(
+            guid,
+            counter,
+            launch,
+            &b.self_guid,
+            movers.single().ok().map(|g| g.0),
+            &mut e.knockbacks,
+        ),
         SessionEvent::ClientControl { mover, allow_move } => {
             e.client_control
                 .write(ClientControlMessage { mover, allow_move });
@@ -320,6 +352,9 @@ fn on_clock(In(ev): In<SessionEvent>, mut b: Bridge) {
             (packed, zone),
             &mut b.server_time,
         ),
+        SessionEvent::GameTimeSet(clock) => game_time(clock, false, &mut b.server_time),
+        SessionEvent::GameTimeSync(clock) => game_time(clock, true, &mut b.server_time),
+        SessionEvent::GameSpeed { timescale } => game_speed(timescale, &mut b.server_time),
         SessionEvent::ServerUnixTime {
             unix_time,
             reset_in,
@@ -359,15 +394,55 @@ fn on_reputation_delta(
     mut center: MessageWriter<crate::ui_unit::CombatTextEvent>,
     mut quest: ResMut<QuestGiver>,
 ) {
-    if let SessionEvent::ReputationDelta { standings } = ev {
-        crate::combat_log::chat::faction_standing(
-            &standings,
-            &b.reputations,
-            factions.as_deref(),
-            &mut chat_log,
-            &mut center,
-        );
-        reputation_delta(standings, &mut b.reputations, &mut quest);
+    if let SessionEvent::ReputationDelta {
+        bonus,
+        show_effect: _,
+        standings,
+    } = ev
+    {
+        // Our race and class pick each faction's base, our gender the rank labels.
+        let me = b
+            .self_guid
+            .0
+            .and_then(|g| b.index.0.get(&g).copied())
+            .and_then(|e| b.stores.get(e).ok())
+            .map(|s| {
+                (
+                    s.0.unit_race().unwrap_or(0),
+                    s.0.unit_class().unwrap_or(0),
+                    s.0.unit_gender() == Some(1),
+                )
+            })
+            .unwrap_or((0, 0, false));
+        let mut lines = FactionLines {
+            catalog: factions.as_deref().map(|f| f.catalog()),
+            me,
+            bonus,
+            log: &mut chat_log,
+            texts: Vec::new(),
+        };
+        reputation_delta(standings, &mut b.reputations, &mut quest, &mut lines);
+        center.write_batch(lines.texts);
+    }
+}
+
+/// `SMSG_SET_FACTION_ATWAR` (`0x5d0850`): the slot's at-war bit set or cleared (`0x5d0896`); the
+/// reputation pane's `UPDATE_FACTION` and the unit reactions read the store.
+fn on_reputation_at_war(In(ev): In<SessionEvent>, mut b: Bridge) {
+    if let SessionEvent::ReputationAtWar { list_id, at_war } = ev {
+        let Some(i) = reputation_slot(list_id, "SMSG_SET_FACTION_ATWAR") else {
+            return;
+        };
+        let reps = &mut b.reputations;
+        if reps.0.len() <= i {
+            reps.0.resize(i + 1, (0, 0));
+        }
+        let flags = &mut reps.0[i].0;
+        if at_war {
+            *flags |= benilla_formats::faction_flags::AT_WAR;
+        } else {
+            *flags &= !benilla_formats::faction_flags::AT_WAR;
+        }
     }
 }
 
@@ -528,6 +603,7 @@ fn logged_out(
 fn disconnected(
     reason: String,
     end: benilla_protocol::SessionEnd,
+    kick_reason: u8,
     commands: &mut Commands,
     index: &mut GuidIndex,
     self_guid: &mut SelfGuid,
@@ -539,7 +615,10 @@ fn disconnected(
     disconnects: &mut MessageWriter<DisconnectedMessage>,
 ) {
     // Whether the session is over is settled once, here, and carried to every reader.
-    let msg = DisconnectedMessage::new(reason.clone(), end);
+    let msg = DisconnectedMessage {
+        kick_reason,
+        ..DisconnectedMessage::new(reason.clone(), end)
+    };
     let over = msg.session_over;
     disconnects.write(msg);
     warn!("net: {reason} — tearing down the streamed world");
@@ -595,17 +674,18 @@ fn teleport(
     }
 }
 
-/// `SMSG_MOVE_KNOCK_BACK`: a ballistic launch our controller flies and acks. The reference handles
-/// it for the controller only; observers get `MSG_MOVE_KNOCK_BACK`, so one naming another unit is
-/// dropped.
+/// `SMSG_MOVE_KNOCK_BACK`: a ballistic launch our controller flies and acks, for our body or the
+/// unit we drive (`0x72d1b0`); AzerothCore names a possessed unit when it is our mover. Observers
+/// get `MSG_MOVE_KNOCK_BACK`, so one naming any other unit is dropped.
 fn knock_back(
     guid: u64,
     counter: u32,
     launch: JumpInfo,
     self_guid: &SelfGuid,
+    active_mover: Option<u64>,
     knockbacks: &mut MessageWriter<KnockBackMessage>,
 ) {
-    if self_guid.0 == Some(guid) {
+    if self_guid.0 == Some(guid) || active_mover == Some(guid) {
         knockbacks.write(KnockBackMessage {
             guid,
             counter,
@@ -688,7 +768,36 @@ fn time_speed(
     if server_time.0.is_none() {
         info!("net: server game-time {hours:02}:{minutes:02} (drives lighting)");
     }
-    server_time.0 = Some(GameTime::new(hours, minutes, day_serial, timescale).dated(packed, zone));
+    let clock = GameTime::new(hours, minutes, day_serial, timescale).dated(packed, zone);
+    server_time.1 = clock.timescale();
+    server_time.0 = Some(clock);
+}
+
+/// `SMSG_GAMETIME_SET` sets the clock to the packet's time (`0x7e2bb0`), `SMSG_GAMETIME_UPDATE`
+/// syncs it, never back (`0x7e2a37`); both run at the speed the clock holds.
+fn game_time(clock: GameClock, sync: bool, server_time: &mut ServerTime) {
+    debug!(
+        "net: server game-time {} to {:02}:{:02}",
+        if sync { "synced" } else { "set" },
+        clock.hours,
+        clock.minutes
+    );
+    let next = GameTime::new(clock.hours, clock.minutes, clock.day_serial, server_time.1)
+        .dated(clock.packed, clock.zone);
+    server_time.0 = Some(match &server_time.0 {
+        Some(now) if sync => now.synced(next),
+        _ => next,
+    });
+}
+
+/// `SMSG_GAMESPEED_SET`: the clock runs on from its current time at the new speed, which a clock
+/// set later keeps (`0x7e2893`).
+fn game_speed(timescale: f32, server_time: &mut ServerTime) {
+    let timescale = timescale.clamp(GameTime::MIN_SPEED, GameTime::MAX_SPEED);
+    server_time.1 = timescale;
+    if let Some(clock) = server_time.0.as_mut() {
+        clock.set_timescale(timescale);
+    }
 }
 
 /// `SMSG_QUERY_TIME_RESPONSE`: the server wall clock that absolute descriptor stamps (the
@@ -713,24 +822,95 @@ fn reputations(standings: Vec<(u8, i32)>, reputations: &mut Reputations) {
     reputations.0 = standings;
 }
 
-/// `SMSG_SET_FACTION_STANDING`: overwrites the changed slots, growing the store with flags 0, and
-/// makes each visible unless it is `HIDDEN`, as the reference's handler does.
+/// What a standing change prints through: the faction table, our race, class and gender, the
+/// packet's bonus, the chat log, and the combat texts owed.
+struct FactionLines<'a> {
+    catalog: Option<&'a benilla_formats::FactionCatalog>,
+    me: (u8, u8, bool),
+    bonus: f32,
+    log: &'a mut crate::ui_chat::ChatLog,
+    texts: Vec<crate::ui_unit::CombatTextEvent>,
+}
+
+/// The stored flag `0x40` whose rows always print their change (`0x5d211d`).
+const FACTION_FLAG_ALWAYS_LOGGED: u8 = 0x40;
+/// The stored flag `0x80` that lets an invisible faction print its rank change (`0x5d2236`).
+const FACTION_FLAG_RANK_SHOWN: u8 = 0x80;
+
+/// `SMSG_SET_FACTION_STANDING` (`0x5d20a0`), row by row:
+///
+/// - The line (`0x5d211d`-`0x5d2142`): a faction with flag `0x40` always, in the generic form
+///   with `HIDDEN`; any other only as the packet's first row and not `HIDDEN`.
+/// - A new standing is stored and its delta printed (`0x5d217b`, `0x5d21b2`).
+/// - A faction neither `VISIBLE` nor `HIDDEN` is revealed (`0x5d21d9`).
+/// - A rank below Unfriendly sets `AT_WAR` (`0x5d21f7`); a rise in rank clears it (`0x5d2200`).
+/// - A rank change prints `FACTION_STANDING_CHANGED` (`0x5d2243`) unless the faction is `HIDDEN`,
+///   a header without `0x80`, or revealed by this row.
 fn reputation_delta(
     standings: Vec<(u32, i32)>,
     reputations: &mut Reputations,
     quest: &mut QuestGiver,
+    lines: &mut FactionLines,
 ) {
     use benilla_formats::faction_flags as flag;
-    for (list_id, standing) in standings {
+    let (race, class, female) = lines.me;
+    for (row, (list_id, standing)) in standings.into_iter().enumerate() {
         let Some(i) = reputation_slot(list_id, "SMSG_SET_FACTION_STANDING") else {
             continue;
         };
         if reputations.0.len() <= i {
             reputations.0.resize(i + 1, (0, 0));
         }
+        let (mut flags, old) = reputations.0[i];
+        let mode = if flags & FACTION_FLAG_ALWAYS_LOGGED != 0 {
+            Some(flags & flag::HIDDEN != 0)
+        } else if row == 0 && flags & flag::HIDDEN == 0 {
+            Some(false)
+        } else {
+            None
+        };
+        // The wire's list id is `Faction.dbc`'s `rep_index`.
+        let faction = lines.catalog.and_then(|c| {
+            c.reputation_factions()
+                .find(|(_, f)| i32::try_from(list_id).is_ok_and(|l| f.rep_index == l))
+                .map(|(id, f)| {
+                    (
+                        c.faction_name(id).unwrap_or_default(),
+                        f.base_for(race, class),
+                    )
+                })
+        });
+        let base = faction.map_or(0, |(_, base)| base);
+        let old_rank = benilla_formats::reputation_rank(base + old);
         reputations.0[i].1 = standing;
-        if reputations.0[i].0 & flag::HIDDEN == 0 {
-            reputations.0[i].0 |= flag::VISIBLE;
+        if let (Some(generic), Some((name, _))) = (mode, faction) {
+            lines
+                .texts
+                .extend(crate::combat_log::chat::faction_change_line(
+                    name,
+                    standing - old,
+                    generic,
+                    lines.bonus,
+                    lines.log,
+                ));
+        }
+        let new_rank = benilla_formats::reputation_rank(base + standing);
+        let revealed = flags & (flag::VISIBLE | flag::HIDDEN) == 0;
+        if revealed {
+            flags |= flag::VISIBLE;
+        }
+        if new_rank < 2 {
+            flags |= flag::AT_WAR;
+        } else if new_rank > old_rank {
+            flags &= !flag::AT_WAR;
+        }
+        reputations.0[i].0 = flags;
+        let shown = flags & flag::HIDDEN == 0
+            && (flags & flag::HEADER == 0 || flags & FACTION_FLAG_RANK_SHOWN != 0);
+        if new_rank != old_rank && shown && !revealed {
+            if let Some((name, _)) = faction {
+                crate::combat_log::chat::faction_rank_line(name, new_rank, female, lines.log);
+            }
         }
     }
     // Standing feeds questgiver status (`SatisfyQuestReputation`); the reference re-asks here too.
@@ -786,6 +966,110 @@ fn packet_dropped(opcode: u16, unparseable: bool, dropped: &mut DroppedOpcodes) 
 }
 
 #[cfg(test)]
+mod game_clock_tests {
+    use super::*;
+
+    fn clock(hours: u8, minutes: u8) -> GameClock {
+        GameClock::new(((hours as u32) << 6) | minutes as u32, 0)
+    }
+
+    /// `SMSG_GAMETIME_SET` and `SMSG_GAMETIME_UPDATE` move the time and keep the speed.
+    #[test]
+    fn a_game_time_keeps_the_running_speed() {
+        for sync in [false, true] {
+            let mut server_time = ServerTime(Some(GameTime::new(6, 0, 0, 0.5)), 0.5);
+            game_time(clock(21, 15), sync, &mut server_time);
+            let now = server_time.0.unwrap();
+            assert_eq!(now.timescale(), 0.5);
+            assert!((21 * 60 + 15..21 * 60 + 17).contains(&now.minute_of_day()));
+        }
+    }
+
+    /// A set goes back to the packet's time; a sync holds a clock that is ahead.
+    #[test]
+    fn a_set_runs_back_and_a_sync_holds() {
+        let ahead = || {
+            ServerTime(
+                Some(GameTime::new(14, 5, 0, GameTime::MIN_SPEED)),
+                GameTime::MIN_SPEED,
+            )
+        };
+        let mut server_time = ahead();
+        game_time(clock(14, 2), false, &mut server_time);
+        assert_eq!(server_time.0.unwrap().minute_of_day(), 14 * 60 + 2);
+        let mut server_time = ahead();
+        game_time(clock(14, 2), true, &mut server_time);
+        assert_eq!(server_time.0.unwrap().minute_of_day(), 14 * 60 + 5);
+    }
+
+    /// A speed before any time is kept for the time that follows; with none, the clock's 1/60.
+    #[test]
+    fn a_clock_packet_before_settimespeed() {
+        let mut server_time = ServerTime::default();
+        game_time(clock(8, 0), false, &mut server_time);
+        assert_eq!(server_time.0.unwrap().timescale(), GameTime::MIN_SPEED);
+        let mut server_time = ServerTime::default();
+        game_speed(2.0, &mut server_time);
+        assert!(server_time.0.is_none());
+        game_time(clock(8, 0), true, &mut server_time);
+        assert_eq!(server_time.0.unwrap().timescale(), 2.0);
+    }
+
+    /// `SMSG_GAMESPEED_SET` sets the speed of the running clock, clamped (`0x76cfa0`).
+    #[test]
+    fn a_game_speed_sets_the_running_clock() {
+        let mut server_time = ServerTime(
+            Some(GameTime::new(6, 0, 0, GameTime::MIN_SPEED)),
+            GameTime::MIN_SPEED,
+        );
+        game_speed(0.25, &mut server_time);
+        assert_eq!(server_time.0.unwrap().timescale(), 0.25);
+        game_speed(0.0, &mut server_time);
+        assert_eq!(server_time.0.unwrap().timescale(), GameTime::MIN_SPEED);
+        assert_eq!(server_time.1, GameTime::MIN_SPEED);
+    }
+}
+
+#[cfg(test)]
+mod knock_back_tests {
+    use super::*;
+    use bevy::ecs::system::RunSystemOnce;
+
+    const ME: u64 = 0x7;
+    const EYE: u64 = 0xF130_006F_5F29_221A;
+
+    fn knocked(guid: u64, active_mover: Option<u64>) -> usize {
+        let mut world = World::new();
+        world.init_resource::<Messages<KnockBackMessage>>();
+        world
+            .run_system_once(move |mut out: MessageWriter<KnockBackMessage>| {
+                knock_back(
+                    guid,
+                    1,
+                    JumpInfo::default(),
+                    &SelfGuid(Some(ME)),
+                    active_mover,
+                    &mut out,
+                );
+            })
+            .unwrap();
+        world.resource::<Messages<KnockBackMessage>>().len()
+    }
+
+    /// `0x72d1b0` launches the unit named: our body, or the unit we drive.
+    #[test]
+    fn a_knockback_lands_on_our_body_or_the_unit_we_drive() {
+        assert_eq!(knocked(ME, Some(ME)), 1);
+        assert_eq!(knocked(EYE, Some(EYE)), 1, "a possessed mover is launched");
+        assert_eq!(
+            knocked(EYE, Some(ME)),
+            0,
+            "a unit we only watch is not ours to fly"
+        );
+    }
+}
+
+#[cfg(test)]
 mod teardown_tests {
     use super::*;
     use bevy::ecs::system::RunSystemOnce;
@@ -821,6 +1105,7 @@ mod teardown_tests {
                     disconnected(
                         "character login refused".into(),
                         end,
+                        0,
                         &mut commands,
                         &mut index,
                         &mut self_guid,
@@ -862,5 +1147,102 @@ mod teardown_tests {
         assert_eq!(guid, Some(7));
         assert!(reason.is_some());
         assert!(avatar);
+    }
+}
+
+#[cfg(test)]
+mod reputation_delta_tests {
+    use super::*;
+
+    /// One `SMSG_SET_FACTION_STANDING` through the row rule against the install's `Faction.dbc`,
+    /// as a Human Warrior (Stormwind's base 4000, Friendly).
+    #[test]
+    fn the_rows_pick_their_lines_and_the_rank_moves_the_war_flag() {
+        use benilla_formats::faction_flags as flag;
+        let data = benilla_formats::wow_data_or_skip!();
+        let mut chain = benilla_formats::open_chain(&data).expect("open chain");
+        let catalog = benilla_formats::load_faction_catalog(&mut chain).expect("dbc");
+        let slot = |name: &str| {
+            catalog
+                .reputation_factions()
+                .find(|(id, _)| catalog.faction_name(*id) == Some(name))
+                .map(|(_, f)| f.rep_index as u32)
+                .unwrap_or_else(|| panic!("{name} has a reputation slot"))
+        };
+        let (stormwind, darnassus) = (slot("Stormwind"), slot("Darnassus"));
+        let mut reps = Reputations::default();
+        reps.0.resize(128, (0, 0));
+        reps.0[stormwind as usize].0 = flag::VISIBLE;
+        reps.0[darnassus as usize].0 = flag::VISIBLE | flag::AT_WAR;
+        let mut quest = QuestGiver::default();
+        let mut log = crate::ui_chat::ChatLog::default();
+        let mut lines = FactionLines {
+            catalog: Some(&catalog),
+            me: (1, 1, false),
+            bonus: 0.0,
+            log: &mut log,
+            texts: Vec::new(),
+        };
+        // Stormwind first, up to Honored: its change line and text, and the rank line. Darnassus
+        // second changes silently but still prints its rank and drops below Unfriendly.
+        let darnassus_base = catalog
+            .reputation_factions()
+            .find(|(_, f)| f.rep_index == darnassus as i32)
+            .map(|(_, f)| f.base_for(1, 1))
+            .unwrap();
+        reputation_delta(
+            vec![(stormwind, 5100), (darnassus, -9000 - darnassus_base)],
+            &mut reps,
+            &mut quest,
+            &mut lines,
+        );
+        assert_eq!(lines.texts.len(), 1, "one FACTION text, the first row's");
+        assert_eq!(
+            log.pending_len(),
+            3,
+            "change + rank for Stormwind, rank for Darnassus"
+        );
+        assert_eq!(reps.0[stormwind as usize], (flag::VISIBLE, 5100));
+        assert_ne!(
+            reps.0[darnassus as usize].0 & flag::AT_WAR,
+            0,
+            "Hated sets war"
+        );
+
+        // Back up past Hostile: a rise in rank clears the war flag.
+        let mut log = crate::ui_chat::ChatLog::default();
+        let mut lines = FactionLines {
+            catalog: Some(&catalog),
+            me: (1, 1, false),
+            bonus: 0.0,
+            log: &mut log,
+            texts: Vec::new(),
+        };
+        reputation_delta(
+            vec![(darnassus, -darnassus_base)],
+            &mut reps,
+            &mut quest,
+            &mut lines,
+        );
+        assert_eq!(
+            reps.0[darnassus as usize].0 & flag::AT_WAR,
+            0,
+            "a rise clears war"
+        );
+
+        // A hidden faction prints nothing, first row or not, and is not revealed.
+        reps.0[stormwind as usize].0 = flag::HIDDEN;
+        let mut log = crate::ui_chat::ChatLog::default();
+        let mut lines = FactionLines {
+            catalog: Some(&catalog),
+            me: (1, 1, false),
+            bonus: 0.0,
+            log: &mut log,
+            texts: Vec::new(),
+        };
+        reputation_delta(vec![(stormwind, 40000)], &mut reps, &mut quest, &mut lines);
+        assert!(lines.texts.is_empty());
+        assert_eq!(log.pending_len(), 0);
+        assert_eq!(reps.0[stormwind as usize].0 & flag::VISIBLE, 0);
     }
 }

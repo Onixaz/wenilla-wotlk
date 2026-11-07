@@ -159,6 +159,10 @@ pub(crate) struct MoveModes {
     /// 3.3.5a's `CAN_FLY` (`SMSG_MOVE_SET_CAN_FLY`, a flying mount or `.gm fly on`): the jump key
     /// takes flight and a fall off a ledge becomes one ([`super::flight`]).
     pub(crate) can_fly: bool,
+    /// The second flags word's swim-to-fly bit (`SMSG_MOVE_SET_CAN_TRANSITION_BETWEEN_SWIM_AND_FLY`,
+    /// `0x6ed68d`). Held and acked; its one reader, the flight collision query's facet flag
+    /// `0x20000` (`0x75e441`), has no counterpart in our collision.
+    pub(crate) swim_fly_transition: bool,
 }
 
 impl MoveModes {
@@ -182,6 +186,7 @@ impl MoveModes {
             MoveMode::FeatherFall => self.feather_fall = apply,
             MoveMode::Hover => self.hover = apply,
             MoveMode::CanFly => self.can_fly = apply,
+            MoveMode::SwimFlyTransition => self.swim_fly_transition = apply,
         }
     }
 
@@ -314,11 +319,18 @@ pub(crate) struct Player {
     /// bit. Observers read our gait off it, and it is in the server-authored merge mask, so a
     /// server move can flip it ([`super::wire_in`]); it owes no ack.
     pub(super) walking: bool,
-    /// The auto-move (`/follow` or Click to Move) holding forward this frame: the reference pushes
-    /// W's own bit, so this is a [`forward_axis`] term. Rewritten each frame by
+    /// The auto-move holding forward (`0x72ecf0`), a [`forward_axis`] term. Rewritten each frame by
     /// [`super::follow::steer_follow`] and [`super::approach::steer_approach`] just before the
     /// controller reads it.
     pub(super) auto_forward: bool,
+    /// The auto-move turning or pitching: input bits `0x1000000` and `0x400000`, Track but no bob.
+    pub(super) auto_turning: bool,
+    /// A `/follow` with `autoInteract` off: the camera reads its bits as Move (`0x602760`).
+    pub(super) auto_as_move: bool,
+    /// The auto-move asks the controller's flight edge for this frame (`0x731e0f`).
+    pub(super) auto_take_off: bool,
+    /// A teleport landed: the frame's auto-move ends and the loot closes (`0x72aec0(1, 0)`).
+    pub(super) teleported: bool,
     /// Free-fly (`F`): the camera moves on its own and the avatar/server position is frozen.
     pub(crate) detached: bool,
     /// `SMSG_CLIENT_CONTROL_UPDATE` with `allowMove = 0` named the unit we drive: us, while someone
@@ -796,14 +808,12 @@ mod stand_state_tests {
             stand_state_refused(false, f::FORWARD, 3),
             "walking: /sleep refused"
         );
-        // SLEEP's effective mask is the one-shot route's `0x20003f`.
-        assert_eq!(
+        // Standing up from SLEEP is still ungated, by SLEEP's whole `0x20003f`.
+        assert!(!stand_state_refused(
+            false,
             f::TURN_LEFT | f::TURN_RIGHT | f::ANY_MOVE | f::SWIMMING,
-            f::ROUTE_COMMITTED_MOVE,
-            "`0x20003f`, byte-verified in the one-shot route and the stand-state setter alike"
-        );
-        // Standing up from SLEEP is still ungated.
-        assert!(!stand_state_refused(false, f::ROUTE_COMMITTED_MOVE, 0));
+            0
+        ));
         // FALLING is in neither mask.
         assert!(
             !stand_state_refused(false, f::FALLING, 3),

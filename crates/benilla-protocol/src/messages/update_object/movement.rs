@@ -46,12 +46,23 @@ pub struct CreateSpline {
     pub flying: bool,
     /// `MoveSplineFlag::Cyclic`: the server loops this path forever.
     pub cyclic: bool,
+    /// `MoveSplineFlag::Enter_Cycle`: the first wrap drops the path's entry (`0x98c940`).
+    pub enter_cycle: bool,
+    /// The running lap's and the next lap's duration modifiers (`spline+0x204`, `+0x208`).
+    pub duration_mods: [f32; 2],
+    /// The Catmull-Rom control points outside [`Self::path`], the wire array's first and last.
+    pub phantoms: [[f32; 3]; 2],
     /// `MoveSplineFlag::Runmode`; its absence forces walk mode on.
     pub run_mode: bool,
     /// `MoveSplineFlag::Parabolic`: the jump arc, as on `MonsterMove`.
     pub arc: Option<crate::messages::SplineArc>,
     /// `MoveSplineFlag::OrientationFixed`: the unit keeps its facing along the path.
     pub facing_fixed: bool,
+    /// The facing taken when the walk ends (`0x4f4b71`..`0x4f4ba0`), as on `MonsterMove`.
+    pub final_facing: crate::messages::MonsterMoveFacing,
+    /// Catmull-Rom over the nodes, else straight lines: `flags & 0x42000` (`0x6f15c3`), which
+    /// overwrites the wire's mode byte before any evaluation.
+    pub catmull_rom: bool,
 }
 
 /// A `LIVING` block's live mover state: the `MOVEMENTFLAGS` word and the swim pitch that rides it.
@@ -78,13 +89,18 @@ pub struct MovementBlock {
     /// A ship's or elevator's path progress in ms at create, the anchor its cycle runs from
     /// (`Object.cpp:590-605`); no other object sets `UPDATE_FLAG_TRANSPORT`.
     pub transport_progress: Option<u32>,
-    /// A `LIVING` block's rider pose (`MOVEFLAG_ON_TRANSPORT`), local to the transport's frame.
+    /// The pose local to a transport's frame: a `LIVING` block's rider tail
+    /// (`MOVEFLAG_ON_TRANSPORT`), or a `POSITION` block's transport guid, local position and
+    /// transport facing (`0x4d38cb`), with seat `-1`.
     pub transport: Option<TransportPose>,
     /// The path this unit is already walking at create (`MOVEFLAG_SPLINE_ENABLED`).
     pub spline: Option<CreateSpline>,
     /// `UPDATEFLAG_VEHICLE`: the unit's `Vehicle.dbc` id and its facing at create, from which
     /// the vehicle's facing limits run (`0x757fa0`).
     pub vehicle: Option<(u32, f32)>,
+    /// `UPDATEFLAG_HAS_TARGET`: the unit's attack target (`0x4d39cb`), the state
+    /// `SMSG_ATTACKSTART` sets; `None` for none or a zero guid.
+    pub attack_target: Option<u64>,
 }
 
 impl MovementBlock {}

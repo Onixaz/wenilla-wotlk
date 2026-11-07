@@ -1250,25 +1250,6 @@ mod tests {
         // The assertion below refuses a name whose gap has closed.
         const KNOWN: &[(&str, &[&str])] = &[
             (
-                "the GM survey's verbs, not built: the survey window opens on GMSURVEY_DISPLAY, \
-                 and its buttons reach these",
-                &[
-                    "GMSurveyAnswerSubmit",
-                    "GMSurveyCommentSubmit",
-                    "GMSurveyQuestion",
-                    "GMSurveySubmit",
-                ],
-            ),
-            (
-                "the skill-point purchase arrows and button `SkillFrame.lua` still carries; they \
-                 show only while a row has a step or rank cost, which no 3.3.5a server sends",
-                &["AddSkillUp", "BuySkillTier", "RemoveSkillUp"],
-            ),
-            (
-                "TRADE_REPLACE_ENCHANT's Accept; the verb is not built",
-                &["ReplaceTradeEnchant"],
-            ),
-            (
                 "Real ID: 12340's Battle.net verbs, not built; a 3.3.5a server has no Battle.net service",
                 &[
                     "BNAcceptFriendInvite",
@@ -1307,26 +1288,6 @@ mod tests {
                 ],
             ),
             (
-                "the secure slash-command verbs `ChatFrame.lua` dispatches, not built",
-                &[
-                    "CancelShapeshiftForm",
-                    "DisableSpellAutocast",
-                    "Dismount",
-                    "EnableSpellAutocast",
-                    "EquipItemByName",
-                    "RunMacro",
-                    "RunMacroText",
-                    "SpellTargetItem",
-                    "StartAttack",
-                    "StopAttack",
-                    "StopMacro",
-                    "TargetLastFriend",
-                    "TargetNearestEnemyPlayer",
-                    "TargetNearestFriendPlayer",
-                    "UseItemByName",
-                ],
-            ),
-            (
                 "voice chat, not built",
                 &[
                     "ChannelSilenceVoice",
@@ -1341,51 +1302,6 @@ mod tests {
                     "KBQuery_BeginLoading",
                     "KBSetup_BeginLoading",
                     "KBSetup_IsLoaded",
-                ],
-            ),
-            (
-                "the looking-for-raid browser, not built",
-                &[
-                    "RefreshLFGList",
-                    "SearchLFGJoin",
-                    "SearchLFGLeave",
-                    "SearchLFGSort",
-                ],
-            ),
-            (
-                "12340 verbs the stock windows call, each not built yet",
-                &[
-                    "CancelItemTempEnchantment",
-                    "CancelSummon",
-                    "ComplainChat",
-                    "ConsoleAddMessage",
-                    "DeclineInvite",
-                    "GameMovieFinished",
-                    "GetContainerFreeSlots",
-                    "GetGuildEventInfo",
-                    "GetItemSpell",
-                    "GetQuestLogItemDrop",
-                    "GetQuestPOILeaderBoard",
-                    "GetSpellLink",
-                    "GMReportLag",
-                    "GrantLevel",
-                    "IsEquippableItem",
-                    "IsEquippedItem",
-                    "IsSubZonePVPPOI",
-                    "IsTutorialFlagged",
-                    "PlayerCanTeleport",
-                    "QuestPOIUpdateIcons",
-                    "ReportPlayerIsPVPAFK",
-                    "ResetChatWindows",
-                    "SendSystemMessage",
-                    "SetChatColorNameByClass",
-                    "SetOptOutOfLoot",
-                    "SetTaxiBenchmarkMode",
-                    "SummonFriend",
-                    "UnitInRange",
-                    "UnitIsControlling",
-                    "UnitIsSameServer",
-                    "UpdateAddOnMemoryUsage",
                 ],
             ),
             (
@@ -2018,41 +1934,21 @@ mod tests {
             // ── The stock `UIParent.lua`'s listeners first, then the other files' ──
             ("ADDON_ACTION_BLOCKED", R_0),
             ("MACRO_ACTION_BLOCKED", R_0),
-            ("ARENA_OPPONENT_UPDATE", R_1),
-            ("ARENA_SEASON_WORLD_STATE", R_1),
-            ("CANCEL_SUMMON", R_1),
-            ("CHANNEL_INVITE_REQUEST", R_1),
-            ("CHANNEL_PASSWORD_REQUEST", R_1),
-            ("CHAT_MSG_RAID_BOSS_WHISPER", R_1),
-            ("DISABLE_TAXI_BENCHMARK", R_1),
-            ("ENABLE_TAXI_BENCHMARK", R_1),
             ("FRIENDLIST_SHOW", R_1),
-            ("GUILDTABARD_UPDATE", R_1),
-            ("GUILD_EVENT_LOG_UPDATE", R_1),
-            ("INSPECT_TALENT_READY", R_1),
             ("ITEM_UNLOCKED", R_1),
             ("MAIL_LOCK_SEND_ITEMS", R_1),
             ("MODIFIER_STATE_CHANGED", R_1),
             ("PARTY_CONVERTED_TO_RAID", R_1),
             ("PET_BAR_HIDE", R_1),
-            ("PET_RENAMEABLE", R_1),
             ("PET_SPELL_POWER_UPDATE", R_1),
-            ("PLAYER_DIFFICULTY_CHANGED", R_1),
             ("PLAYER_ENTERING_BATTLEGROUND", R_1),
             ("PLAYER_ROLES_ASSIGNED", R_1),
             ("RAISED_AS_GHOUL", R_1),
-            ("READY_CHECK_CONFIRM", R_1),
-            ("READY_CHECK_FINISHED", R_1),
-            ("TALENTS_INVOLUNTARILY_RESET", R_1),
             ("TRADE_POTENTIAL_BIND_ENCHANT", R_1),
-            ("UPDATE_CHAT_COLOR_NAME_BY_CLASS", R_1),
-            ("UPDATE_FLOATING_CHAT_WINDOWS", R_1),
-            ("UPDATE_LFG_LIST", R_1),
             ("UPDATE_SHAPESHIFT_COOLDOWN", R_1),
             ("UPDATE_SHAPESHIFT_FORM", R_1),
             ("UPDATE_SHAPESHIFT_USABLE", R_1),
             ("UPDATE_STEALTH", R_1),
-            ("VOTE_KICK_REASON_NEEDED", R_1),
             ("WORLD_STATE_UI_TIMER_UPDATE", R_1),
             ("WOW_MOUSE_NOT_FOUND", R_1),
             ("BN_BLOCK_LIST_UPDATED", R_2),
@@ -2089,7 +1985,6 @@ mod tests {
             ("MOVIE_COMPRESSING_PROGRESS", R_4),
             ("MOVIE_RECORDING_PROGRESS", R_4),
             ("MOVIE_UNCOMPRESSED_MOVIE", R_4),
-            ("PLAY_MOVIE", R_4),
             ("UNIT_", R_5),
             ("UNIT_MAX", R_5),
             ("VOICE_CHANNEL_STATUS_UPDATE", R_6),
@@ -2122,10 +2017,6 @@ mod tests {
                 "UIParent.lua — the internet-cafe billing nag, likewise never sent",
             ),
             (
-                "PLAYER_SKINNED",
-                "UIParent.lua — the corpse-skinned notice; benilla's loot feed does not derive it",
-            ),
-            (
                 "TRADE_REQUEST",
                 "UIParent.lua — the trade ASK dialog, and the one entry on this list that is \
                  UNPRODUCEABLE rather than unbuilt: the 5875 client registers the event and \
@@ -2133,11 +2024,6 @@ mod tests {
                  `0x11d`), so StaticPopupDialogs[\"TRADE\"] is \
                  dead code THERE too, and benilla leaves it unproduced: \
                  producing this would be a divergence, not a fix",
-            ),
-            (
-                "TRADE_REPLACE_ENCHANT",
-                "UIParent.lua — the enchant-replacement confirm inside a trade; benilla's trade \
-                 feed does not derive it",
             ),
             (
                 "CLOSE_WORLD_MAP",
@@ -2403,16 +2289,10 @@ mod tests {
     }
 
     /// 1.12.1 producers still to remove, each with what replaces it; the list only shrinks.
-    const STILL_1_12_EVENTS: &[(&str, &str)] = &[
-        (
-            "MEETINGSTONE_CHANGED",
-            "1.12.1's meeting-stone queue, on opcodes that are other packets in 12340 (#421)",
-        ),
-        (
-            "CONFIRM_PET_UNLEARN",
-            "1.12.1's pet trainer prompt: 12340 has no handler for 0x2F1 and no ConfirmPetUnlearn",
-        ),
-    ];
+    const STILL_1_12_EVENTS: &[(&str, &str)] = &[(
+        "CONFIRM_PET_UNLEARN",
+        "1.12.1's pet trainer prompt: 12340 has no handler for 0x2F1 and no ConfirmPetUnlearn",
+    )];
 
     /// Every event benilla fires exists in the 3.3.5a client: an event it can dispatch is a
     /// NUL-terminated string in `WoW.exe`, and a name missing there no stock listener can ever

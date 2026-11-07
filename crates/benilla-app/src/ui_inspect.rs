@@ -25,6 +25,9 @@ use crate::ui_script::UiFeed;
 #[derive(Resource, Default)]
 pub(crate) struct InspectTarget {
     pub(crate) token: Option<String>,
+    /// The guid `NotifyInspect` set (`0x52291a`), 0 after `ClearInspectPlayer`; the inspect
+    /// packets read their items only for it (`0x6ce08a`, `0x6ce0da`).
+    pub(crate) guid: u64,
 }
 
 /// `SMSG_INSPECT_TALENT`'s worn items of the last player inspected (`0x6cdf30`): their twelve
@@ -58,16 +61,43 @@ impl Plugin for InspectUiPlugin {
             .init_resource::<InspectFeedState>()
             .init_resource::<InspectWorn>()
             .net_handler(K::InspectItems, on_inspect_items)
+            .net_handler(K::InspectTalents, on_inspect_talents)
             .add_systems(Update, feed_inspect.in_set(UiFeed));
     }
 }
 
-fn on_inspect_items(In(ev): In<SessionEvent>, mut worn: ResMut<InspectWorn>) {
+fn on_inspect_items(
+    In(ev): In<SessionEvent>,
+    mut worn: ResMut<InspectWorn>,
+    target: Res<InspectTarget>,
+) {
     let SessionEvent::InspectItems { guid, items } = ev else {
         return;
     };
+    if guid != target.guid {
+        debug!("inspect: items for {guid:#x}, not the inspected player — skipped");
+        return;
+    }
     debug!("inspect: {} worn items for {guid:#x}", items.len());
     *worn = InspectWorn { guid, items };
+}
+
+/// `SMSG_INSPECT_TALENT`'s talents, for the inspected player alone (`0x6ce0da`).
+fn on_inspect_talents(
+    In(ev): In<SessionEvent>,
+    mut talents: ResMut<crate::ui_talent::InspectTalents>,
+    target: Res<InspectTarget>,
+) {
+    let SessionEvent::InspectTalents {
+        guid,
+        talents: info,
+    } = ev
+    else {
+        return;
+    };
+    if guid == target.guid {
+        talents.apply(info);
+    }
 }
 
 /// The inspected player's gem counts (`0x6de4d0`): meta, red, yellow and blue, each gem in a
@@ -167,6 +197,7 @@ fn feed_inspect(
     selection: Res<crate::target::Selection>,
     group: Res<crate::ui_party::GroupState>,
     worn: Res<InspectWorn>,
+    mut inspect_talents: ResMut<crate::ui_talent::InspectTalents>,
 ) {
     let Some(mut script) = script else {
         return;
@@ -175,21 +206,39 @@ fn feed_inspect(
     let memo = feed.vm.get(&script);
 
     // `NotifyInspect(unit)`: send `CMSG_INSPECT` for the unit's guid and latch its token.
-    for token in script.take_inspect_notifies() {
+    // `ClearInspectPlayer()`, from `InspectFrame_OnHide`: the resolve stops and the booth empties,
+    // in call order among the notifies, so a clear then a notify in one chunk keeps the target.
+    let notifies = script.take_inspect_notifies();
+    let clear_at = script.take_inspect_clear();
+    let notified = notifies.len();
+    // Each target change sets the inspected talent tabs from the player's class (`0x5c9f70`).
+    let class_of = |guid: u64| {
+        let store = stores.get(*index.0.get(&guid)?).ok()?;
+        Some((store.0.unit_race()?, store.0.unit_class()?))
+    };
+    for (i, token) in notifies.into_iter().enumerate() {
+        if clear_at == Some(i) {
+            target.token = None;
+            target.guid = 0;
+            inspect_talents.set_target(None);
+        }
         match crate::ui_unit::player_token_guid(&token, &selection, &group) {
             Some(guid) => {
                 debug!("inspect: {token:?} -> {guid:#x}; sending CMSG_INSPECT");
                 let _ = commands.0.send(ClientCommand::Inspect { target: guid });
                 target.token = Some(token);
+                target.guid = guid;
+                inspect_talents.set_target(class_of(guid));
             }
             None => {
                 debug!("inspect: {token:?} did not resolve to a player guid — nothing sent");
             }
         }
     }
-    // `ClearInspectPlayer()`, from `InspectFrame_OnHide`: the resolve stops and the booth empties.
-    if script.take_inspect_clear() {
+    if clear_at.is_some_and(|at| at >= notified) {
         target.token = None;
+        target.guid = 0;
+        inspect_talents.set_target(None);
     }
 
     // Re-resolve the latched token every frame, so the window follows a retarget as the

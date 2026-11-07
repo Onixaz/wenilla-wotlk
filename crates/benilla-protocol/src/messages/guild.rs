@@ -240,10 +240,12 @@ pub struct GuildQueryResponse {
     pub border_color: i32,
     /// Tabard background colour index. Signed, `-1` = no tabard designed.
     pub background_color: i32,
+    /// The record's last word (`0x75b472`), which AzerothCore fills with the ranks in use.
+    pub rank_count: u32,
 }
 
-/// Read `SMSG_GUILD_QUERY_RESPONSE` (`Server/Packets/Guild.cpp:118-131`): `u32` id, name, exactly
-/// ten rank-name cstrings with no count, then five `i32` tabard fields.
+/// Read `SMSG_GUILD_QUERY_RESPONSE` (`0x75b3e0`): `u32` id, name, exactly ten rank-name cstrings
+/// with no count, five `i32` tabard fields, then a `u32`.
 pub(super) fn read_guild_query_response(r: &mut impl Read) -> io::Result<GuildQueryResponse> {
     let guild_id = read_u32_le(r)?;
     let name = read_cstring(r)?;
@@ -260,6 +262,7 @@ pub(super) fn read_guild_query_response(r: &mut impl Read) -> io::Result<GuildQu
         border_style: read_u32_le(r)? as i32,
         border_color: read_u32_le(r)? as i32,
         background_color: read_u32_le(r)? as i32,
+        rank_count: read_u32_le(r)?,
     })
 }
 
@@ -366,6 +369,57 @@ pub(super) fn read_guild_permissions(r: &mut impl Read) -> io::Result<GuildPermi
 
 /// Body of the `MSG_GUILD_PERMISSIONS` ask: empty (`0x5caa40`).
 pub fn guild_permissions() -> Vec<u8> {
+    Vec::new()
+}
+
+/// The rows the guild event log keeps (`0x5ca6a0` caps the count at 100).
+pub const GUILD_EVENT_LOG_ROWS: usize = 100;
+
+/// One `MSG_GUILD_EVENT_LOG_QUERY` row: 1 invite, 2 join, 3 promote, 4 demote, 5 remove, 6 quit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GuildEventLogEntry {
+    pub kind: u8,
+    pub player1: u64,
+    /// 0 for a join or a quit, which carry no second guid.
+    pub player2: u64,
+    /// The new rank of a promote or demote, else 0.
+    pub rank: u8,
+    /// Seconds since the event.
+    pub age: u32,
+}
+
+/// Read the `MSG_GUILD_EVENT_LOG_QUERY` answer (`0x5ca6a0`): a `u8` count, capped at 100; per row
+/// a `u8` kind, a guid, a second guid but for join and quit, a rank byte for promote and demote,
+/// and the `u32` age.
+pub(super) fn read_guild_event_log(r: &mut impl Read) -> io::Result<Vec<GuildEventLogEntry>> {
+    let count = read_u8(r)?;
+    let mut rows = Vec::with_capacity(capacity_hint(count, GUILD_EVENT_LOG_ROWS));
+    for _ in 0..usize::from(count).min(GUILD_EVENT_LOG_ROWS) {
+        let kind = read_u8(r)?;
+        let player1 = read_u64_le(r)?;
+        let player2 = if matches!(kind, 2 | 6) {
+            0
+        } else {
+            read_u64_le(r)?
+        };
+        let rank = if matches!(kind, 3 | 4) {
+            read_u8(r)?
+        } else {
+            0
+        };
+        rows.push(GuildEventLogEntry {
+            kind,
+            player1,
+            player2,
+            rank,
+            age: read_u32_le(r)?,
+        });
+    }
+    Ok(rows)
+}
+
+/// Body of the `MSG_GUILD_EVENT_LOG_QUERY` ask: empty (`0x5cc470`).
+pub fn guild_event_log_query() -> Vec<u8> {
     Vec::new()
 }
 
@@ -484,21 +538,19 @@ pub(super) fn read_guild_command_result(r: &mut impl Read) -> io::Result<GuildCo
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GuildInfo {
     pub name: String,
-    pub created_day: u32,
-    pub created_month: u32,
-    pub created_year: u32,
+    /// The creation date, one packed date-time word (`0x76cb60`).
+    pub created: u32,
     pub member_count: u32,
     /// How many distinct accounts the members belong to.
     pub account_count: u32,
 }
 
-/// Read `SMSG_GUILD_INFO` (`Server/Packets/Guild.cpp:103-111`): the name, then five `u32`s.
+/// Read `SMSG_GUILD_INFO` (`0x6cc440`): the name, the packed creation date, the member and
+/// account counts.
 pub(super) fn read_guild_info(r: &mut impl Read) -> io::Result<GuildInfo> {
     Ok(GuildInfo {
         name: read_cstring(r)?,
-        created_day: read_u32_le(r)?,
-        created_month: read_u32_le(r)?,
-        created_year: read_u32_le(r)?,
+        created: read_u32_le(r)?,
         member_count: read_u32_le(r)?,
         account_count: read_u32_le(r)?,
     })
@@ -691,5 +743,49 @@ mod tests {
         assert_eq!(VIEW_OFFICER_NOTE | EMPTY, 0x0000_4040);
         assert_eq!(EDIT_OFFICER_NOTE | EMPTY, 0x0000_8040);
         assert_eq!(MODIFY_GUILD_INFO | EMPTY, 0x0001_0040);
+    }
+
+    #[test]
+    fn the_event_log_reads_each_kinds_fields() {
+        let mut b = vec![3u8];
+        // An invite: two guids.
+        b.push(1);
+        b.extend_from_slice(&0x10u64.to_le_bytes());
+        b.extend_from_slice(&0x20u64.to_le_bytes());
+        b.extend_from_slice(&60u32.to_le_bytes());
+        // A join: one guid.
+        b.push(2);
+        b.extend_from_slice(&0x20u64.to_le_bytes());
+        b.extend_from_slice(&50u32.to_le_bytes());
+        // A promote: two guids and the rank.
+        b.push(3);
+        b.extend_from_slice(&0x10u64.to_le_bytes());
+        b.extend_from_slice(&0x20u64.to_le_bytes());
+        b.push(2);
+        b.extend_from_slice(&40u32.to_le_bytes());
+        let rows = read_guild_event_log(&mut b.as_slice()).unwrap();
+        let row = |kind, player1, player2, rank, age| GuildEventLogEntry {
+            kind,
+            player1,
+            player2,
+            rank,
+            age,
+        };
+        assert_eq!(
+            rows,
+            [
+                row(1, 0x10, 0x20, 0, 60),
+                row(2, 0x20, 0, 0, 50),
+                row(3, 0x10, 0x20, 2, 40)
+            ]
+        );
+        // A count past 100 reads 100 rows.
+        let mut b = vec![101u8];
+        for _ in 0..101 {
+            b.push(2);
+            b.extend_from_slice(&1u64.to_le_bytes());
+            b.extend_from_slice(&0u32.to_le_bytes());
+        }
+        assert_eq!(read_guild_event_log(&mut b.as_slice()).unwrap().len(), 100);
     }
 }

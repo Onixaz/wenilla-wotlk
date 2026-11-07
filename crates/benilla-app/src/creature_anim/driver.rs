@@ -30,9 +30,10 @@ use super::select::{
 };
 use super::sheath::{advance_sheath_ceremony, start_sheath_ceremony};
 use super::{
-    find_resolved, move_flags, AnimData, AnimDriver, AutoRepeatArmed, BaseAnimRecompute, CastHold,
-    DefenseAnim, EmoteAnim, Engaged, MovementState, NockLatch, Overlay, OverlayFade, SheathRequest,
-    SheathSwapMessage, SwingImpact, SwingMessage, SwingSlowdown, UnitAnimRng, Wielded, WoundAnim,
+    find_resolved, move_flags, resolved_id, routed_behavior, AnimData, AnimDriver, AutoRepeatArmed,
+    BaseAnimRecompute, CastHold, DefenseAnim, EmoteAnim, Engaged, MovementState, NockLatch,
+    Overlay, OverlayFade, SheathRequest, SheathSwapMessage, SwingImpact, SwingMessage,
+    SwingSlowdown, UnitAnimRng, Wielded, WoundAnim,
 };
 
 mod grip;
@@ -273,6 +274,8 @@ type UnitData = (
         &'static mut UnitAnimRng,
         // A seated passenger's ride pose (`0x747b20`).
         Option<&'static crate::vehicle::SeatPose>,
+        // Created by update type 3: the stand-state seed its first pass reads.
+        Has<crate::net::FreshSpawn>,
     ),
 );
 
@@ -289,6 +292,7 @@ type HostData = (
     &'static Transform,
     // Read only by the debug trace.
     Has<SelfPlayer>,
+    Has<benilla_world::model_fade::DespawnFade>,
 );
 
 /// The per-unit animation state machine: death overrides; otherwise Specials as bracketed loops,
@@ -298,7 +302,8 @@ type HostData = (
 #[allow(clippy::type_complexity)]
 pub(super) fn drive_animations(
     par_commands: ParallelCommands,
-    mut units: Query<UnitData>,
+    // A fading model plays on with its object gone (`0x7823e6`): no driver picks for it.
+    mut units: Query<UnitData, Without<benilla_world::model_fade::DespawnFade>>,
     // A mount child's movement view is its host's, fetched through `MountBody.host`.
     mount_hosts: Query<HostData>,
     mut swings: MessageReader<SwingMessage>,
@@ -323,7 +328,7 @@ pub(super) fn drive_animations(
         // Read for `DO_NOT_PLAY_WOUND_ANIM`; a missing cache reads as an unreceived template.
         Option<Res<crate::names::NameCache>>,
         MessageReader<BaseAnimRecompute>,
-        // A rider's mount child, where a mount-set request goes.
+        // A rider's mount child, where a full-set request goes.
         Query<(&ObjectStore, &crate::entities::mount::MountChild)>,
         // The open NPC session's unit: its state emote is passed over when the row's `EmoteFlags`
         // carry `0x2000`.
@@ -401,9 +406,11 @@ pub(super) fn drive_animations(
             e.seq,
         ));
     }
-    // A mounted rider's mount-set emotes go to the mount model; the rider keeps the request for its
-    // own CLASS_A and nowhere routes. The emote player's armed test runs once, on the rider, ahead
-    // of that routing, so the forwarded copy carries none.
+    // `None` until `AnimationData.dbc` loads; every lookup then resolves to itself.
+    let catalog = anim_data.as_deref().map(|d| &d.0);
+    // A mounted rider's full-set emotes go to the mount model; the rider keeps the request for its
+    // own upper set and nowhere routes. The emote player's armed test runs once, on the rider,
+    // ahead of that routing, so the forwarded copy carries none.
     let mut to_mount: Vec<(Entity, (OneShotReq, u64))> = Vec::new();
     for (rider, reqs) in pending.iter() {
         let Ok((store, child)) = riders.get(*rider) else {
@@ -416,7 +423,10 @@ pub(super) fn drive_animations(
             let OneShotReq::Emote(id, via_player, remap) = req else {
                 continue;
             };
-            if !route_mounted(id).mount {
+            let behavior = units
+                .get(*rider)
+                .map_or(id, |u| routed_behavior(u.1, id, catalog));
+            if !route_mounted(behavior).mount {
                 continue;
             }
             let armed = via_player
@@ -457,8 +467,6 @@ pub(super) fn drive_animations(
     for r in sheath_requests.read() {
         pending_sheath.insert(r.entity, *r);
     }
-    // `None` until `AnimationData.dbc` loads; every lookup then resolves to itself.
-    let catalog = anim_data.as_deref().map(|d| &d.0);
     // `WOW_ANIM_COST=1` counts the frame's resting rows, the ones an input memo could skip; no skip
     // is taken, as a parked rig's wake pose still needs the right clip armed.
     let anim_cost = anim_cost_enabled();
@@ -525,6 +533,13 @@ struct UnitCx<'a, 'w, 's> {
     anim_trace_last: &'a Mutex<HashMap<Entity, String>>,
 }
 
+/// The `fct` trace's line for a CREATE_OBJECT2 creature's first pass.
+fn trace_spawn_seed(entity: Entity, what: &str) {
+    if benilla_assets::trace::enabled_for("fct") {
+        benilla_assets::trace::line("fct", &format!("anim spawn seed unit={entity} {what}"));
+    }
+}
+
 /// One unit's frame of [`drive_animations`], in the reference's phase order.
 fn drive_unit(
     cx: &UnitCx,
@@ -580,8 +595,13 @@ fn drive_unit(
             aura_nodes,
             mut unit_rng,
             seat_pose,
+            fresh_spawn,
         ),
     ) = item;
+    // A mount fades with its host, so it plays on with it too.
+    if mount_body.is_some_and(|mb| mount_hosts.get(mb.host).is_ok_and(|host| host.9)) {
+        return;
+    }
     let rng = unit_rng
         .bypass_change_detection()
         .stream(session_rng, entity);
@@ -600,7 +620,7 @@ fn drive_unit(
         ridden_by_self,
     ) = match mount_body {
         Some(mb) => match mount_hosts.get(mb.host) {
-            Ok((s, r, m, sp, f, sw, md, t, host_self)) => {
+            Ok((s, r, m, sp, f, sw, md, t, host_self, _)) => {
                 (s, r, m, sp, f, sw, md, t.scale.x, host_self)
             }
             Err(_) => (None, None, None, None, None, false, None, 1.0, false),
@@ -713,6 +733,11 @@ fn drive_unit(
     let relaxed = !select::arm_forces_head(engaged, cast_hold.is_some(), outgoing);
 
     wound_upkeep(entity, &mut drv, &mut player);
+
+    // The stand-state seed lasts one pass (`0x73acf1`), this one.
+    if fresh_spawn {
+        commands.entity(entity).remove::<crate::net::FreshSpawn>();
+    }
 
     // Death overrides every state: play Death and hold.
     if dead {
@@ -870,6 +895,19 @@ fn drive_unit(
         swaps,
     );
 
+    // The split test's inputs. A facing ease ([`FacingStep`]) stands for the turn latch, which the
+    // reference sets out of movement and at stand state 0.
+    let split = select::SplitState {
+        flags: mv.flags,
+        stand_state: mv.stand_state,
+        turn_latch: facing_step.is_some()
+            && mv.flags & move_flags::TURN_LATCH_VOID == 0
+            && mv.stand_state == 0,
+        falling: airborne_frozen,
+        cast_anim: cast_hold.is_some(),
+        channeling: store.is_some_and(|s| s.0.unit_channel_spell() != 0),
+        attacking: engaged,
+    };
     // ── This frame's one-shots, each routed per play from live state (`route_oneshot`): masked
     // onto the SpineLow overlay beside `mode`, or full-body on the base track. A wound is a
     // per-bone secondary that a blended arm on the same bone overwrites (op4 copies over
@@ -1013,16 +1051,18 @@ fn drive_unit(
             }
             continue;
         }
-        // A mounted rider plays only its CLASS_A ids, on the key bone, and nothing else; a mount
-        // child plays the clip on its own bone 0.
+        // A mounted rider plays only its upper-set ids off the full set, on the key bone, and
+        // nothing else; a mount child plays the clip on its own bone 0.
+        let resolved = resolved_id(anims, id, catalog);
+        let behavior = select::behavior_of(resolved, catalog);
         let masked = if mounted {
-            if !route_mounted(id).rider_upper {
+            if !route_mounted(behavior).rider_upper {
                 continue;
             }
             true
         } else {
             mount_body.is_none()
-                && route_oneshot(id, mv.flags, mv.stand_state) == OneShotRoute::Masked
+                && route_oneshot(resolved, behavior, &split) == OneShotRoute::Masked
         };
         // Resolve to a clip this model has, roll its variation and its replay budget (a clamp
         // one-shot authored `(min,max)` plays R times).
@@ -1199,6 +1239,54 @@ fn drive_unit(
         && (mv.flags != drv.gait_flags || !matches!(drv.mode, Mode::Gait | Mode::Swing { .. }))
     {
         drv.interact_hold = false;
+    }
+
+    // A CREATE_OBJECT2 creature's first pass, its previous stand state seeded past the last
+    // (`0x740068`): Birth when the model owns it (`0x716fe5`), else a pose it streams in with
+    // starts at its loop, not its way down (`0x71e22a`). Death and a mount outrank both.
+    if fresh_spawn && !mounted && matches!(drv.mode, Mode::Gait) {
+        let drv = &mut *drv;
+        if anims.owns(select::BIRTH) {
+            play::play(
+                &mut drv.base_lock,
+                &mut tr,
+                &mut player,
+                anims,
+                select::BIRTH,
+                false,
+                false,
+                1.0,
+                catalog,
+                rng,
+                &mut drv.loop_window,
+            );
+            drv.mode = Mode::Swing {
+                id: select::BIRTH,
+                under: None,
+            };
+            drv.gait = None;
+            drv.gait_flags = mv.flags;
+            trace_spawn_seed(entity, "birth");
+        } else if let Some(sp @ select::Special::Pose(_)) = special {
+            play::play(
+                &mut drv.base_lock,
+                &mut tr,
+                &mut player,
+                anims,
+                sp.loop_id(),
+                true,
+                relaxed,
+                1.0,
+                catalog,
+                rng,
+                &mut drv.loop_window,
+            );
+            drv.mode = Mode::Looping(sp);
+            drv.gait = None;
+            trace_spawn_seed(entity, "pose loop");
+        } else {
+            trace_spawn_seed(entity, "no birth, no pose");
+        }
     }
 
     // ── The mode machine: the base track's decision.
