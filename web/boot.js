@@ -290,8 +290,11 @@ function createBootUi() {
       #wenilla-boot .bar { height: 6px; background: #222; border-radius: 3px; overflow: hidden; }
       #wenilla-boot .bar > i { display: block; height: 100%; width: 0; background: #c9a227;
         border-radius: 3px; transition: width .15s linear; }
-      #wenilla-boot .bar.pulse > i { width: 30% !important; animation: wboot-slide 1.2s ease-in-out infinite; }
-      @keyframes wboot-slide { 0% { margin-left: 0 } 50% { margin-left: 70% } 100% { margin-left: 0 } }
+      #wenilla-boot .bar.pulse > i { width: 30% !important; will-change: transform;
+        animation: wboot-slide 1.2s ease-in-out infinite; }
+      /* A transform runs on the compositor: "Starting…" is the client's long first frame, which
+         holds the main thread. 233.33% of the fill's own 30% is 70% of the bar. */
+      @keyframes wboot-slide { 0%, 100% { transform: translateX(0) } 50% { transform: translateX(233.33%) } }
       #wenilla-boot .data { margin-top: .5rem; text-align: center; font-size: 12px; color: #888;
         min-height: 1.2em; }
       #wenilla-boot .err { color: #e07070; text-align: center; }
