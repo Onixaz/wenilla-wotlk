@@ -14,8 +14,14 @@
 //     later reader (a fetch ahead); without it the reader takes them (memory → consumed).
 //   - `prefetch(names)` is `load` with `keep` at low priority, so fetches ahead never crowd out
 //     a read something is waiting on.
-//   - `reading()` counts the `load`s without `keep` still waiting: the client's own reads, which
-//     the page's cover waits on so a screen is not shown before its art.
+//   - `ready(names)` (sync) says whether a frame can read `names` now, and otherwise starts them:
+//     the caller draws without them and asks again next frame, so a miss costs a late image and
+//     not a frozen frame. A name that cannot arrive answers true, and its read fails as it would.
+//   - `dropAhead()` forgets the fetches ahead of the player not yet sent: the character select's
+//     tiles when the selection moves on. `landed()` counts the files answered so far, the one
+//     live measure of a load whose size nobody knows until its parents have landed.
+//   - `reading()` counts the `load`s without `keep` and the `ready` names still waiting: the
+//     client's own reads, which the page's cover waits on so a screen is not shown before its art.
 //
 // The network is batched: every name that misses memory and the persistent cache within one
 // task joins a `POST /data/__batch`, which answers many files in one response, streamed file by
@@ -32,6 +38,7 @@ const DEFAULT_BUDGET = 384 * 1024 * 1024;
 const LEARNED_KEY = 'wenilla:data:learned';
 const LEARNED_MAX = 6000;
 const CACHE_PREFIX = 'wenilla-data-';
+const DROPPED = new Error('fetch ahead dropped');
 
 /// The MPQ-equivalence key: lowercase, backslash-separated.
 export function dataKey(name) {
@@ -54,6 +61,9 @@ export function createStore(opts = {}) {
   let phase = 'boot';
   let learnedDirty = false;
   let reading = 0;
+  let answered = 0;
+  const arriving = new Set(); // keys `ready` is waiting on
+  const settled = new Set(); // keys `ready` asked for that did not land: never asked for again
   const stats = {
     memHits: 0, getMisses: 0, joined: 0, cacheHits: 0, network: 0, networkBytes: 0,
     batches: 0, notFound: 0, errors: 0, evicted: 0,
@@ -125,13 +135,13 @@ export function createStore(opts = {}) {
         return new Uint8Array(await hit.arrayBuffer());
       }
     }
-    const bytes = await net.request(f.key, f.priority);
+    const bytes = await net.request(f.key, f.priority, f.ahead);
     // A Response built from bytes copies them, so they stay ours.
     if (bytes && cache) cache.put(url, new Response(bytes)).catch(() => {});
     return bytes;
   }
 
-  function flight(key, priority) {
+  function flight(key, priority, ahead) {
     let f = flights.get(key);
     if (f) {
       stats.joined += 1;
@@ -141,7 +151,7 @@ export function createStore(opts = {}) {
       }
       return f;
     }
-    f = { key, priority, keep: false, consumers: 0 };
+    f = { key, priority, ahead, keep: false, consumers: 0 };
     f.promise = new Promise((resolve, reject) => {
       f.resolve = resolve;
       f.reject = reject;
@@ -151,6 +161,7 @@ export function createStore(opts = {}) {
     fetchBytes(f).then(
       (bytes) => {
         flights.delete(key);
+        if (bytes !== null) answered += 1;
         if (bytes === null) {
           missing.add(key);
           stats.notFound += 1;
@@ -161,7 +172,7 @@ export function createStore(opts = {}) {
       },
       (err) => {
         flights.delete(key);
-        stats.errors += 1;
+        if (err !== DROPPED) stats.errors += 1;
         f.reject(err);
       },
     );
@@ -169,14 +180,15 @@ export function createStore(opts = {}) {
   }
 
   /// The bytes for `name`: `Uint8Array`, or `null` when the host has no such file.
-  function load(name, { priority = 'high', keep = false } = {}) {
+  function load(name, { priority = 'high', keep = false, ahead = false } = {}) {
     const key = dataKey(name);
     if (mem.has(key)) {
       stats.memHits += 1;
+      answered += 1;
       return Promise.resolve(take(key, keep));
     }
     if (missing.has(key)) return Promise.resolve(null);
-    const f = flight(key, priority);
+    const f = flight(key, priority, ahead);
     if (keep) {
       f.keep = true;
     } else {
@@ -190,12 +202,34 @@ export function createStore(opts = {}) {
     return f.promise;
   }
 
+  /// Whether every name is in memory now; those that are not start at high priority, kept for
+  /// the read that follows. A miss is learned for the next visit, as `get`'s is.
+  function ready(names) {
+    let all = true;
+    for (const name of names) {
+      const key = dataKey(name);
+      if (mem.has(key) || missing.has(key) || settled.has(key)) continue;
+      all = false;
+      if (arriving.has(key)) continue;
+      arriving.add(key);
+      reading += 1;
+      learn(name);
+      const landed = () => {
+        arriving.delete(key);
+        reading -= 1;
+        if (!mem.has(key)) settled.add(key);
+      };
+      load(name, { priority: 'high', keep: true }).then(landed, landed);
+    }
+    return all;
+  }
+
   /// Fetch `names` ahead into memory; resolves when every one has landed or failed.
-  function prefetch(names, { priority = 'low', onProgress } = {}) {
+  function prefetch(names, { priority = 'low', ahead = false, onProgress } = {}) {
     const list = Array.from(names ?? []);
     let done = 0;
     const one = (n) =>
-      load(n, { priority, keep: true })
+      load(n, { priority, keep: true, ahead })
         .catch(() => null)
         .then(() => {
           done += 1;
@@ -242,6 +276,9 @@ export function createStore(opts = {}) {
     prefetch,
     has: (name) => mem.has(dataKey(name)),
     reading: () => reading,
+    ready,
+    landed: () => answered,
+    dropAhead: () => net.dropAhead(),
     /// The names synchronous reads missed on earlier visits during `phase`.
     learned: (p) => Array.from(learnedMap).filter(([, ph]) => ph === p).map(([n]) => n),
     /// Name the phase later misses are learned under (`boot`, then `world` once the glue is up).
@@ -260,11 +297,11 @@ function createBatcher({ base, fetchFn, urlFor, stats, maxNames, maxBatches, max
   let scheduled = false;
   let batching = true; // false once the host answers that it has no batch route
 
-  function request(key, priority) {
+  function request(key, priority, ahead) {
     // The host's own routes (`__index`, …) are not chain files: always a plain GET.
     if (!batching || key.startsWith('__')) return single(key, priority);
     return new Promise((resolve, reject) => {
-      const e = { key, priority: priority === 'low' ? 'low' : 'high', resolve, reject };
+      const e = { key, priority: priority === 'low' ? 'low' : 'high', ahead, resolve, reject };
       queues[e.priority].push(e);
       queued.set(key, e);
       schedule();
@@ -278,6 +315,15 @@ function createBatcher({ base, fetchFn, urlFor, stats, maxNames, maxBatches, max
     e.priority = 'high';
     queues.high.push(e);
     schedule();
+  }
+
+  // Fetches ahead still queued go; a reader waiting on one promoted it out of the low queue.
+  function dropAhead() {
+    for (const e of queues.low.filter((x) => x.ahead)) {
+      queued.delete(e.key);
+      e.reject(DROPPED);
+    }
+    queues.low = queues.low.filter((x) => !x.ahead);
   }
 
   // One task's requests gather before a batch goes out: a frame's loads arrive together.
@@ -358,6 +404,7 @@ function createBatcher({ base, fetchFn, urlFor, stats, maxNames, maxBatches, max
   return {
     request,
     promote,
+    dropAhead,
     state: () => ({
       queuedHigh: queues.high.length,
       queuedLow: queues.low.length,

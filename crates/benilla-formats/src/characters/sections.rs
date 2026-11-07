@@ -298,6 +298,17 @@ pub struct CompositePlan {
 }
 
 impl CompositePlan {
+    /// Every file [`Self::run`] may read: the base skin and each overlay's candidates.
+    pub fn paths(&self) -> Vec<String> {
+        std::iter::once(self.base.clone())
+            .chain(
+                self.layers
+                    .iter()
+                    .flat_map(|(paths, _)| paths.iter().cloned()),
+            )
+            .collect()
+    }
+
     /// Read, decode and blit at `side`, the bake's `1 << componentTextureLevel` (`0x4f1a20`): the
     /// base skin's levels above it drop, every section rect scales to it as the reference shifts
     /// its 512²-authored rects right by `9 - level`, and each overlay pastes at every level left

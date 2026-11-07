@@ -165,6 +165,7 @@ const PUBLISHED: &[(&str, &str)] = &[
     ("terrain_stream::TerrainOptions", "record"),
     ("terrain_stream::ViewFocus", "record"),
     ("terrain_stream::WorldLoadProgress", "wall"),
+    ("terrain_stream::entry_files", "record"),
     ("thread_qos::QosClass", "record"),
     ("thread_qos::ThreadQosPlugin", "wall"),
     ("thread_qos::promote_current_thread", "record"),

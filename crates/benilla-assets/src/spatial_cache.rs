@@ -59,6 +59,11 @@ impl<K: Eq + Hash, V> SpatialCache<K, V> {
         self.map.clear();
     }
 
+    /// Whether `key` is held, without counting a use.
+    pub fn contains(&self, key: &K) -> bool {
+        self.map.contains_key(key)
+    }
+
     /// Fetch a value, counting the hit as a use. It clones out so the miss path can insert in the
     /// same expression.
     pub fn fetch(&mut self, key: &K) -> Option<V>

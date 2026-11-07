@@ -188,6 +188,10 @@ fn build_skybox(
     let Some(mut world_assets) = world_assets else {
         return; // assetless run: the gradient dome stays the backdrop
     };
+    // On the page the sky's files arrive first: retry, without latching `built`.
+    if !benilla_formats::web::ready_tree(path) {
+        return;
+    }
     // The model's rigid spins by bone; none under a deterministic run, which keeps bind poses.
     let spins = if crate::dev_state::deterministic_run() {
         Default::default()

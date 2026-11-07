@@ -42,7 +42,7 @@ fn is_wmo_group(lower: &str) -> bool {
 }
 
 /// A model reference (`.mdx`/`.mdl`, as ADTs and WMOs write them) as its archive `.m2` name.
-fn model_name(raw: &str) -> String {
+pub(crate) fn model_name(raw: &str) -> String {
     let lower = raw.to_ascii_lowercase();
     match lower.rsplit_once('.') {
         Some((stem, "mdx" | "mdl" | "m2")) => format!("{stem}.m2"),

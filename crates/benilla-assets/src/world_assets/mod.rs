@@ -33,6 +33,11 @@ pub struct WorldAssets {
     pub textures: SpatialCache<(String, bool, bool), Handle<Image>>,
     /// UI sprites by resolved path, released once nothing shows them ([`SpriteCache`]).
     sprites: SpriteCache<String>,
+    /// Sprite paths [`Self::sprite_landed`] has seen in memory: the UI asks per quad per frame, so
+    /// a landed path never goes back to the page.
+    landed_sprites: std::collections::HashSet<String>,
+    /// A quad went without its sprite this frame ([`Self::take_sprite_wait`]).
+    sprite_wait: bool,
     /// UI sprites by path and per-axis wrap, since the sampler bakes into the `Image`.
     tiled_sprites: SpriteCache<(String, bool, bool)>,
     /// Sprites resampled to an exact physical size, by `(path, w, h)`.
@@ -264,6 +269,8 @@ impl WorldAssets {
             chain: Arc::new(Mutex::new(chain)),
             textures: SpatialCache::default(),
             sprites: SpriteCache::default(),
+            landed_sprites: Default::default(),
+            sprite_wait: false,
             resampled_sprites: HashMap::new(),
             resample_sources: HashMap::new(),
             tiled_sprites: SpriteCache::default(),
@@ -319,6 +326,42 @@ impl WorldAssets {
         let handle = images.add(repeat_texture_authored(crate::for_upload(chain), wrap));
         self.textures.insert(key, handle.clone());
         Some(handle)
+    }
+
+    /// Whether a sprite can decode this frame without a blocking read: always natively. On the
+    /// page a miss starts the file and the quad skips the frame, so a first-seen image arrives a
+    /// round trip late instead of freezing the game. Only for a caller that asks every frame, as
+    /// [`Self::sprite_texture`] caches its answer.
+    pub fn sprite_landed(&mut self, path: &str) -> bool {
+        if cfg!(not(target_arch = "wasm32")) || self.landed_sprites.contains(path) {
+            return true;
+        }
+        let landed = benilla_formats::web::ready(&sprite_candidates(path));
+        if landed {
+            self.landed_sprites.insert(path.to_string());
+        } else {
+            self.sprite_wait = true;
+        }
+        landed
+    }
+
+    /// Whether a quad went without its sprite since the last call: the UI's conversion is cached
+    /// on its inputs, so it must run again until the sprite lands.
+    pub fn take_sprite_wait(&mut self) -> bool {
+        std::mem::take(&mut self.sprite_wait)
+    }
+
+    /// [`Self::sprite_texture`] once [`Self::sprite_landed`], for a caller that asks every frame.
+    pub fn sprite_when_landed(
+        &mut self,
+        path: &str,
+        images: &mut Assets<Image>,
+    ) -> Option<Handle<Image>> {
+        if self.sprite_landed(path) {
+            self.sprite_texture(path, images)
+        } else {
+            None
+        }
     }
 
     /// A clamp-sampled sRGB sprite, mip 0 only: the celestial discs and every UI quad.

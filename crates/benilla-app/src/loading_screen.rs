@@ -41,6 +41,15 @@ const FILL_LEFT: f32 = 0.2375; // 0.5 − 0.525·0.5
 const FILL_BOTTOM: f32 = 0.0625; // 0.075 − 0.025·0.5
 const FILL_HEIGHT: f32 = 0.025;
 const FILL_MAX_WIDTH: f32 = 0.525; // halfW; fill width = progress · FILL_MAX_WIDTH
+/// On the page the files behind residency download first, and residency's total grows with them
+/// (16 tiles, then thousands of placements), so its ratio stands still and then overshoots. Arrivals
+/// carry the bar, approaching this share of it; residency finishes it once the scene is ready.
+#[cfg(target_arch = "wasm32")]
+const ARRIVAL_SHARE: f32 = 0.9;
+/// Files landed at which arrivals are 63 % of [`ARRIVAL_SHARE`]; an open-country entry reads about
+/// 3,600 and Dalaran about 7,100, and the load's size is unknown until its parents have landed.
+#[cfg(target_arch = "wasm32")]
+const ARRIVAL_SCALE: f32 = 1500.0;
 
 /// The glue and loading screens are authored 4:3; on a wider window the reference fits them to
 /// height and pillarboxes. The square BLP is stretched to this aspect.
@@ -152,6 +161,9 @@ pub(crate) struct LoadingScreen {
     ready_frames: u32,
     /// Bar fill, 0..1, monotonic within a load: the raw residency ratio dips as the view moves.
     displayed: f32,
+    /// The page's landed-file count at the raise: arrivals count from here.
+    #[cfg(target_arch = "wasm32")]
+    landed_at_raise: f64,
     /// Decoded backdrop art by BLP path.
     art_cache: HashMap<String, Handle<Image>>,
     /// Which tip the next raise carries, taken by [`crate::game_tip::drive_game_tip`].
@@ -207,6 +219,10 @@ impl LoadingScreen {
         self.map = map;
         self.ready_frames = 0;
         self.displayed = 0.0; // restart the fill for the new load
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.landed_at_raise = benilla_formats::web::landed();
+        }
         self.active_since = now;
         self.last_wait_log = now;
         info!("loading screen: up ({reason}, map {map:?})");
@@ -583,7 +599,7 @@ fn drive_loading_screen(
                 info!(
                     "loading screen: waiting {:.1}s — {}/{} resident, {} placements pending, \
                      {} colliders pending, {} merges pending, awaiting_snap={}, settling={}, \
-                     warm={}, ui_pending={}",
+                     warm={}, ui_pending={}, bar={:.0}%",
                     now - screen.active_since,
                     progress.ready,
                     progress.total,
@@ -594,6 +610,7 @@ fn drive_loading_screen(
                     player_settling,
                     warm.satisfied(),
                     entry_ui_pending.is_some(),
+                    screen.displayed * 100.0,
                 );
             }
         }
@@ -665,6 +682,14 @@ fn drive_loading_screen(
         }
     }
 
+    // --- On the page, the files arriving show from the first frame, snap or no snap. ---
+    #[cfg(target_arch = "wasm32")]
+    if screen.active {
+        let landed = (benilla_formats::web::landed() - screen.landed_at_raise) as f32;
+        let arrived = ARRIVAL_SHARE * (1.0 - (-landed / ARRIVAL_SCALE).exp());
+        screen.displayed = screen.displayed.max(arrived);
+    }
+
     // --- Progress bar: zero until the snap lands (residency is still the old place's). ---
     if !screen.awaiting_snap {
         // The sliced in-game UI load is part of what the screen waits for (its clear condition
@@ -674,6 +699,7 @@ fn drive_loading_screen(
         // Natively the load is one-shot, so the bar is residency alone, as in HEAD.
         #[cfg(target_arch = "wasm32")]
         let fraction = match entry_ui_pending.as_deref() {
+            _ if !progress.scene_ready => 0.0,
             Some(ui) => 0.8 * progress.fraction() + 0.2 * ui.fraction(),
             None => progress.fraction(),
         };

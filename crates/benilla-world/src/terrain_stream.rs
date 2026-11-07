@@ -37,6 +37,7 @@ mod spawn;
 mod weld;
 pub(crate) mod window;
 
+pub use ahead::entry_files;
 use collider::{finish_colliders, impassable_wall_data, terrain_collider_data};
 use furnish::furnish_tile_cells;
 use merge::{flush_static_merge, StaticMerge};

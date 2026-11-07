@@ -276,6 +276,8 @@ pub(super) struct GateInputs {
     portraits: std::collections::HashMap<String, crate::portrait::PortraitSource>,
     /// The `UiFontAtlas::generation` the held glyph UVs came from; it moves only on a reset.
     generation: Option<u64>,
+    /// Frames a quad spent waiting on its sprite, added to [`Self::generation`].
+    sprite_waits: u64,
     /// The paint-only write count `extracted` reflects ([`UiScript::paint_epoch`]): moved with
     /// the mutation count standing, the script patches `extracted` instead of walking.
     paint: Option<u64>,
@@ -745,6 +747,12 @@ pub(super) fn paint_script(
     let extract_span = bevy::log::info_span!("ui_script: extract").entered();
     let mut out = Vec::new();
     let mut assets = world_assets;
+    // A quad waiting on its sprite changed nothing the gate below sees: moving the generation
+    // reruns the conversion, every frame until it lands.
+    if assets.as_mut().is_some_and(|a| a.take_sprite_wait()) {
+        prev.sprite_waits += 1;
+    }
+    let generation = generation.map(|g| g.wrapping_add(prev.sprite_waits));
     let mut minimap_slot = None;
     // Message lines' link spans for the click hit-test; region FontStrings' are not collected.
     let mut link_spans: Vec<(
@@ -1167,7 +1175,7 @@ pub(super) fn paint_script(
         if let (Some(texture), Some(pos)) = (texture, window.cursor_position()) {
             if let Some(handle) = assets
                 .as_mut()
-                .and_then(|a| a.sprite_texture(&texture, &mut images))
+                .and_then(|a| a.sprite_when_landed(&texture, &mut images))
             {
                 out.push(cursor_icon_quad(pos, handle));
             }
@@ -1444,7 +1452,9 @@ fn convert_entry(
             let (handle, premultiplied) = match booths.images.0.get(slot) {
                 Some(PortraitSource::Live(h)) => (Some(h.clone()), true),
                 Some(PortraitSource::File(p)) => (
-                    assets.as_mut().and_then(|a| a.sprite_texture(p, images)),
+                    assets
+                        .as_mut()
+                        .and_then(|a| a.sprite_when_landed(p, images)),
                     false,
                 ),
                 None => (None, false),
@@ -1489,7 +1499,9 @@ fn convert_entry(
                 let (handle, premultiplied) = match booths.images.0.get(token) {
                     Some(PortraitSource::Live(h)) => (Some(h.clone()), true),
                     Some(PortraitSource::File(p)) => (
-                        assets.as_mut().and_then(|a| a.sprite_texture(p, images)),
+                        assets
+                            .as_mut()
+                            .and_then(|a| a.sprite_when_landed(p, images)),
                         false,
                     ),
                     None => (None, false),
@@ -1538,6 +1550,10 @@ fn convert_entry(
             let wrap = tiling_axes(&uv);
             let handle = match (path.as_deref(), assets.as_mut()) {
                 (Some(p), Some(a)) => {
+                    // Still on its way: the cell stays empty until it lands.
+                    if !a.sprite_landed(benilla_ui::script::emblem_mask_path(p).unwrap_or(p)) {
+                        return;
+                    }
                     let resolved = if p == benilla_ui::script::nameplate::BORDER_TEXTURE {
                         // Where the frame system painted the plate, beside the driver's `vpl` line.
                         if benilla_assets::trace::enabled_for("vpl") {
@@ -1645,7 +1661,9 @@ fn convert_entry(
             // A backdrop piece, the bg or one of the 8 border pieces, sampled `Repeat` when `tile`;
             // its UVs are per-corner, as the TOP and BOTTOM edges are rotated.
             let handle = assets.as_mut().and_then(|a| {
-                if tile {
+                if !a.sprite_landed(&path) {
+                    None
+                } else if tile {
                     a.sprite_texture_tiled(&path, images)
                 } else {
                     a.sprite_texture(&path, images)

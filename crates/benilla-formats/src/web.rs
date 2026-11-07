@@ -46,6 +46,19 @@ pub fn index_key(name: &str) -> String {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn prefetch_parents<I: IntoIterator<Item = String>>(_names: I) {}
 
+/// Whether a frame can read `names` without blocking; on the page, those that cannot start
+/// arriving and the caller asks again next frame. Off the page every read is local.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn ready(_names: &[String]) -> bool {
+    true
+}
+
+/// [`ready`] for `name` and the files its loader reads after it ([`crate::web_deps`]).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn ready_tree(_name: &str) -> bool {
+    true
+}
+
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use wasm_bindgen::JsValue;
@@ -152,6 +165,9 @@ mod wasm {
         get: js_sys::Function,
         load: js_sys::Function,
         prefetch: js_sys::Function,
+        ready: js_sys::Function,
+        landed: js_sys::Function,
+        drop_ahead: js_sys::Function,
     }
 
     thread_local! {
@@ -163,6 +179,8 @@ mod wasm {
         /// Parents [`expand`] has walked lately, so one model on forty tiles is walked once.
         static WALKED: std::cell::RefCell<std::collections::HashSet<String>> =
             std::cell::RefCell::new(std::collections::HashSet::new());
+        /// Bumped by [`drop_ahead`]: a walk from before it stops at its next landing.
+        static AHEAD_ROUND: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
 
     /// How many parents [`WALKED`] remembers before it starts over: a revisited area walks again.
@@ -187,6 +205,9 @@ mod wasm {
                     get: method("get")?,
                     load: method("load")?,
                     prefetch: method("prefetch")?,
+                    ready: method("ready")?,
+                    landed: method("landed")?,
+                    drop_ahead: method("dropAhead")?,
                     obj,
                 })
             })
@@ -224,6 +245,7 @@ mod wasm {
             let priority = if high { "high" } else { "low" };
             let _ = js_sys::Reflect::set(&opts, &"priority".into(), &priority.into());
             let _ = js_sys::Reflect::set(&opts, &"keep".into(), &JsValue::from_bool(keep));
+            let _ = js_sys::Reflect::set(&opts, &"ahead".into(), &JsValue::from_bool(!high));
             s.load.call2(&s.obj, &name.into(), &opts)
         })?;
         let promise: js_sys::Promise = match promise.map(JsCast::dyn_into) {
@@ -247,8 +269,47 @@ mod wasm {
         }
         with_store(|s| {
             let arr: js_sys::Array = names.iter().map(|n| JsValue::from_str(n)).collect();
-            let _ = s.prefetch.call1(&s.obj, &arr);
+            let opts = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&opts, &"ahead".into(), &JsValue::TRUE);
+            let _ = s.prefetch.call2(&s.obj, &arr, &opts);
         });
+    }
+
+    /// Whether a frame can read `names` without a blocking request (`ready` in `web/datastore.js`).
+    /// Names the chain index lacks need no fetch, and a page with no store reads as it always did.
+    pub fn ready(names: &[String]) -> bool {
+        let wanted: js_sys::Array = names
+            .iter()
+            .filter(|n| index_has(n) != Some(false))
+            .map(|n| JsValue::from_str(n))
+            .collect();
+        if wanted.length() == 0 {
+            return true;
+        }
+        with_store(|s| s.ready.call1(&s.obj, &wanted).ok())
+            .flatten()
+            .is_none_or(|v| v.is_truthy())
+    }
+
+    /// How many files the store has answered since the page opened: the page's one live measure
+    /// of a load whose size nobody knows until its parents have landed.
+    pub fn landed() -> f64 {
+        with_store(|s| s.landed.call0(&s.obj).ok()?.as_f64())
+            .flatten()
+            .unwrap_or(0.0)
+    }
+
+    /// [`ready`] for `name`, then for what its loader reads after it, read off its bytes.
+    pub fn ready_tree(name: &str) -> bool {
+        let name = crate::web_deps::model_name(name);
+        if !ready(std::slice::from_ref(&name)) {
+            return false;
+        }
+        let Some(bytes) = resident(&name, false) else {
+            return true; // not in the chain: its read fails as it would
+        };
+        let d = crate::web_deps::deps(&name, &bytes);
+        ready(&d.leaves.into_iter().chain(d.parents).collect::<Vec<_>>())
     }
 
     /// Whether the chain has `name`, from the shared name index: `None` when there is no index.
@@ -289,12 +350,23 @@ mod wasm {
             if index_has(&name) == Some(false) || !first_walk(&name) {
                 continue;
             }
+            let round = AHEAD_ROUND.get();
             wasm_bindgen_futures::spawn_local(async move {
                 if let Some(Ok(Some(bytes))) = load(&name, false, true).await {
-                    expand(&name, &bytes);
+                    if round == AHEAD_ROUND.get() {
+                        expand(&name, &bytes);
+                    }
                 }
             });
         }
+    }
+
+    /// Forget the fetches ahead not yet sent and the walks under way: what was ahead of the player
+    /// is no longer where the player is going. What already landed stays.
+    pub fn drop_ahead() {
+        AHEAD_ROUND.set(AHEAD_ROUND.get().wrapping_add(1));
+        WALKED.with(|w| w.borrow_mut().clear());
+        with_store(|s| s.drop_ahead.call0(&s.obj));
     }
 
     /// Mark `name` walked; false when it already was.
@@ -311,5 +383,6 @@ mod wasm {
 
 #[cfg(target_arch = "wasm32")]
 pub use wasm::{
-    data_base, exists_sync, expand, fetch_sync, index_has, load, prefetch_parents, resident, trace,
+    data_base, drop_ahead, exists_sync, expand, fetch_sync, index_has, landed, load,
+    prefetch_parents, ready, ready_tree, resident, trace,
 };
