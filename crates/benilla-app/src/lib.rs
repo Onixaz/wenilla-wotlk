@@ -529,6 +529,10 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
 
     // Boot-progress bridge (webprogress.rs): tell the hosting page the Startup pile is done.
     app.add_systems(PostStartup, webprogress::signal_startup);
+    app.add_systems(
+        OnEnter(char_select::ClientState::CharSelect),
+        webprogress::signal_charselect_once,
+    );
 
     // A crate on top of benilla adds its plugins here ([`run_with`]).
     if let Some(extend) = extend {

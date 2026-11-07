@@ -230,3 +230,17 @@ test('synchronous misses are learned by phase and kept across visits', async (t)
   assert.deepEqual(next.learned('boot'), ['DBFilesClient\\Spell.dbc']);
   assert.deepEqual(next.learned('world'), ['Interface\\A.blp']);
 });
+
+test('reading counts the client\'s waiting reads, not fetches ahead', async () => {
+  const h = host({ 'a.blp': bytes(1), 'b.blp': bytes(2) });
+  const s = plain(h);
+  const ahead = s.prefetch(['a.blp']);
+  assert.equal(s.reading(), 0);
+  const read = s.load('b.blp');
+  assert.equal(s.reading(), 1);
+  await settle();
+  h.openAll();
+  await Promise.all([ahead, read]);
+  await settle();
+  assert.equal(s.reading(), 0);
+});

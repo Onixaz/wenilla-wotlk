@@ -14,6 +14,8 @@
 //     later reader (a fetch ahead); without it the reader takes them (memory → consumed).
 //   - `prefetch(names)` is `load` with `keep` at low priority, so fetches ahead never crowd out
 //     a read something is waiting on.
+//   - `reading()` counts the `load`s without `keep` still waiting: the client's own reads, which
+//     the page's cover waits on so a screen is not shown before its art.
 //
 // The network is batched: every name that misses memory and the persistent cache within one
 // task joins a `POST /data/__batch`, which answers many files in one response, streamed file by
@@ -51,6 +53,7 @@ export function createStore(opts = {}) {
   const learnedMap = new Map(loadLearned(storage)); // name -> phase
   let phase = 'boot';
   let learnedDirty = false;
+  let reading = 0;
   const stats = {
     memHits: 0, getMisses: 0, joined: 0, cacheHits: 0, network: 0, networkBytes: 0,
     batches: 0, notFound: 0, errors: 0, evicted: 0,
@@ -174,8 +177,16 @@ export function createStore(opts = {}) {
     }
     if (missing.has(key)) return Promise.resolve(null);
     const f = flight(key, priority);
-    if (keep) f.keep = true;
-    else f.consumers += 1;
+    if (keep) {
+      f.keep = true;
+    } else {
+      f.consumers += 1;
+      reading += 1;
+      const landed = () => {
+        reading -= 1;
+      };
+      f.promise.then(landed, landed);
+    }
     return f.promise;
   }
 
@@ -230,6 +241,7 @@ export function createStore(opts = {}) {
     load,
     prefetch,
     has: (name) => mem.has(dataKey(name)),
+    reading: () => reading,
     /// The names synchronous reads missed on earlier visits during `phase`.
     learned: (p) => Array.from(learnedMap).filter(([, ph]) => ph === p).map(([n]) => n),
     /// Name the phase later misses are learned under (`boot`, then `world` once the glue is up).
