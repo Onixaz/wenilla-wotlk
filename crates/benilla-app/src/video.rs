@@ -33,7 +33,9 @@ pub(crate) fn windowed_env() -> bool {
     std::env::var_os("WOW_WIN").is_some()
         || std::env::var_os("WOW_CAPTURE").is_some()
         || std::env::var_os("WOW_CAPTURE_UI").is_some()
-        || benilla_world::bgwin::background_run()
+        // Cached for the process, so a test cannot scope it: the runner's own `WOW_UNATTENDED`
+        // would otherwise take the window away from every test that drives one.
+        || (!cfg!(test) && benilla_world::bgwin::background_run())
 }
 
 /// `$WOW_WIN=WxH` in logical px; the one parser, so the size asked for and the size checked agree.
