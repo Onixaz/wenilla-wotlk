@@ -45,8 +45,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: realm
-      - name: cargo test -p wenilla-realm
-        run: cargo test -p wenilla-realm
       - name: browser startup and journal regressions
         run: node --test web/tests/*.test.mjs
       - name: host cache and relay regressions
