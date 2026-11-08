@@ -127,6 +127,37 @@ async fn compresses_the_index_and_leaves_blp_texels_alone() {
     );
 }
 
+/// What a shared cache is told about a chain file, end to end: only a URL naming the current data
+/// version is `public`, a stale version is never stored, and with no version nothing changes.
+#[tokio::test]
+async fn a_files_cache_control_follows_the_version_it_was_asked_for() {
+    let data_dir = benilla_formats::wow_data_or_skip!();
+    let chain = Arc::new(Chain::open(&data_dir).expect("open chain"));
+    let app = wenilla_host::data::router_with(chain, None, Some("abc123".into()));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let file = "/data/interface%5Cglues%5Ccommon%5Cglue-panel-button-up.blp";
+    for (query, expected) in [
+        ("?v=abc123", "public, max-age=31536000, immutable"),
+        ("?v=older", "no-store"),
+        ("", "private, max-age=31536000, immutable"),
+    ] {
+        let (status, head, body) =
+            raw_request_with(addr, "GET", &format!("{file}{query}"), "").await;
+        assert_eq!(status, 200, "{query}");
+        assert_eq!(&body[..4], b"BLP2", "{query}");
+        assert!(
+            head.contains(&format!("cache-control: {expected}")),
+            "{query}:\n{head}"
+        );
+    }
+}
+
 /// `POST /data/__batch` against the real chain: every asked name comes back once, as asked, with
 /// the chain's own bytes, a missing name as −1, and an oversized batch is refused.
 #[tokio::test]
