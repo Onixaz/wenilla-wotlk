@@ -312,9 +312,9 @@ const WARM_SETTLE_SECS: f32 = 0.25;
 #[cfg(not(target_arch = "wasm32"))]
 const WARM_REVEAL_PER_FRAME: usize = 72;
 /// The browser's compiles run in the GPU process, and a burst fills the page's command buffer,
-/// which its one thread then waits on: on D3D12 an unpaced pass froze the tab for 26 s of a 31 s
-/// cover, where this slice holds the longest stall to 1.4 s and the cover to 9-12 s. The pass then
-/// ends on [`WARM_TIMEOUT_SECS`], and a variant it did not reach compiles when first drawn. On
+/// which its one thread then waits on: on D3D12 an unpaced pass froze the tab for 26 s, where this
+/// slice holds the longest stall to a few seconds. The pass then ends on [`WARM_TIMEOUT_SECS`],
+/// and a variant it did not reach compiles when first drawn. On
 /// Metal this pace held a warm Goldshire login's cover 1.0 s longer than unpaced.
 #[cfg(target_arch = "wasm32")]
 const WARM_REVEAL_PER_FRAME: usize = 24;
