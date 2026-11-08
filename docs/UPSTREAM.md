@@ -40,7 +40,6 @@ per-target split and takes upstream's macOS arm as is. Then verify:
 ```bash
 cargo check --workspace --all-targets
 cargo check --target wasm32-unknown-unknown -p wenilla --no-default-features --features webgpu
-cargo test -p wenilla-realm
 scripts/web-build.sh          # then boot it in a WebGPU browser: login, world entry, sound, cross a zone line
 ```
 
