@@ -311,12 +311,13 @@ const WARM_SETTLE_SECS: f32 = 0.25;
 /// 0 means unpaced.
 #[cfg(not(target_arch = "wasm32"))]
 const WARM_REVEAL_PER_FRAME: usize = 72;
-/// The browser reveals every rig at once. Its compiles run in the GPU process, the page's one
-/// thread is all the load has, and the music plays off it (`sound::web_voice`), so pacing only
-/// stretches the warm over the cover's slowest frames: a warm Goldshire login drained 2589 rigs
-/// in 7.9 s over 108 paced frames, and in 0.96 s unpaced, which clears the cover 1.0 s sooner.
+/// The browser's compiles run in the GPU process, and a burst fills the page's command buffer,
+/// which its one thread then waits on: on D3D12 an unpaced pass froze the tab for 26 s of a 31 s
+/// cover, where this slice holds the longest stall to 1.4 s and the cover to 9-12 s. The pass then
+/// ends on [`WARM_TIMEOUT_SECS`], and a variant it did not reach compiles when first drawn. On
+/// Metal this pace held a warm Goldshire login's cover 1.0 s longer than unpaced.
 #[cfg(target_arch = "wasm32")]
-const WARM_REVEAL_PER_FRAME: usize = usize::MAX;
+const WARM_REVEAL_PER_FRAME: usize = 24;
 
 /// The pacing slice actually in force, `$WOW_WARM_SLICE` applied once.
 fn reveal_slice() -> usize {
