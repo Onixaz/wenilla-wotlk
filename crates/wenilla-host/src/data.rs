@@ -320,6 +320,19 @@ fn is_missing(err: &anyhow::Error) -> bool {
     msg.contains("not in patch chain") || msg.contains("deleted from patch chain")
 }
 
+/// The `Cache-Control` of a chain file asked for with `query` while the install is `version`.
+/// `?v=<version>` names these exact bytes, so a shared cache may keep them under that URL; any
+/// other `v=` must not be kept, or a new install's bytes would land under an old version's URL.
+/// With no `v=`, the bytes are for the player's browser alone.
+fn file_cache_control(query: Option<&str>, version: Option<&str>) -> &'static str {
+    let asked = query.and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("v=")));
+    match asked {
+        None => "private, max-age=31536000, immutable",
+        Some(v) if Some(v) == version => "public, max-age=31536000, immutable",
+        Some(_) => "no-store",
+    }
+}
+
 async fn file(method: Method, uri: Uri, State(state): State<DataState>) -> Response {
     let raw = uri.path().strip_prefix("/data/").unwrap_or("");
     let decoded = percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
@@ -327,6 +340,7 @@ async fn file(method: Method, uri: Uri, State(state): State<DataState>) -> Respo
     // Before the move into `spawn_blocking` — the classification is pure string math on the
     // name and yields a `&'static str`, so it costs nothing to take it out of the task's way.
     let content_type = content_type(&name);
+    let cache_control = file_cache_control(uri.query(), state.version.as_deref());
 
     let chain = Arc::clone(&state.chain);
     // `Chain::read` does synchronous file I/O (through benilla-mpq's blocking reads); running it
@@ -343,12 +357,7 @@ async fn file(method: Method, uri: Uri, State(state): State<DataState>) -> Respo
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, content_type),
-                    // `private`: the bytes are the operator's game files — cacheable by the player's
-                    // browser (they never change under one name), never by a shared cache.
-                    (
-                        header::CACHE_CONTROL,
-                        "private, max-age=31536000, immutable",
-                    ),
+                    (header::CACHE_CONTROL, cache_control),
                 ],
                 body,
             )
@@ -396,7 +405,23 @@ async fn index(State(state): State<DataState>) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{compressible, content_type, data_version};
+    use super::{compressible, content_type, data_version, file_cache_control};
+
+    /// Only `v=` as a whole parameter counts, wherever it sits in the query, and a host that
+    /// names no version can never vouch for one.
+    #[test]
+    fn the_cache_control_follows_the_asked_version() {
+        const PUBLIC: &str = "public, max-age=31536000, immutable";
+        const PRIVATE: &str = "private, max-age=31536000, immutable";
+        let cc = |q, v| file_cache_control(q, v);
+        assert_eq!(cc(Some("v=abc"), Some("abc")), PUBLIC);
+        assert_eq!(cc(Some("x=1&v=abc"), Some("abc")), PUBLIC);
+        assert_eq!(cc(Some("v=old"), Some("abc")), "no-store");
+        assert_eq!(cc(Some("v="), Some("abc")), "no-store");
+        assert_eq!(cc(Some("v=abc"), None), "no-store");
+        assert_eq!(cc(None, Some("abc")), PRIVATE);
+        assert_eq!(cc(Some("nv=abc"), Some("abc")), PRIVATE);
+    }
 
     /// The version names the archives, not the folder's other files, and moves when one changes.
     #[test]

@@ -23,12 +23,16 @@
 //   - `reading()` counts the `load`s without `keep` and the `ready` names still waiting: the
 //     client's own reads, which the page's cover waits on so a screen is not shown before its art.
 //
-// The network is batched: every name that misses memory and the persistent cache within one
-// task joins a `POST /data/__batch`, which answers many files in one response, streamed file by
-// file. A browser runs six HTTP/1.1 requests to a host at once, so a world of small files fetched
-// one per request is a queue of round trips (Dalaran is ~5,500 files); batched, it is a few dozen.
-// High-priority batches go first and low-priority ones never take more than `maxLowBatches` of
-// the slots. A host without the route gets one `GET /data/<name>` per file, as before.
+// The network goes one of two ways, and high priority goes first on both. With a data version,
+// each name that misses memory and the persistent cache is one `GET /data/<key>?v=<version>`, a
+// URL every player spells the same so a CDN can cache it (the host answers it `public`, and a
+// POST is never cached): at most `maxRequests` in flight, `maxLowRequests` of them low priority.
+// Without a version (an older host, or `__version` failed) every such name within one task joins
+// a `POST /data/__batch`, which answers many files in one response, streamed file by file: a
+// browser runs six HTTP/1.1 requests to a host at once, so a world of small files fetched one per
+// request is a queue of round trips (Dalaran is ~5,500 files); batched, it is a few dozen, with
+// `maxBatches` in flight, `maxLowBatches` of them low priority. A host without that route gets one
+// `GET /data/<name>` per file. `opts.transport` ('get' or 'batch') forces a way.
 //
 // Memory is a byte-bounded LRU. Under it sits the Cache API, keyed by the host's data version
 // (`GET /data/__version`), so a second visit reads the disk instead of the network and a changed
@@ -56,6 +60,7 @@ export function createStore(opts = {}) {
   let memBytes = 0;
   const flights = new Map(); // key -> flight
   const missing = new Set(); // keys the host answered 404 for
+  let versionPromise = null;
   let cachePromise = null;
   const learnedMap = new Map(loadLearned(storage)); // name -> phase
   let phase = 'boot';
@@ -66,17 +71,17 @@ export function createStore(opts = {}) {
   const settled = new Set(); // keys `ready` asked for that did not land: never asked for again
   const stats = {
     memHits: 0, getMisses: 0, joined: 0, cacheHits: 0, network: 0, networkBytes: 0,
-    batches: 0, notFound: 0, errors: 0, evicted: 0,
+    batches: 0, requests: 0, notFound: 0, errors: 0, evicted: 0,
   };
   const urlFor = (key) => `${base}/${encodeURIComponent(key)}`;
-  const net = createBatcher({
+  const net = createNetwork({
     base,
     fetchFn,
     urlFor,
     stats,
     maxNames: opts.batchNames ?? 64,
-    maxBatches: opts.maxBatches ?? 4,
-    maxLowBatches: opts.maxLowBatches ?? 2,
+    batchLimits: { all: opts.maxBatches ?? 4, low: opts.maxLowBatches ?? 2 },
+    requestLimits: { all: opts.maxRequests ?? 24, low: opts.maxLowRequests ?? 8 },
   });
 
   function put(key, bytes) {
@@ -104,16 +109,34 @@ export function createStore(opts = {}) {
     return bytes;
   }
 
+  /// The host's data version, asked once: `opts.version`, or `GET /data/__version`. `null` when
+  /// the host names none.
+  function dataVersion() {
+    if (!versionPromise) {
+      versionPromise = (async () => {
+        if (opts.version) return opts.version;
+        const r = await fetchFn(`${base}/__version`);
+        if (!r.ok) return null;
+        return (await r.text()).trim() || null;
+      })().catch(() => null);
+    }
+    return versionPromise;
+  }
+
+  /// What follows a chain file's URL on the network: `?v=<version>`, nothing for a forced GET
+  /// with no version to name, or `null` for the batch route.
+  async function fileQuery() {
+    if (opts.transport === 'batch') return null;
+    const version = await dataVersion();
+    if (version) return `?v=${version}`;
+    return opts.transport === 'get' ? '' : null;
+  }
+
   function openCache() {
     if (!cachePromise) {
       cachePromise = (async () => {
         if (!cacheStorage) return null;
-        let version = opts.version;
-        if (!version) {
-          const r = await fetchFn(`${base}/__version`);
-          if (!r.ok) return null;
-          version = (await r.text()).trim();
-        }
+        const version = await dataVersion();
         if (!version) return null;
         const name = CACHE_PREFIX + version;
         for (const n of await cacheStorage.keys()) {
@@ -135,7 +158,10 @@ export function createStore(opts = {}) {
         return new Uint8Array(await hit.arrayBuffer());
       }
     }
-    const bytes = await net.request(f.key, f.priority, f.ahead);
+    // The host's own routes need no version. `f.priority` is read after this wait: a reader may
+    // have joined and raised it while the version was on its way.
+    const query = f.key.startsWith('__') ? null : await fileQuery();
+    const bytes = await net.request(f.key, f.priority, f.ahead, query);
     // A Response built from bytes copies them, so they stay ours.
     if (bytes && cache) cache.put(url, new Response(bytes)).catch(() => {});
     return bytes;
@@ -289,19 +315,20 @@ export function createStore(opts = {}) {
   };
 }
 
-/// The network half: names in, bytes (or `null` for a 404) out, gathered into batches.
-function createBatcher({ base, fetchFn, urlFor, stats, maxNames, maxBatches, maxLowBatches }) {
+/// The network half: names in, bytes (or `null` for a 404) out, one GET per file or gathered into
+/// batches. `query` on a request says which: the string to append to the GET, `null` for a batch.
+function createNetwork({ base, fetchFn, urlFor, stats, maxNames, batchLimits, requestLimits }) {
   const queues = { high: [], low: [] };
   const queued = new Map(); // key -> entry not yet sent
   const active = { high: 0, low: 0 };
   let scheduled = false;
   let batching = true; // false once the host answers that it has no batch route
 
-  function request(key, priority, ahead) {
+  function request(key, priority, ahead, query) {
     // The host's own routes (`__index`, …) are not chain files: always a plain GET.
-    if (!batching || key.startsWith('__')) return single(key, priority);
+    if (key.startsWith('__') || (query === null && !batching)) return single(key, priority);
     return new Promise((resolve, reject) => {
-      const e = { key, priority: priority === 'low' ? 'low' : 'high', ahead, resolve, reject };
+      const e = { key, priority: priority === 'low' ? 'low' : 'high', ahead, query, resolve, reject };
       queues[e.priority].push(e);
       queued.set(key, e);
       schedule();
@@ -326,6 +353,8 @@ function createBatcher({ base, fetchFn, urlFor, stats, maxNames, maxBatches, max
     queues.low = queues.low.filter((x) => !x.ahead);
   }
 
+  const limits = (e) => (e.query === null ? batchLimits : requestLimits);
+
   // One task's requests gather before a batch goes out: a frame's loads arrive together.
   function schedule() {
     if (scheduled) return;
@@ -337,13 +366,34 @@ function createBatcher({ base, fetchFn, urlFor, stats, maxNames, maxBatches, max
     scheduled = false;
     for (;;) {
       const busy = active.high + active.low;
+      const high = queues.high[0];
+      const low = queues.low[0];
       let p = null;
-      if (queues.high.length && busy < maxBatches) p = 'high';
-      else if (queues.low.length && busy < maxBatches && active.low < maxLowBatches) p = 'low';
+      if (high && busy < limits(high).all) p = 'high';
+      else if (low && busy < limits(low).all && active.low < limits(low).low) p = 'low';
       if (!p) return;
-      const entries = queues[p].splice(0, maxNames);
-      for (const e of entries) queued.delete(e.key);
-      run(entries, p);
+      if (queues[p][0].query === null) {
+        const entries = queues[p].splice(0, maxNames);
+        for (const e of entries) queued.delete(e.key);
+        run(entries, p);
+      } else {
+        const e = queues[p].shift();
+        queued.delete(e.key);
+        runGet(e, p);
+      }
+    }
+  }
+
+  async function runGet(e, p) {
+    active[p] += 1;
+    stats.requests += 1;
+    try {
+      e.resolve(await single(e.key, p, e.query));
+    } catch (err) {
+      e.reject(err);
+    } finally {
+      active[p] -= 1;
+      pump();
     }
   }
 
@@ -391,10 +441,11 @@ function createBatcher({ base, fetchFn, urlFor, stats, maxNames, maxBatches, max
     }
   }
 
-  async function single(key, priority) {
-    const r = await fetchFn(urlFor(key), { priority });
+  async function single(key, priority, query = '') {
+    const url = urlFor(key) + query;
+    const r = await fetchFn(url, { priority });
     if (r.status === 404) return null;
-    if (!r.ok) throw new Error(`${urlFor(key)}: HTTP ${r.status}`);
+    if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`);
     const bytes = new Uint8Array(await r.arrayBuffer());
     stats.network += 1;
     stats.networkBytes += bytes.byteLength;
@@ -408,7 +459,7 @@ function createBatcher({ base, fetchFn, urlFor, stats, maxNames, maxBatches, max
     state: () => ({
       queuedHigh: queues.high.length,
       queuedLow: queues.low.length,
-      activeBatches: active.high + active.low,
+      activeRequests: active.high + active.low,
     }),
   };
 }

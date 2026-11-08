@@ -38,7 +38,8 @@ cargo run --release -p wenilla-host -- --www web/dist --data /path/to/WoW/Data -
 ```
 
 `wenilla-host` (`crates/wenilla-host`) is the whole server side: static files
-(precompressed), `GET /data/{name}` (`HEAD` too; `GET /data/__index` lists the chain,
+(precompressed), `GET /data/{name}` (`HEAD` too; with `?v=<the data version>` the answer is
+`public` so a CDN can keep it, a stale `v=` is `no-store`; `GET /data/__index` lists the chain,
 `POST /data/__batch` answers many names in one streamed response, `GET /data/__version` names the
 install so the page knows when its kept copy is stale), and
 `GET /ws/{port}` — a WebSocket↔TCP proxy that only ever dials `--upstream` on 3724 or 8085.
@@ -122,8 +123,12 @@ public deployment belongs behind a login (`wenilla-realm`), not this host.
   keybinds". The grant is heuristic and often only arrives after repeat visits; there is no
   fallback if it is refused. It covers quota storage, which is also where the game data is kept (below).
 - **Game data** — every `/data` read goes through the page's data store (`web/datastore.js`,
-  `window.__wenilla_data`). It fetches in batches (`POST /data/__batch`: one request for up to 64
-  files, streamed file by file, since a browser runs only six HTTP/1.1 requests to a host at once),
+  `window.__wenilla_data`). With a data version it fetches each file as
+  `GET /data/<lowercase name>?v=<version>`, one URL per file for every player so a CDN in front can
+  cache them, up to 24 in flight; that wants HTTP/2 or 3, since a browser runs only six HTTP/1.1
+  requests to a host at once. Without a version it fetches in batches (`POST /data/__batch`: one
+  request for up to 64 files, streamed file by file); `createStore({ transport: 'batch' })` or
+  `'get'` forces either way. It
   holds bytes fetched ahead in a bounded memory LRU, and keeps every file it fetched in the Cache
   API under the host's `__version`, so a second visit reads the disk and a changed install starts
   clean. The client's synchronous reads (`Chain::read`, ~60 call sites) answer from that memory

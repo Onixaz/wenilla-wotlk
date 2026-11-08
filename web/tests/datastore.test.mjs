@@ -21,17 +21,21 @@ function frame(name, body) {
 }
 
 /// A fake host: `files` maps key -> bytes; every request waits on a gate the test opens.
-/// `batch: false` is a host without the batch route.
-function host(files, { batch = true } = {}) {
+/// `batch: false` is a host without the batch route, `version: null` one that names no version.
+function host(files, { batch = true, version = 'v1' } = {}) {
   const calls = [];
   const fetch = (url, init = {}) => {
-    const path = decodeURIComponent(url.slice('/data/'.length));
+    const [rawPath, query] = url.slice('/data/'.length).split('?');
+    const path = decodeURIComponent(rawPath);
     const keys = path === '__batch' ? JSON.parse(init.body) : [path];
+    const method = init.method ?? 'GET';
     let open;
     const gate = new Promise((r) => (open = r));
-    calls.push({ path, keys, priority: init.priority, open });
+    calls.push({ url, method, path, query, keys, priority: init.priority, open });
     return gate.then(() => {
-      if (path === '__version') return new Response('v1');
+      if (path === '__version') {
+        return version ? new Response(version) : new Response('', { status: 404 });
+      }
       if (path === '__batch') {
         if (!batch) return new Response('', { status: 404 });
         const parts = keys.map((k) => frame(k, files[k] ?? null));
@@ -45,7 +49,10 @@ function host(files, { batch = true } = {}) {
 }
 
 const bytes = (...v) => new Uint8Array(v);
-const plain = (h, o = {}) => createStore({ fetch: h.fetch, persist: false, storage: null, ...o });
+const plain = (h, o = {}) =>
+  createStore({ fetch: h.fetch, persist: false, storage: null, transport: 'batch', ...o });
+const versioned = (h, o = {}) =>
+  createStore({ fetch: h.fetch, persist: false, storage: null, version: 'v1', ...o });
 
 test('keys match the way the MPQ hash does', () => {
   assert.equal(dataKey('World/Maps/A.ADT'), 'world\\maps\\a.adt');
@@ -204,7 +211,8 @@ test('a persistent cache answers before the network and is filled by it', async 
   assert.ok(opened.includes('wenilla-data-v1'));
   assert.ok(opened.includes('deleted:wenilla-data-old'), 'an older data version is dropped');
   await settle();
-  assert.deepEqual(store.get('/data/a.blp'), bytes(7));
+  assert.deepEqual(store.get('/data/a.blp'), bytes(7), 'kept without the version in its key');
+  assert.deepEqual(h.calls.map((c) => c.url), ['/data/__version', '/data/a.blp?v=v1']);
 
   const fresh = createStore({ fetch: h.fetch, caches, storage: null });
   const before = h.calls.length;
@@ -303,6 +311,181 @@ test('dropAhead forgets unsent fetches ahead, leaves the rest, and a dropped nam
   }
   await list;
   assert.deepEqual(h.calls.map((c) => c.keys).flat().sort(), ['c.blp', 'x.adt']);
+  assert.equal(s.stats().errors, 0);
+  assert.equal(s.landed(), 2);
+  s.ready(['a.adt']);
+  await settle();
+  h.openAll();
+  await settle();
+  assert.equal(s.ready(['a.adt']), true);
+});
+
+test('with a version each file is one GET naming it, and nothing is batched', async () => {
+  const h = host({ 'a.blp': bytes(1, 2), 'b.blp': bytes(3) });
+  const s = versioned(h);
+  const pa = s.load('a.blp');
+  const pb = s.load('b.blp');
+  await settle();
+  assert.deepEqual(
+    h.calls.map((c) => [c.method, c.url, c.priority]),
+    [['GET', '/data/a.blp?v=v1', 'high'], ['GET', '/data/b.blp?v=v1', 'high']],
+  );
+  h.openAll();
+  assert.deepEqual(await pa, bytes(1, 2));
+  assert.deepEqual(await pb, bytes(3));
+  const st = s.stats();
+  assert.deepEqual([st.requests, st.batches, st.network, st.networkBytes], [2, 0, 2, 3]);
+});
+
+test('the version is asked once, even with no persistent cache to key', async () => {
+  const h = host({ a: bytes(1), b: bytes(2) });
+  const s = createStore({ fetch: h.fetch, persist: false, storage: null });
+  const pa = s.load('a');
+  const pb = s.load('b');
+  await settle();
+  assert.deepEqual(h.calls.map((c) => c.path), ['__version']);
+  for (let i = 0; i < 2; i++) {
+    h.openAll();
+    await settle();
+  }
+  await Promise.all([pa, pb]);
+  assert.deepEqual(h.calls.map((c) => c.url), ['/data/__version', '/data/a?v=v1', '/data/b?v=v1']);
+});
+
+test('every spelling of a name asks the same URL', async () => {
+  const urls = [];
+  for (const name of ['World/Maps/A.ADT', 'world\\maps\\a.adt', 'WORLD\\Maps/a.Adt']) {
+    const h = host({ 'world\\maps\\a.adt': bytes(1) });
+    const p = versioned(h).load(name);
+    await settle();
+    h.openAll();
+    assert.deepEqual(await p, bytes(1));
+    urls.push(h.calls[0].url);
+  }
+  assert.deepEqual(urls, Array(3).fill('/data/world%5Cmaps%5Ca.adt?v=v1'));
+});
+
+test('a host that names no version gets batches', async () => {
+  const h = host({ a: bytes(1) }, { version: null });
+  const s = createStore({ fetch: h.fetch, persist: false, storage: null });
+  const p = s.load('a');
+  for (let i = 0; i < 3; i++) {
+    await settle();
+    h.openAll();
+  }
+  assert.deepEqual(await p, bytes(1));
+  assert.deepEqual(h.calls.map((c) => [c.method, c.path]), [['GET', '__version'], ['POST', '__batch']]);
+});
+
+test('a version request that fails falls back to batches', async () => {
+  const h = host({ a: bytes(1) });
+  const fetch = (url, init) => (url.endsWith('/__version') ? Promise.reject(new Error('offline')) : h.fetch(url, init));
+  const s = createStore({ fetch, persist: false, storage: null });
+  const p = s.load('a');
+  await settle();
+  h.openAll();
+  assert.deepEqual(await p, bytes(1));
+  assert.deepEqual(h.calls.map((c) => c.path), ['__batch']);
+});
+
+test('the transport option forces either way', async () => {
+  const batched = host({ a: bytes(1) });
+  const s = versioned(batched, { transport: 'batch' });
+  const p = s.load('a');
+  await settle();
+  batched.openAll();
+  assert.deepEqual(await p, bytes(1));
+  assert.deepEqual(batched.calls.map((c) => c.path), ['__batch'], 'even with a version');
+
+  const got = host({ a: bytes(1) }, { version: null });
+  const t = createStore({ fetch: got.fetch, persist: false, storage: null, transport: 'get' });
+  const q = t.load('a');
+  for (let i = 0; i < 3; i++) {
+    await settle();
+    got.openAll();
+  }
+  assert.deepEqual(await q, bytes(1));
+  assert.deepEqual(got.calls.map((c) => c.url), ['/data/__version', '/data/a'], 'no version to name');
+});
+
+test('the host\'s own routes stay a plain GET and do not wait for the version', async () => {
+  const h = host({ __index: bytes(1) });
+  const s = createStore({ fetch: h.fetch, persist: false, storage: null });
+  const p = s.load('__index');
+  await settle();
+  assert.deepEqual(h.calls.map((c) => c.url), ['/data/__index']);
+  h.openAll();
+  assert.deepEqual(await p, bytes(1));
+});
+
+test('a name the host lacks resolves null over GET and is remembered', async () => {
+  const h = host({});
+  const s = versioned(h);
+  const p = s.load('gone.blp');
+  await settle();
+  h.openAll();
+  assert.equal(await p, null);
+  assert.equal(await s.load('GONE.blp'), null);
+  assert.equal(h.calls.length, 1);
+  assert.equal(s.stats().notFound, 1);
+  assert.equal(s.stats().errors, 0);
+});
+
+test('a failed GET rejects its read and counts as an error', async () => {
+  const s = versioned({ fetch: async () => new Response('', { status: 503 }) });
+  await assert.rejects(s.load('a.blp'), /a\.blp\?v=v1: HTTP 503/);
+  assert.equal(s.stats().errors, 1);
+});
+
+test('GETs in flight are capped; fetches ahead take at most their slots, a reader jumps them', async () => {
+  const files = Object.fromEntries('abcdefg'.split('').map((k, i) => [k, bytes(i)]));
+  const h = host(files);
+  const s = versioned(h, { maxRequests: 3, maxLowRequests: 1 });
+  s.prefetch(['a', 'b', 'c', 'd', 'e']);
+  await settle();
+  assert.deepEqual(h.calls.map((c) => [c.path, c.priority]), [['a', 'low']]);
+  const read = s.load('e'); // queued low: promoted, and sent ahead of b, c and d
+  const other = s.load('g');
+  await settle();
+  assert.deepEqual(h.calls.slice(1).map((c) => [c.path, c.priority]), [['e', 'high'], ['g', 'high']]);
+  assert.equal(s.stats().activeRequests, 3);
+  h.openAll();
+  assert.deepEqual(await read, bytes(4));
+  assert.deepEqual(await other, bytes(6));
+  await settle();
+  assert.deepEqual(h.calls.slice(3).map((c) => [c.path, c.priority]), [['b', 'low']]);
+});
+
+test('a reader that joins while the version is on its way raises the fetch', async () => {
+  const h = host({ a: bytes(1) });
+  const s = createStore({ fetch: h.fetch, persist: false, storage: null });
+  s.prefetch(['a']);
+  const read = s.load('a');
+  await settle();
+  assert.deepEqual(h.calls.map((c) => c.path), ['__version']);
+  h.openAll();
+  await settle();
+  assert.deepEqual(h.calls.slice(1).map((c) => [c.path, c.priority]), [['a', 'high']]);
+  h.openAll();
+  assert.deepEqual(await read, bytes(1));
+});
+
+test('dropAhead forgets unsent GETs ahead, leaves the rest, and a dropped name can come back', async () => {
+  const h = host({ 'a.adt': bytes(1), 'b.adt': bytes(2), 'c.blp': bytes(3), 'x.adt': bytes(4) });
+  const s = versioned(h, { maxRequests: 1, maxLowRequests: 1 });
+  s.prefetch(['x.adt'], { ahead: true }); // sent, so it finishes
+  s.prefetch(['a.adt'], { ahead: true });
+  const list = s.prefetch(['c.blp']); // the page's own list stays
+  const b = s.prefetch(['b.adt'], { ahead: true });
+  await settle();
+  s.dropAhead();
+  await b;
+  for (let i = 0; i < 4; i++) {
+    h.openAll();
+    await settle();
+  }
+  await list;
+  assert.deepEqual(h.calls.map((c) => c.path).sort(), ['c.blp', 'x.adt']);
   assert.equal(s.stats().errors, 0);
   assert.equal(s.landed(), 2);
   s.ready(['a.adt']);
