@@ -214,6 +214,7 @@ mod video;
 mod vplates;
 mod wdb;
 mod weapon_trail;
+mod web_ui_preload;
 mod webbridge;
 /// The web build's env-var stand-in (a browser tab has no process environment) — see the
 /// module doc. `pub` because the plan's "Env/config on web" interface names it as
@@ -535,6 +536,16 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
         OnEnter(char_select::ClientState::CharSelect),
         webprogress::signal_charselect_once,
     );
+    if cfg!(target_arch = "wasm32") {
+        app.add_systems(
+            OnEnter(char_select::ClientState::CharSelect),
+            web_ui_preload::pin_ui_code_once,
+        );
+        app.add_systems(
+            Update,
+            web_ui_preload::fill_ui_art_once.run_if(in_state(char_select::ClientState::InWorld)),
+        );
+    }
 
     // A crate on top of benilla adds its plugins here ([`run_with`]).
     if let Some(extend) = extend {

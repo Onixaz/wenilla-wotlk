@@ -198,8 +198,17 @@ fn install_addon_asset_resolvers(world: &mut World, script: &mut UiScript) {
     }));
     // Keyed by the path exactly as the region carries it, so a hit allocates nothing (this is
     // asked per zero-size textured region per layout pass); misses are cached too.
-    let sizes: std::cell::RefCell<std::collections::HashMap<String, Option<(u32, u32)>>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+    type Sizes = std::collections::HashMap<String, Option<(u32, u32)>>;
+    let sizes: std::rc::Rc<std::cell::RefCell<Sizes>> = Default::default();
+    // A size is read off the decoded art, and on the page an absent file's read is a blocking
+    // request: layout asks here first, and lays out again when it lands.
+    if cfg!(target_arch = "wasm32") {
+        let measured = sizes.clone();
+        script.set_texture_span_ready(Box::new(move |path| {
+            measured.borrow().contains_key(path)
+                || benilla_formats::web::ready(&benilla_assets::sprite_candidates(path))
+        }));
+    }
     script.set_texture_size_probe(Box::new(move |path| {
         if let Some(cached) = sizes.borrow().get(path) {
             return *cached;

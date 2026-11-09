@@ -161,6 +161,26 @@ pub(super) fn texel_span(
     Some((w as f32, h as f32))
 }
 
+/// [`content_span`] for the layout pass. Deviation, on the page alone: the reference reads the
+/// file from disk within the call, but a page's read of an absent file stops the frame, so such
+/// art is noted in `waits` and has no span until it lands.
+fn laid_span(
+    data: &RegionData,
+    probe: Option<&crate::script::TextureSizeProbe>,
+    ready: Option<&crate::script::TextureProbe>,
+    waits: &mut std::collections::HashSet<String>,
+) -> Option<(f32, f32)> {
+    if let (None, Some(path), Some(ready)) = (&data.fill, data.texture.as_deref(), ready) {
+        if !ready(path) {
+            if !waits.contains(path) {
+                waits.insert(path.to_string());
+            }
+            return None;
+        }
+    }
+    content_span(data, probe)
+}
+
 /// The edge of the 8×8 surface the colour `SetTexture` makes.
 const SOLID_TEXTURE_TEXELS: f32 = 8.0;
 
@@ -736,6 +756,8 @@ impl UiScript {
             layout_rounds,
             pending_size_changed,
             texture_size_probe,
+            texture_span_ready,
+            texture_span_waits,
             ..
         } = model;
         // ── The incremental seed ─────────────────────────────────────────────
@@ -991,18 +1013,31 @@ impl UiScript {
                 // A texture's unset axis takes its texel extent (`content_span`): the reference's
                 // size getter is virtual for both region classes. It must apply before the
                 // resolve, as `combine_edge` reads a zero span as no size and leaves an edge unset.
+                // An axis its anchors fix never reads the span, so its art is not measured: a
+                // measure decodes the file, and an implicit `SetAllPoints` icon needs none.
+                scratch.anchors.clear();
+                scratch.anchors.extend_from_slice(&data.anchors);
                 if !is_fontstring && (width == 0.0 || height == 0.0) {
-                    if let Some((cw, ch)) = content_span(data, texture_size_probe.as_ref()) {
-                        if width == 0.0 {
-                            width = cw;
-                        }
-                        if height == 0.0 {
-                            height = ch;
+                    let (x_fixed, y_fixed) = layout::axes_fixed_by_anchors(&scratch, |id| {
+                        (id != SCREEN).then(|| solver.rect(id)).flatten()
+                    });
+                    if (width == 0.0 && !x_fixed) || (height == 0.0 && !y_fixed) {
+                        let span = laid_span(
+                            data,
+                            texture_size_probe.as_ref(),
+                            texture_span_ready.as_ref(),
+                            texture_span_waits,
+                        );
+                        if let Some((cw, ch)) = span {
+                            if width == 0.0 {
+                                width = cw;
+                            }
+                            if height == 0.0 {
+                                height = ch;
+                            }
                         }
                     }
                 }
-                scratch.anchors.clear();
-                scratch.anchors.extend_from_slice(&data.anchors);
                 scratch.width = width;
                 scratch.height = height;
                 scratch.scale = scale;

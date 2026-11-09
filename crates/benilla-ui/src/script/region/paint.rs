@@ -565,4 +565,11 @@ impl crate::script::UiScript {
     pub fn set_texture_size_probe(&mut self, probe: crate::script::TextureSizeProbe) {
         self.model_mut().texture_size_probe = Some(probe);
     }
+
+    /// Install the host's check that layout may measure a path without blocking. Until it answers
+    /// true, a region that needs that art's span goes without one and lays out again when it
+    /// lands; the size getters still measure, as a script reads the answer on the next line.
+    pub fn set_texture_span_ready(&mut self, ready: crate::script::TextureProbe) {
+        self.model_mut().texture_span_ready = Some(ready);
+    }
 }

@@ -933,6 +933,98 @@ fn a_textures_getters_report_its_texel_span_on_an_unsized_axis() {
     assert!(s.take_errors().is_empty());
 }
 
+/// Layout measures art only for an axis its anchors leave open: an implicit `SetAllPoints` icon
+/// resolves from its owner alone and its file is never read, while a one-point texture still
+/// takes its span.
+#[test]
+fn layout_measures_art_only_where_the_anchors_leave_an_axis_open() {
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let sink = asked.clone();
+    s.set_texture_size_probe(Box::new(move |p| {
+        sink.borrow_mut().push(p.to_string());
+        Some((128, 96))
+    }));
+    s.run(
+        r#"
+        local f = CreateFrame("Frame", "Owner", UIParent)
+        f:SetPoint("BOTTOMLEFT", 10, 20); f:SetWidth(100); f:SetHeight(50)
+        Icon = f:CreateTexture("Icon", "ARTWORK")
+        Icon:SetTexture("Interface\\Icon"); Icon:SetAllPoints(f)
+        Wide = f:CreateTexture("Wide", "ARTWORK")
+        Wide:SetTexture("Interface\\Wide"); Wide:SetPoint("TOPLEFT"); Wide:SetPoint("TOPRIGHT")
+        Point = f:CreateTexture("Point", "ARTWORK")
+        Point:SetTexture("Interface\\Point"); Point:SetPoint("TOPLEFT")
+    "#,
+    )
+    .unwrap();
+    s.resolve();
+    {
+        let asked = asked.borrow();
+        assert!(!asked.iter().any(|p| p.ends_with("Icon")), "{asked:?}");
+        assert!(asked.iter().any(|p| p.ends_with("Wide")), "height is open");
+        assert!(asked.iter().any(|p| p.ends_with("Point")), "both are open");
+    }
+    s.run(
+        r#"
+        assert(Icon:GetRight() - Icon:GetLeft() == 100, "the owner's span")
+        assert(Icon:GetTop() - Icon:GetBottom() == 50, "the owner's span")
+        assert(Wide:GetRight() - Wide:GetLeft() == 100, "the anchors win the width")
+        assert(Wide:GetTop() - Wide:GetBottom() == 96, "the art's height")
+        assert(Point:GetRight() - Point:GetLeft() == 128, "the art's width")
+    "#,
+    )
+    .unwrap();
+    assert!(s.take_errors().is_empty());
+}
+
+/// A host that cannot measure art yet: the region waits with no rect and no read of the file, and
+/// resolves to the art's span on the first resolve after it lands, with no other layout write.
+#[test]
+fn layout_waits_for_unlanded_art_and_lays_out_again_when_it_lands() {
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    let landed = std::rc::Rc::new(std::cell::Cell::new(false));
+    let measured = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let (arrived, reads) = (landed.clone(), measured.clone());
+    s.set_texture_span_ready(Box::new(move |_| arrived.get()));
+    s.set_texture_size_probe(Box::new(move |_| {
+        reads.set(reads.get() + 1);
+        Some((128, 96))
+    }));
+    s.run(
+        r#"
+        local f = CreateFrame("Frame", "Owner", UIParent)
+        f:SetPoint("BOTTOMLEFT", 10, 20); f:SetWidth(100); f:SetHeight(50)
+        Art = f:CreateTexture("Art", "ARTWORK")
+        Art:SetTexture("Interface\\Crest"); Art:SetPoint("TOPLEFT")
+    "#,
+    )
+    .unwrap();
+    s.resolve();
+    s.resolve();
+    assert_eq!(
+        measured.get(),
+        0,
+        "layout must not read art that has not landed"
+    );
+    s.run(r#"assert(Art:GetLeft() == nil, "no span yet, no rect")"#)
+        .unwrap();
+
+    landed.set(true);
+    s.resolve();
+    assert!(measured.get() > 0, "the landing lays it out again");
+    s.run(
+        r#"
+        assert(Art:GetRight() - Art:GetLeft() == 128, "the art's width")
+        assert(Art:GetTop() - Art:GetBottom() == 96, "the art's height")
+    "#,
+    )
+    .unwrap();
+    assert!(s.take_errors().is_empty());
+}
+
 /// The constructors' string arguments take four shapes, by whether the binding tests its parser's
 /// return: a region constructor's `name` and `layer` (untested) and `CreateFrame`'s `name` and
 /// `inherits` (unguarded) read a table as absent and stringify a number; a region constructor's
