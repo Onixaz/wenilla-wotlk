@@ -59,6 +59,21 @@ pub fn ready_tree(_name: &str) -> bool {
     true
 }
 
+/// Every name in the chain's index, as [`index_key`] spells them. Empty off the page.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn index_names() -> Vec<String> {
+    Vec::new()
+}
+
+/// Fetch `names` ahead into memory, safe from eviction. Nothing off the page.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn prefetch_pinned(_names: &[String]) {}
+
+/// Download each list to the page's persistent cache, one list after another, each under its
+/// tag (`fill` in `web/datastore.js`). Nothing off the page.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn fill_in_turn(_lists: Vec<(&'static str, Vec<String>)>) {}
+
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use wasm_bindgen::JsValue;
@@ -165,6 +180,7 @@ mod wasm {
         get: js_sys::Function,
         load: js_sys::Function,
         prefetch: js_sys::Function,
+        fill: Option<js_sys::Function>,
         ready: js_sys::Function,
         landed: js_sys::Function,
         drop_ahead: js_sys::Function,
@@ -205,6 +221,7 @@ mod wasm {
                     get: method("get")?,
                     load: method("load")?,
                     prefetch: method("prefetch")?,
+                    fill: method("fill"),
                     ready: method("ready")?,
                     landed: method("landed")?,
                     drop_ahead: method("dropAhead")?,
@@ -273,6 +290,52 @@ mod wasm {
             let _ = js_sys::Reflect::set(&opts, &"ahead".into(), &JsValue::TRUE);
             let _ = s.prefetch.call2(&s.obj, &arr, &opts);
         });
+    }
+
+    /// Fetch `names` ahead into the store at low priority, safe from eviction.
+    pub fn prefetch_pinned(names: &[String]) {
+        if names.is_empty() {
+            return;
+        }
+        with_store(|s| {
+            let arr: js_sys::Array = names.iter().map(|n| JsValue::from_str(n)).collect();
+            let opts = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&opts, &"pin".into(), &JsValue::TRUE);
+            let _ = s.prefetch.call2(&s.obj, &arr, &opts);
+        });
+    }
+
+    /// Download each list to the persistent cache in turn (`fill` in `web/datastore.js`), the
+    /// next list starting when the last has finished; a page without `fill` does nothing.
+    pub fn fill_in_turn(lists: Vec<(&'static str, Vec<String>)>) {
+        use wasm_bindgen::JsCast;
+        wasm_bindgen_futures::spawn_local(async move {
+            for (tag, names) in lists {
+                let started = with_store(|s| {
+                    let fill = s.fill.as_ref()?;
+                    let arr: js_sys::Array = names.iter().map(|n| JsValue::from_str(n)).collect();
+                    let opts = js_sys::Object::new();
+                    let _ = js_sys::Reflect::set(&opts, &"tag".into(), &tag.into());
+                    fill.call2(&s.obj, &arr, &opts).ok()
+                })
+                .flatten();
+                let Some(Ok(promise)) = started.map(JsCast::dyn_into::<js_sys::Promise>) else {
+                    return;
+                };
+                let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+            }
+        });
+    }
+
+    /// Every name in the chain's index, as [`super::index_key`] spells them.
+    pub fn index_names() -> Vec<String> {
+        let _ = index_has(""); // the index is built by its first question
+        INDEX.with(|cell| {
+            cell.get()
+                .and_then(Option::as_ref)
+                .map(|set| set.iter().cloned().collect())
+                .unwrap_or_default()
+        })
     }
 
     /// Whether a frame can read `names` without a blocking request (`ready` in `web/datastore.js`).
@@ -383,6 +446,6 @@ mod wasm {
 
 #[cfg(target_arch = "wasm32")]
 pub use wasm::{
-    data_base, drop_ahead, exists_sync, expand, fetch_sync, index_has, landed, load,
-    prefetch_parents, ready, ready_tree, resident, trace,
+    data_base, drop_ahead, exists_sync, expand, fetch_sync, fill_in_turn, index_has, index_names,
+    landed, load, prefetch_parents, prefetch_pinned, ready, ready_tree, resident, trace,
 };
