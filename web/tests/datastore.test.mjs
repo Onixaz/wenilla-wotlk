@@ -225,6 +225,25 @@ test('a persistent cache answers before the network and is filled by it', async 
   assert.deepEqual(h.calls.slice(before).map((c) => c.path), ['__version'], 'served from the cache');
 });
 
+test('a locale keeps its own cache and leaves every other locale\'s alone', async () => {
+  const deleted = [];
+  const opened = [];
+  const caches = {
+    keys: async () => ['wenilla-data-enus-v1', 'wenilla-data-eses-v0', 'wenilla-data-oldhash'],
+    delete: async (n) => deleted.push(n),
+    open: async (n) => {
+      opened.push(n);
+      return { match: async () => undefined, put: async () => {} };
+    },
+  };
+  const fetch = async () => new Response(bytes(1));
+  const s = createStore({ base: '/eses/data', version: 'v1', transport: 'get', fetch, caches, storage: null });
+  await s.load('a.blp');
+  await settle();
+  assert.deepEqual(opened, ['wenilla-data-eses-v1']);
+  assert.deepEqual(deleted.sort(), ['wenilla-data-eses-v0', 'wenilla-data-oldhash']);
+});
+
 test('synchronous misses are learned by phase and kept across visits', async (t) => {
   const kv = new Map();
   const storage = { getItem: (k) => kv.get(k) ?? null, setItem: (k, v) => kv.set(k, v) };

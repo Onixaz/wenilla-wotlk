@@ -50,21 +50,39 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
 
-    let chain = Arc::new(
-        Chain::open(&cli.data).with_context(|| format!("opening {}", cli.data.display()))?,
-    );
-    tracing::info!(data = %cli.data.display(), "patch chain open");
-
-    let locale = benilla_formats::data_locale(&cli.data).ok();
-    tracing::info!(locale = ?locale, "data locale");
     let version = wenilla_host::data::data_version(&cli.data);
     tracing::info!(version = ?version, "data version");
-    let app = wenilla_host::data::router_with(chain, locale, version)
-        .merge(wenilla_host::ws::router(
-            cli.upstream.clone(),
-            wenilla_host::ALLOWED_PORTS,
-        ))
-        .merge(wenilla_host::static_site::router(&cli.www));
+    let site = |chain: Chain, locale: Option<String>| {
+        wenilla_host::data::router_with(Arc::new(chain), locale, version.clone())
+            .merge(wenilla_host::static_site::router(&cli.www))
+    };
+
+    let locales = if cli.data.is_dir() {
+        benilla_formats::data_locales(&cli.data)
+            .with_context(|| format!("listing {}", cli.data.display()))?
+    } else {
+        Vec::new()
+    };
+    let pages = if locales.is_empty() {
+        let chain =
+            Chain::open(&cli.data).with_context(|| format!("opening {}", cli.data.display()))?;
+        site(chain, benilla_formats::data_locale(&cli.data).ok())
+    } else {
+        let mut sites = Vec::with_capacity(locales.len());
+        for folder in locales {
+            let chain = Chain::open_locale(&cli.data, folder)
+                .with_context(|| format!("opening {} as {folder}", cli.data.display()))?;
+            tracing::info!(locale = folder, "patch chain open");
+            sites.push((folder.to_string(), site(chain, Some(folder.to_string()))));
+        }
+        let default = benilla_formats::data_locale(&cli.data)
+            .with_context(|| format!("choosing a locale in {}", cli.data.display()))?;
+        wenilla_host::locale_site::router(sites, &default)
+    };
+    let app = pages.merge(wenilla_host::ws::router(
+        cli.upstream.clone(),
+        wenilla_host::ALLOWED_PORTS,
+    ));
 
     let listener = tokio::net::TcpListener::bind(&cli.bind)
         .await

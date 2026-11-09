@@ -38,13 +38,16 @@
 //
 // Memory is a byte-bounded LRU. Under it sits the Cache API, keyed by the host's data version
 // (`GET /data/__version`), so a second visit reads the disk instead of the network and a changed
-// install drops the old copy. Names are matched as the MPQ hash matches them: any case, `/` ≡ `\`.
+// install drops the old copy. Each locale prefix (`/eses/data`) keeps its own copy, so switching
+// language never drops another's. Names are matched as the MPQ hash matches them: any case, `/` ≡ `\`.
 
 const DEFAULT_BUDGET = 384 * 1024 * 1024;
 const LEARNED_KEY = 'wenilla:data:learned';
 const LEARNED_MAX = 6000;
 const FILLED_KEY = 'wenilla:data:filled';
 const CACHE_PREFIX = 'wenilla-data-';
+/// A cache that belongs to one locale prefix: the prefix's four letters follow `CACHE_PREFIX`.
+const LOCALE_CACHE = /^wenilla-data-[a-z]{4}-/;
 const DROPPED = new Error('fetch ahead dropped');
 
 /// The MPQ-equivalence key: lowercase, backslash-separated.
@@ -54,6 +57,9 @@ export function dataKey(name) {
 
 export function createStore(opts = {}) {
   const base = opts.base ?? '/data';
+  const scope = /\/([a-z]{4})\/data$/.exec(base)?.[1];
+  const cachePrefix = scope ? `${CACHE_PREFIX}${scope}-` : CACHE_PREFIX;
+  const filledKey = scope ? `${FILLED_KEY}:${scope}` : FILLED_KEY;
   const budget = opts.budgetBytes ?? DEFAULT_BUDGET;
   const fetchFn = opts.fetch ?? ((...a) => globalThis.fetch(...a));
   const cacheStorage = opts.persist === false ? null : (opts.caches ?? globalThis.caches ?? null);
@@ -144,9 +150,12 @@ export function createStore(opts = {}) {
         if (!cacheStorage) return null;
         const version = await dataVersion();
         if (!version) return null;
-        const name = CACHE_PREFIX + version;
+        const name = cachePrefix + version;
+        const anotherLocale = (n) => LOCALE_CACHE.test(n) && !(scope && n.startsWith(cachePrefix));
         for (const n of await cacheStorage.keys()) {
-          if (n.startsWith(CACHE_PREFIX) && n !== name) cacheStorage.delete(n).catch(() => {});
+          if (n.startsWith(CACHE_PREFIX) && n !== name && !anotherLocale(n)) {
+            cacheStorage.delete(n).catch(() => {});
+          }
         }
         return await cacheStorage.open(name);
       })().catch(() => null);
@@ -310,7 +319,7 @@ export function createStore(opts = {}) {
 
   function readFilled(version) {
     try {
-      const v = JSON.parse(storage?.getItem(FILLED_KEY) ?? 'null');
+      const v = JSON.parse(storage?.getItem(filledKey) ?? 'null');
       return v?.version === version && Array.isArray(v.tags) ? v.tags : [];
     } catch (_) {
       return [];
@@ -320,7 +329,7 @@ export function createStore(opts = {}) {
   function writeFilled(version, tag) {
     try {
       const tags = [...readFilled(version), tag];
-      storage?.setItem(FILLED_KEY, JSON.stringify({ version, tags }));
+      storage?.setItem(filledKey, JSON.stringify({ version, tags }));
     } catch (_) {
       /* quota or private mode: the next visit walks the list again and finds it cached */
     }
