@@ -477,7 +477,14 @@ async fn query(
 ) -> bool {
     let mut ok = logon.refresh_realms(REALM_REFRESH_TIMEOUT).await;
     if !ok {
-        match benilla_protocol::logon_async(&req.host, &req.user, &req.pass).await {
+        match benilla_protocol::logon_async(
+            &req.host,
+            &req.user,
+            &req.pass,
+            benilla_formats::client_locale().code,
+        )
+        .await
+        {
             Ok(fresh) => {
                 *logon = fresh;
                 ok = true;
@@ -567,7 +574,14 @@ async fn run(
 
         // Logon: the dial and the SRP6 exchange against realmd.
         stage(LoginStage::Connecting);
-        let mut logon = match benilla_protocol::logon_async(&req.host, &req.user, &req.pass).await {
+        let mut logon = match benilla_protocol::logon_async(
+            &req.host,
+            &req.user,
+            &req.pass,
+            benilla_formats::client_locale().code,
+        )
+        .await
+        {
             Ok(l) => l,
             Err(e) => {
                 if canceled() {

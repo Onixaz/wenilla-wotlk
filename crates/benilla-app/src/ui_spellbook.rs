@@ -105,6 +105,10 @@ struct FeedMemory {
     cooldown_epoch: gate::Watch,
     rune_epoch: gate::Watch,
     self_present: gate::Watch,
+    /// The race and class whose rank table the script holds.
+    next_ranks_for: Option<(u8, u8)>,
+    /// The known-spell set the script holds.
+    known_pushed: BTreeSet<u32>,
 }
 
 fn feed_spellbook(
@@ -202,6 +206,18 @@ fn feed_spellbook(
     let (race, class) = store
         .map(|s| (s.0.unit_race().unwrap_or(0), s.0.unit_class().unwrap_or(0)))
         .unwrap_or((0, 0));
+    // The known test reads the bitmap, set ahead of the registrar's book gates (`0x54208a`).
+    if memory.known_pushed != actions.spells {
+        memory.known_pushed.clone_from(&actions.spells);
+        script.set_known_spells(actions.spells.iter().copied());
+    }
+    // The item tests' rank walk reads the abilities the player's race and class admit (`0x71a6e6`).
+    if let Some(lines) = skill_lines.as_deref().filter(|_| race != 0 && class != 0) {
+        if memory.next_ranks_for != Some((race, class)) {
+            memory.next_ranks_for = Some((race, class));
+            script.set_next_ranks(lines.catalog.next_ranks(race, class));
+        }
+    }
     // The melee auto-attack shows the main-hand weapon, or Spell-Reset unarmed, not its `Temp`.
     let attack_icon = store.map(|s| {
         melee_auto_attack_icon(
@@ -248,13 +264,16 @@ fn feed_spellbook(
     // Each slot's cooldown (the reference's cooldown lookup: id, category and GCD alike) on the
     // `GetTime` clock, frame-stable per arm, so a running cooldown never churns the diff.
     let (anchor, ui_now) = (clock.anchor, clock.ui_now);
-    let rune_check = runes
-        .as_deref()
-        .zip(rune_costs.as_deref())
-        .map(|(runes, costs)| crate::spell::usable::RuneCheck {
-            state: &runes.state,
-            costs: &costs.0,
-        });
+    let rune_check =
+        runes
+            .as_deref()
+            .zip(rune_costs.as_deref())
+            .zip(store)
+            .map(|((runes, costs), store)| crate::spell::usable::RuneCheck {
+                state: &runes.state,
+                costs: &costs.0,
+                player: &store.0,
+            });
     let now_ms = (ui_now * 1000.0).floor() as i64;
     for slot in &mut fresh.slots {
         let d = spells.catalog.get(slot.spell_id);
@@ -534,22 +553,19 @@ pub(crate) fn cast_spell(
         ladder,
         tokens,
     } = cast;
-    // `CastSpell`'s two cancel forks, in order: the active-action toggle, then the form match,
+    // `CastSpell`'s two cancel forks, in order: the active-spell test, then the form match,
     // which `UseAction` lacks, with its silent no-op.
     let forks = via_book.then(|| (ladder.spells.as_ref(), targeting.self_store.iter().next()));
     if let Some((Some(sp), Some(store))) = forks {
         if let Some(d) = sp.catalog.get(spell_id) {
             let auras = targeting.self_auras.iter().next();
-            if crate::ui_action::toggle::active_action_toggle(spell_id, d, auras) {
+            if ladder.is_active_spell(spell_id, Some(store), auras) {
                 if ladder.keeps_fresh_toggle(spell_id) {
                     debug!("ui_spellbook: cast {spell_id} re-pressed — just cast, kept");
                     return;
                 }
-                debug!("ui_spellbook: cast {spell_id} re-pressed — aura cancels");
-                let _ = ladder
-                    .commands
-                    .0
-                    .send(crate::net::ClientCommand::CancelAura { spell_id });
+                debug!("ui_spellbook: cast {spell_id} re-pressed — cancels");
+                ladder.cancel_active_spell(spell_id, Some(store), auras);
                 return;
             }
             let form = store.0.unit_shapeshift_form();

@@ -11,6 +11,7 @@
 // - BLEND_MULTIPLY: (rgb·α, α) under (Dst, 1−srcα) = `dst·lerp(1, rgb, α)`, the blob shadow's
 //   modulate-with-fade and ModelBlend::Mod at α = 1.
 // - BLEND_MOD2X:    (rgb, 1) under (Dst, Src) = `2·src·dst`, rain's state; reads no alpha.
+//   EffectBlend::ModAdd shares it under (Dst, One), and AlphaDepthWrite shares BLEND_ALPHA.
 
 #import bevy_render::view::View
 
@@ -21,7 +22,7 @@ struct WowLight {
     light_sun: vec4<f32>,
     light_spec: vec4<f32>,
     fog_color: vec4<f32>,  // rgb row-7 fog (gamma); w = enable (>0.5)
-    fog_params: vec4<f32>, // x=start y=end z=linear-lighting A/B flag w=farclip wall
+    fog_params: vec4<f32>, // x=start y=end z=shadow cutoff w=farclip wall
     sh_c10_r: vec4<f32>,
     sh_c10_g: vec4<f32>,
     sh_c10_b: vec4<f32>,

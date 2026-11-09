@@ -11,12 +11,17 @@
 
 use mlua::{Lua, Value, Variadic};
 
-/// An mlua error's bare Lua message, as `loadstring` returns it: without the `syntax error: ` or
-/// `runtime error: ` word mlua's `Display` adds and the reference never does.
-pub(super) fn lua_message(e: &mlua::Error) -> String {
+/// An mlua error's bare Lua message, what `error` raised and `loadstring` returns: without the
+/// `syntax error: ` or `runtime error: ` word mlua's `Display` adds and the traceback mlua and our
+/// `xpcall` handler append, none of which the reference's error handler (`0x819730`) ever gets.
+pub fn lua_message(e: &mlua::Error) -> String {
     match e {
         mlua::Error::SyntaxError { message, .. } => message.clone(),
-        mlua::Error::RuntimeError(m) => m.clone(),
+        mlua::Error::RuntimeError(m) => match m.split_once("\nstack traceback:") {
+            Some((bare, _)) => bare.to_string(),
+            None => m.clone(),
+        },
+        mlua::Error::CallbackError { cause, .. } => lua_message(cause),
         other => other.to_string(),
     }
 }
@@ -550,9 +555,6 @@ end
 -- ── _G accessors (getglobal/setglobal: _G[name] get/set) ───────────────────────────────
 function getglobal(name) return _G[name] end
 function setglobal(name, value) _G[name] = value end
-
--- ── GetLocale: benilla ships/reads enUS data only (the 5875 MPQs + Spell.dbc enUS column) ──────
-function GetLocale() return "enUS" end
 
 -- ── NOT here: wipe / strsplit / strjoin / strconcat / strtrim ─────────────────────────────────
 -- The client's own bindings, which `lua51.rs` installs after this layer.

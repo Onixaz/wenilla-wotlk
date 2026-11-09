@@ -279,6 +279,15 @@ pub struct TooltipState {
     /// The item shown, which every item setter records, its template held or in flight, and
     /// `GetItem` (`0x61ef10`) reads; 0 for none.
     pub item_id: u32,
+    /// The shown item object's guid (`+0x360`), 0 for a link or a template.
+    pub item_guid: u64,
+    /// The shown item's link block (`+0x3a0`): what `GetItem` rebuilds its link from.
+    pub item_link: crate::script::ItemLinkFields,
+    /// The spell shown and the talent's next rank (`GetSpell`, `0x61f0f0`); 0 for none.
+    pub spell_id: u32,
+    pub next_rank_spell: u32,
+    /// The quest shown (`SetHyperlink`'s toggle), 0 for none.
+    pub quest_id: u32,
 }
 
 /// `AddTexture`'s slot count, the template's `$parentTexture1..10` (`0x61c8bd`, `cmp 0xa`).
@@ -764,17 +773,8 @@ pub struct ScrollFrameState {
     pub range_stamp: Option<(u64, u64)>,
 }
 
-/// `Button:SetFont`'s record, one for the client's three embedded fonts (`+0x33c`, `+0x434`,
-/// `+0x3b8`), since `SetFont` sets all three alike and no Lua call parts them.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ButtonFont {
-    pub path: String,
-    /// The font height in logical px.
-    pub height: f32,
-    /// The normalized outline, `""`, `"OUTLINE"` or `"THICKOUTLINE"`, as `GetFont` answers it; an
-    /// omitted `flags` clears it, where the reference's handling is untraced.
-    pub flags: String,
-}
+/// The constructor's pushed offset (`0x970520`): 0.001 and -0.001 of the screen's width.
+const DEFAULT_PUSHED_TEXT_OFFSET: [f32; 2] = [1.024, -1.024];
 
 /// A button's state, `[button+0x328]`: 0 DISABLED, 1 NORMAL, 2 PUSHED, also the index into its
 /// texture array `+0x4b8`. Past the constructor, the state setter is its only writer.
@@ -822,15 +822,12 @@ pub struct ButtonState {
     pub highlight_font: Option<String>,
     /// [`ButtonState::normal_font`] for the disabled state (`+0x2b8`).
     pub disabled_font: Option<String>,
-    /// `Button:SetFont`'s face, kept on the button since `SetFont` never touches the label
-    /// (`+0x338`) and so creates none; extract applies it to whatever label there is.
-    pub font: Option<ButtonFont>,
-    /// `SetTextColor`'s label colour for the normal state, painted over the state font's own.
-    pub normal_color: Option<[f32; 4]>,
-    /// [`ButtonState::normal_color`] for the highlighted state, which never falls back to it.
-    pub highlight_color: Option<[f32; 4]>,
-    /// [`ButtonState::normal_color`] for the disabled state.
-    pub disabled_color: Option<[f32; 4]>,
+    /// The label's offset while pushed (`+0x2bc`), in UI units; `<PushedTextOffset>`,
+    /// `SetPushedTextOffset`.
+    pub pushed_text_offset: [f32; 2],
+    /// `SetMotionScriptsWhileDisabled` (`motionScriptsWhileDisabled=`): a disabled button still runs
+    /// its `OnEnter` and `OnLeave` (`0x96fca0`).
+    pub motion_scripts_while_disabled: bool,
     /// `LockHighlight()`: highlighted regardless of hover, both the texture and the label font.
     pub locked_highlight: bool,
     /// The shown state texture (`+0x4c4`), written only by `set_state` and `set_state_slot`.
@@ -856,10 +853,8 @@ impl Default for ButtonState {
             normal_font: None,
             highlight_font: None,
             disabled_font: None,
-            font: None,
-            normal_color: None,
-            highlight_color: None,
-            disabled_color: None,
+            pushed_text_offset: DEFAULT_PUSHED_TEXT_OFFSET,
+            motion_scripts_while_disabled: false,
             locked_highlight: false,
             shown: None,
             state: ButtonVisualState::Normal,
@@ -938,6 +933,11 @@ impl ButtonState {
     pub fn set_button_state(&mut self, new: ButtonVisualState, locked: bool) {
         self.locked = locked;
         self.set_state(new);
+    }
+
+    /// The press state a release's click requires.
+    pub fn is_pushed(&self) -> bool {
+        self.state == ButtonVisualState::Pushed
     }
 
     /// `IsEnabled`: the state alone; the class has no enabled flag.
@@ -1213,6 +1213,14 @@ impl SliderState {
         let span = (f64::from(self.max) - f64::from(self.min)) as f32;
         let max = (f64::from(span) + f64::from(self.min)) as f32;
         self.set_min_max(self.min, max)
+    }
+
+    /// The setter's unchanged test (`0x96c484`): the stored minimum and span within the epsilon
+    /// `[0x9ea27c]` (one `FLT_EPSILON`, `2.384e-7`).
+    pub fn same_range(&self, min: f32, max: f32) -> bool {
+        const RANGE_EPSILON: f32 = 2.384_185_8e-7;
+        (self.max - self.min - (max - min)).abs() < RANGE_EPSILON
+            && (self.min - min).abs() < RANGE_EPSILON
     }
 
     /// `SetMinMaxValues`: sets the range; re-settles the value only once one exists.

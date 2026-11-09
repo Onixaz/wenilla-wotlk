@@ -127,12 +127,20 @@ impl BindChecks<'_, '_> {
     }
 
     /// The same compare against a corpse. The range lookup pads a corpse's bounds as a unit's, but
-    /// with no unit to read the second reach from it reads the caster's again. On the ranged arm,
-    /// which the corpse spells use, no unit means no moving bonus; a melee row would fall back to
-    /// the auto-attack target.
+    /// with no unit to read the second reach from it reads the caster's again, and the pair is the
+    /// spell's own kind's (`0x801692`). On the ranged arm, which the corpse spells use, no unit
+    /// means no moving bonus; a melee row would fall back to the auto-attack target.
     fn corpse_range_refusal(&self, spell_id: u32, entity: Entity) -> Option<u8> {
         let mut range = self.range_inputs(entity);
-        range.target = Some(benilla_formats::RangeUnit::still(range.caster.reach));
+        let assist = self
+            .spells
+            .as_deref()
+            .and_then(|s| s.catalog.get(spell_id))
+            .is_some_and(benilla_formats::SpellDisplay::is_helpful);
+        range.target = Some(benilla_formats::RangeUnit {
+            assist,
+            ..benilla_formats::RangeUnit::still(range.caster.reach)
+        });
         self.refusal(spell_id, range)
     }
 
@@ -227,8 +235,8 @@ struct Targeting {
     commit: super::cast_send::CastCommit,
     /// The standing flag_word; more than one seam can answer yes to it.
     word: u32,
-    /// The ladder passed a mounted caster on the auto-dismount check: the commit dismounts first.
-    dismount: bool,
+    /// What the pending send does ahead of the cast (`0x80ac90`), kept for the click's commit.
+    prelude: super::cast_send::CastPrelude,
 }
 
 impl SpellTargeting {
@@ -289,20 +297,20 @@ impl SpellTargeting {
             spell_id,
             commit,
             word,
-            dismount: false,
+            prelude: super::cast_send::CastPrelude::default(),
         });
     }
 
-    /// Mark the standing cast to dismount at its commit, as the pending send does (`0x80af40`).
-    pub(crate) fn dismount_at_commit(&mut self, dismount: bool) {
+    /// Hold what the standing cast's commit does first, as the pending send does (`0x80ac90`).
+    pub(crate) fn prelude_at_commit(&mut self, prelude: super::cast_send::CastPrelude) {
         if let Some(t) = &mut self.0 {
-            t.dismount = dismount;
+            t.prelude = prelude;
         }
     }
 
-    /// Whether the standing cast's commit dismounts first.
-    pub(crate) fn dismounts(&self) -> bool {
-        self.0.as_ref().is_some_and(|t| t.dismount)
+    /// What the standing cast's commit does first.
+    pub(crate) fn prelude(&self) -> Option<&super::cast_send::CastPrelude> {
+        self.0.as_ref().map(|t| &t.prelude)
     }
 
     /// The pending cast when the standing word answers `wants`, so no commit fires on a word its

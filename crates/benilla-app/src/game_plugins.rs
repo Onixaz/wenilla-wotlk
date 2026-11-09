@@ -931,9 +931,31 @@ pub(crate) mod schedule_tests {
     ///   threat and NPC-session feeds, the art scope, the WDL stream and the booth billboards),
     ///   one frame late at worst, as the rider poses; and `net::motion::facing::
     ///   apply_walk_end_facing` against `face_booth_billboards`, which turns only booth quads.
+    /// - The seated frame (#352) adds 55: `vehicle::ride::follow_vehicles` writes a seated unit's
+    ///   `Transform`, `RemoteMotion` and our `Player` at the head of the entity-visuals chain, as
+    ///   `transport::compose_riders` does a rider's, against the same unordered readers (the range,
+    ///   reach, threat, spell-info and session feeds, the camera and the art scope), one frame late at
+    ///   worst.
+    /// - The missile targeting kit and ground following (#110) add 4: `spawn_missiles` and
+    ///   `move_missiles` arm and reap a targeting kit, writing `SpellKitSound` against
+    ///   `sound::spell::route_spell_kit_sounds` and `SpellKitFx` against the chain-beam spawner
+    ///   (each read a frame late at worst), and `move_missiles` reads the terrain heightfield
+    ///   against `rescatter_clutter`, which touches only the clutter.
+    /// - The kit's weapon effects and body procs (#110) add 17: `arm_aura_state_fx`,
+    ///   `play_state_done_kits` and `replay_morph_kit` stow the weapons through `SheathRequest`
+    ///   against `drain_death`, `commit_item_cast_on_pick`, `drain_go_openers`,
+    ///   `drain_bind_on_use_confirms` and `drain_trade_skill`: the driver keeps one request per
+    ///   unit, so two in one frame on one unit settle a frame late at worst;
+    ///   `play_body_procs` reads `NetEntity` against `refresh_live_display`, which only swaps a
+    ///   display; and `tick_shard_emitters` reads the terrain heightfield against
+    ///   `rescatter_clutter`, as `move_missiles` does.
+    /// - `record_spells_in_transit` reads a caster's place against `publish_camera_pose` (+1): a
+    ///   frame's lag does not move a landing time that matters.
+    /// - `target::scan::remember_last_enemy` reads `Player` for the auto-dismount check (`0x71b0c0`)
+    ///   against six writers (+6): a mover's flags a frame late only delay a sampled stamp.
     // The realm entry latch precedes UiFeed and the logout probe, ordering 54 roster/UI pairs.
     // The corpse resolver (#636) follows the transport chain inside UiFeed, ordering 63 more.
-    const UPDATE_ACTIONABLE_CEILING: usize = 3_796;
+    const UPDATE_ACTIONABLE_CEILING: usize = 3_879;
     const UPDATE_ACTIONABLE_SLACK: usize = 40;
 
     fn ratchet(what: &str, n: usize, ceiling: usize, slack: usize) {

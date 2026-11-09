@@ -32,6 +32,7 @@ fn probe_strings(key: &str) -> Option<String> {
 fn warrior(known: &[u32]) -> reeval::PlayerView {
     reeval::PlayerView {
         known: known.iter().copied().collect(),
+        race_class: (1, 1),
         level: 10,
         skills: Vec::new(),
         unlearned: Vec::new(),
@@ -252,7 +253,7 @@ fn the_item_link_is_the_cached_product_at_a_tradeskill_trainer_alone() {
     let link = |t| service_item_link(100, t, &spells, &deps.items, &deps.commands);
     assert_eq!(
         link(TRAINER_TYPE_TRADESKILL).as_deref(),
-        Some("|cffffffff|Hitem:777:0:0:0|h[Copper Shortsword]|h|r")
+        Some("|cffffffff|Hitem:777:0:0:0:0:0:0:0:0|h[Copper Shortsword]|h|r")
     );
     assert_eq!(link(0), None);
 }
@@ -862,6 +863,7 @@ mod re_derive {
     fn player() -> PlayerView {
         PlayerView {
             known: BTreeSet::new(),
+            race_class: (1, 1),
             level: 10,
             skills: Vec::new(),
             unlearned: Vec::new(),

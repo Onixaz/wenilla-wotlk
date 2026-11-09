@@ -13,6 +13,8 @@ pub use benilla_blp::BlpTexels;
 
 mod chain;
 pub use chain::{data_locale, Chain, ChainEntry};
+mod locale;
+pub use locale::{boot_locale, client_locale, dbc_strings, packed as packed_locale, ClientLocale};
 /// Loose `.tga` art, as addon folders ship it.
 mod tga;
 pub use tga::tga_to_rgba;
@@ -163,7 +165,9 @@ pub use pet_stats::{
     load_pet_personalities, PetHappiness, PetPersonalities, PetPersonality, FALLBACK_PERSONALITY,
 };
 mod items;
-pub use items::{load_item_display_catalog, ItemDisplay, ItemDisplayCatalog};
+pub use items::{
+    load_item_dbc_displays, load_item_display_catalog, ItemDisplay, ItemDisplayCatalog,
+};
 mod item_sounds;
 pub use item_sounds::{load_item_group_sounds, ItemGesture, ItemGroupSoundsCatalog};
 mod item_visuals;
@@ -252,9 +256,9 @@ pub use spells::{
     cc_exemption, grants_immunity, load_shapeshift_forms, load_spell_cast_times,
     load_spell_catalog, load_spell_description_variables, load_spell_dispel_types,
     load_spell_durations, load_spell_radii, load_spell_ranges, min_max_range,
-    min_max_range_reads_units, soft_modify, substitute, Caster, CcExemption, CompanionKind,
-    FormRefusal, LearnAnnouncement, LearnEffect, OpenLock, PlayerValue, RangeTargets, RangeUnit,
-    ShapeshiftForm, SpellCastTime, SpellCastTimeCatalog, SpellCatalog,
+    min_max_range_reads_units, min_max_range_with, soft_modify, substitute, Caster, CcExemption,
+    CompanionKind, FormRefusal, LearnAnnouncement, LearnEffect, OpenLock, PlayerValue,
+    RangeTargets, RangeUnit, ShapeshiftForm, SpellCastTime, SpellCastTimeCatalog, SpellCatalog,
     SpellDescriptionVariablesCatalog, SpellDispelTypes, SpellDisplay, SpellDuration,
     SpellDurationCatalog, SpellMods, SpellRadius, SpellRadiusCatalog, SpellRange,
     SpellRangeCatalog, TokenContext, TokenNumber, UnitMotion, ATTR_CASTABLE_WHILE_DEAD,
@@ -282,9 +286,11 @@ mod talents;
 pub use talents::{load_talent_catalog, Talent, TalentCatalog, TalentTabInfo, MAX_TALENT_RANK};
 mod spell_visual;
 pub use spell_visual::{
-    char_proc_small_int, char_proc_type, load_spell_visual_catalog, ChainEffect, ChainProc,
-    CharProc, SpellMissileRec, SpellVisualCatalog, TrailProc, VisualKit, VisualStages,
-    DEFAULT_MISSILE_GRAVITY, KIT_CHAR_PROCS, KIT_SLOT_TAGS, MISSILE_ATTACH_TABLE, WORLD_EFFECT_TAG,
+    chain_flag, char_proc_type, kit_flag, load_spell_visual_catalog, shard_density, ChainEffect,
+    ChainProc, CharProc, EffectScale, MissileMotionRec, ModelAttach, SpellMissileRec,
+    SpellVisualCatalog, TrailProc, VisualKit, VisualStages, DEFAULT_MISSILE_GRAVITY,
+    KIT_CHAR_PROCS, KIT_SLOT_TAGS, MAX_COMBO_ROWS, MISSILE_ATTACH_TABLE, MODEL_ATTACH_WORLD,
+    WEAPON_EFFECT_TAGS, WORLD_EFFECT_TAG,
 };
 mod emit_timing;
 pub use emit_timing::{EmitParams, EmitTiming, ParamsNow};

@@ -5,21 +5,25 @@ use crate::framexml::{self, Element};
 use super::{abs_dim, abs_value, children_named, color_of, tex_coords_of, Loader};
 
 impl Loader<'_> {
-    /// `<StatusBar>`: a reversed `minValue`/`maxValue` pair is swapped, as `SetMinMaxValues` also
-    /// does; `drawLayer` is the bar texture's layer, ARTWORK by default.
+    /// `<StatusBar>`: `minValue` with `maxValue` run the bound and the setter (`0x961800`), which
+    /// clamps a reversed pair; `drawLayer` is the bar texture's layer, ARTWORK by default.
     pub(super) fn apply_statusbar(&mut self, el: &Element, wrapper: &Table, dbg: &str) {
         if !el.tag.eq_ignore_ascii_case("StatusBar") {
             return;
         }
         let parse = |attr: &str| el.attr(attr).and_then(|v| v.trim().parse::<f32>().ok());
-        let (min, max) = (parse("minValue"), parse("maxValue"));
-        if min.is_some() || max.is_some() {
-            self.call(
-                wrapper,
-                "SetMinMaxValues",
-                (min.unwrap_or(0.0), max.unwrap_or(0.0)),
-                dbg,
-            );
+        if let (Some(min), Some(max)) = (parse("minValue"), parse("maxValue")) {
+            match crate::script::statusbar::range_error(f64::from(min), f64::from(max)) {
+                Some(message) => self.warn_once(dbg, format!("Frame {dbg}: {message}")),
+                None => {
+                    let set = crate::script::statusbar::set_min_max(self.lua(), wrapper, min, max);
+                    if let Err(e) = set {
+                        self.report
+                            .errors
+                            .push(format!("{dbg}: SetMinMaxValues: {e}"));
+                    }
+                }
+            }
         }
         if let Some(o) = el.attr("orientation") {
             self.call(wrapper, "SetOrientation", o.to_string(), dbg);
@@ -233,12 +237,36 @@ impl Loader<'_> {
                 }
             }
         }
+        // All three colours write the shared normal font, when the button has one by then
+        // (`0x96f8d0`, branches `0x970162`, `0x970198`, `0x9701d1`), and later ones win.
+        for tag in ["NormalColor", "HighlightColor", "DisabledColor"] {
+            for c in children_named(el, tag).map(color_of) {
+                if let Ok(h) = crate::script::object::frame_handle_of(self.lua(), wrapper) {
+                    let mut model = self.model();
+                    let font = match model.arena.frame(h).map(|f| &f.kind_state) {
+                        Some(crate::widget::KindState::Button(bs)) => bs.normal_font.clone(),
+                        _ => None,
+                    };
+                    if let Some(font) = font {
+                        crate::script::font::set_object_color(&mut model, &font, c);
+                    }
+                }
+            }
+        }
+        if let Some(o) = children_named(el, "PushedTextOffset").last() {
+            if let (Some(x), Some(y)) = abs_dim(o) {
+                self.call(wrapper, "SetPushedTextOffset", (x, y), dbg);
+            }
+        }
         // After the fonts, as the label is attached after the child loop (`0x970150`): a label
         // `text=` creates is anchored by the normal font's justify (`SetFontString 0x96f7b0`).
         if let Some(text) = el.attr("text") {
             // A global-string key: `text="DELETE"` reads "Delete".
             let text = self.resolve_text(text, dbg);
             self.call(wrapper, "SetText", text, dbg);
+        }
+        if let Some(on) = el.attr_bool_opt("motionScriptsWhileDisabled") {
+            self.call(wrapper, "SetMotionScriptsWhileDisabled", on, dbg);
         }
         // `registerForClicks=` (`0x9702b1`): names split on space or comma, OR'd into 32 bits and
         // stored with the high word zeroed (`0x970321`/`0x97032a`), so no Up bit past the left's.
@@ -394,7 +422,12 @@ impl Loader<'_> {
         }
         let parse = |attr: &str| el.attr(attr).and_then(|v| v.trim().parse::<f32>().ok());
         if let (Some(min), Some(max)) = (parse("minValue"), parse("maxValue")) {
-            self.call(wrapper, "SetMinMaxValues", (min, max), dbg);
+            // The setter, not the binding: a reversed XML pair stores, as it never raises.
+            if let Err(e) = crate::script::slider::set_min_max(self.lua(), wrapper, min, max) {
+                self.report
+                    .errors
+                    .push(format!("{dbg}: SetMinMaxValues: {e}"));
+            }
             if let Some(step) = parse("valueStep") {
                 self.call(wrapper, "SetValueStep", step, dbg);
             }

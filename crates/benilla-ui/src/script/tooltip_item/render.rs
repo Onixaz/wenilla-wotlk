@@ -19,6 +19,8 @@ use super::sockets::{empty_socket, socket_lines};
 /// roll. A template source passes `None`.
 #[derive(Default)]
 pub(super) struct ItemInstance {
+    /// The item string's fields, which the link rebuilds from and a `$i` suffix line reads.
+    pub link: crate::script::ItemLinkFields,
     /// The name with its random suffix joined, which the reference composes in the builder (through
     /// `ITEM_SUFFIX_TEMPLATE`); `None` takes the template's.
     pub name: Option<String>,
@@ -123,9 +125,29 @@ pub(super) struct BuilderFlags {
     pub sell: Sell,
 }
 
-/// Render one item into the tooltip's order. Not built: ITEM_COOLDOWN_TIME, ITEM_WRAPPED_BY and the
-/// `LOCKED_WITH_*` line under LOCKED.
+/// Render one item into the tooltip's order, then run `OnTooltipSetItem` before the caller's show.
 pub(super) fn render_view(
+    lua: &Lua,
+    this: &Table,
+    v: &ItemTemplateView,
+    flags: BuilderFlags,
+    inst: Option<&ItemInstance>,
+) -> mlua::Result<()> {
+    let h = crate::script::object::frame_handle_of(lua, this)?;
+    {
+        let mut model = crate::script::model_mut_of(lua);
+        if let Ok(t) = crate::script::tooltip::tip_mut(&mut model, h) {
+            t.item_guid = inst.map_or(0, |i| i.guid);
+            t.item_link = inst.map_or_else(Default::default, |i| i.link);
+        }
+    }
+    render_lines(lua, this, v, flags, inst)?;
+    super::fire_set_item(lua, this)
+}
+
+/// The lines. Not built: ITEM_COOLDOWN_TIME, ITEM_WRAPPED_BY and the `LOCKED_WITH_*` line under
+/// LOCKED.
+fn render_lines(
     lua: &Lua,
     this: &Table,
     v: &ItemTemplateView,
@@ -139,8 +161,8 @@ pub(super) fn render_view(
             .cvars
             .get("showitemlevel")
             .is_some_and(|c| c.value.trim().parse::<f64>().is_ok_and(|n| n != 0.0));
-        // The known bits (the unit's spell-known test, `0x7260e0`): a mount or companion counts.
-        let knows = |id: u32| model.spellbook.named().any(|s| s.spell_id == id);
+        // The known bits or a higher rank (`0x62b4a2`-`0x62b4ae`, `0x62b50d`-`0x62b51c`).
+        let knows = |id: u32| model.known_spells.known_or_higher(id);
         let known = v.required_spell != 0 && knows(v.required_spell);
         // A taught spell (trigger 6, learn) the player knows: the always-red ITEM_SPELL_KNOWN.
         let taught = v
@@ -576,7 +598,7 @@ pub(super) fn render_view(
         let list: Vec<&str> = CLASS_NAMES
             .iter()
             .filter(|&&(id, _)| v.allowable_class & (1 << (id - 1)) != 0)
-            .map(|&(_, n)| n)
+            .map(|&(id, n)| crate::locale::class_name(id).unwrap_or(n))
             .collect();
         if !list.is_empty() {
             let ok = req.class_id > 0 && v.allowable_class & (1 << (req.class_id - 1)) != 0;
@@ -595,7 +617,7 @@ pub(super) fn render_view(
         let list: Vec<&str> = RACE_NAMES
             .iter()
             .filter(|&&(id, _)| v.allowable_race & (1 << (id - 1)) != 0)
-            .map(|&(_, n)| n)
+            .map(|&(id, n)| crate::locale::race_name(id).unwrap_or(n))
             .collect();
         if !list.is_empty() {
             let ok = req.race_id > 0 && v.allowable_race & (1 << (req.race_id - 1)) != 0;

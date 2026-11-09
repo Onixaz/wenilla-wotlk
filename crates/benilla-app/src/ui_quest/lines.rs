@@ -16,7 +16,7 @@ use crate::ui_quest_log::QuestLog;
 /// One quest chat line, raised in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QuestLine {
-    /// `ERR_QUEST_ACCEPTED_S` (`0x89`) with the quest's title.
+    /// `ERR_QUEST_ACCEPTED_S` (`0x92`) with the quest's title.
     Accepted(u32),
     /// `ERR_QUEST_COMPLETE_S` with the title, for every turn-in; the next quest in the chain only
     /// decides whether the window stays (`0x6d10ca`).
@@ -338,7 +338,7 @@ mod tests {
                 "Quest accepted: A Threat Within",
                 "Experience gained: 450.",
                 "Received 10 Silver, 25 Copper.",
-                "Received item: |cffffffff|Hitem:2580:0:0:0|h[Linen Cloth]|h|r.",
+                "Received item: |cffffffff|Hitem:2580:0:0:0:0:0:0:0:0|h[Linen Cloth]|h|r.",
             ]
         );
         assert_eq!(
@@ -375,7 +375,7 @@ mod tests {
             chat(&app)[4..],
             [
                 "Kobold Camp Cleanup completed.",
-                "Received item: |cffffffff|Hitem:6529:0:0:0|h[Shiny Bauble]|h|r.",
+                "Received item: |cffffffff|Hitem:6529:0:0:0:0:0:0:0:0|h[Shiny Bauble]|h|r.",
             ]
         );
         assert!(app.world().resource::<QuestLines>().queued().is_empty());
@@ -430,7 +430,7 @@ mod tests {
         app.update();
         assert_eq!(
             chat(&app),
-            ["Received item: |cffffffff|Hitem:6529:0:0:0|h[Shiny Bauble]|h|r."]
+            ["Received item: |cffffffff|Hitem:6529:0:0:0:0:0:0:0:0|h[Shiny Bauble]|h|r."]
         );
         assert!(app.world().resource::<QuestLines>().queued().is_empty());
     }

@@ -15,7 +15,7 @@ use benilla_protocol::messages::{
 };
 pub(crate) use benilla_protocol::messages::{BANK_BAGS, BANK_SLOTS, KEYRING_SLOTS};
 use benilla_protocol::ObjectFields;
-use benilla_ui::script::EQUIPMENT_BAG;
+use benilla_ui::script::{ItemLinkFields, EQUIPMENT_BAG};
 use bevy::prelude::*;
 
 use crate::items::Items;
@@ -676,8 +676,7 @@ pub(crate) fn item_use_route(
 /// reference's cast tail runs the cast attempt the spellbook, `/cast` and the action bar run, with
 /// the item as an argument no gate skips for, and the cast send picks the opcode from it. So an
 /// item use takes the whole cast ladder, [`crate::spell::CastLadder::send`]. The toggle-cancel scan
-/// above the tail (an aura cancel) is the action button's predicate,
-/// [`crate::ui_action::toggle::active_action_toggle`], applied to the item's spell.
+/// above the tail is the click path's active-spell test, applied to the item's spell.
 ///
 /// Returns whether anything left for the server.
 pub(crate) fn send_item_use(
@@ -691,12 +690,8 @@ pub(crate) fn send_item_use(
     ui_errors: &mut crate::ui_action::UiErrorKeys,
 ) -> bool {
     // The toggle predicate over the caster's live aura slots.
-    let aura_cancels = |spell: u32| {
-        let Some(d) = ladder.spells.as_ref().and_then(|s| s.catalog.get(spell)) else {
-            return false;
-        };
-        crate::ui_action::toggle::active_action_toggle(spell, d, ctx.self_auras)
-    };
+    let aura_cancels =
+        |spell: u32| ladder.is_active_spell(spell, ctx.rel.self_store, ctx.self_auras);
     // The disarm ladder, asked of the caster's own inventory.
     let disarmed_hand = ctx.rel.self_store.and_then(|store| {
         crate::items::disarmed_equipment_slot(
@@ -706,7 +701,11 @@ pub(crate) fn send_item_use(
             &ladder.commands,
         )
     });
-    match item_use_route(it, aura_cancels, disarmed_hand) {
+    let route = item_use_route(it, aura_cancels, disarmed_hand);
+    if matches!(route, ItemUseRoute::Cast(_)) && !leave_form_to_use(&it, ctx, ladder, ui_errors) {
+        return false;
+    }
+    match route {
         ItemUseRoute::CantUseDisarmed => {
             debug!(
                 "ui_items: item use refused — that hand is disarmed (slot {})",
@@ -718,11 +717,8 @@ pub(crate) fn send_item_use(
             false
         }
         ItemUseRoute::ToggleCancel(spell) => {
-            debug!("ui_items: item use {spell} re-pressed — its aura cancels, no cast");
-            let _ = ladder
-                .commands
-                .0
-                .send(crate::net::ClientCommand::CancelAura { spell_id: spell });
+            debug!("ui_items: item use {spell} re-pressed — cancels, no cast");
+            ladder.cancel_active_spell(spell, ctx.rel.self_store, ctx.self_auras);
             true
         }
         ItemUseRoute::QuestOffer { npc, quest } => {
@@ -776,41 +772,97 @@ pub(crate) fn send_item_use(
     }
 }
 
-/// The client's quality colour escape for an item link: it indexes the seven-entry table and clamps
-/// anything `>= 7` to index 1, white, which is the catch-all arm.
-pub(super) fn quality_color(quality: u32) -> &'static str {
-    match quality {
-        0 => "ff9d9d9d",
-        2 => "ff1eff00",
-        3 => "ff0070dd",
-        4 => "ffa335ee",
-        5 => "ffff8000",
-        6 => "ffe6cc80",
-        _ => "ffffffff",
+/// The item use's form leg (`0x708c20`): a shapeshifted player leaves the form unless the form
+/// (flag `0x80`, or `0x40` for gear) or the item (flag `0x800000`) allows it; `false` is refused.
+fn leave_form_to_use(
+    it: &ItemUse,
+    ctx: &crate::spell::cast_target::CastContext,
+    ladder: &crate::spell::CastLadder,
+    ui_errors: &mut crate::ui_action::UiErrorKeys,
+) -> bool {
+    let (Some(store), Some(template)) =
+        (ctx.rel.self_store, ladder.items.template_cached(it.entry))
+    else {
+        return true;
+    };
+    let form = store.0.unit_shapeshift_form();
+    let row = ctx.rel.types.forms.and_then(|f| f.get(&u32::from(form)));
+    let flags = row.map_or(0, |f| f.flags);
+    let exempt = flags & 0x80 != 0
+        || (flags & 0x40 != 0 && template.inventory_type != 0)
+        || template.flags & 0x80_0000 != 0;
+    if !crate::spell::validator::is_shapeshifted(form, flags) || row.is_none() || exempt {
+        return true;
+    }
+    if !ctx.auto_unshift {
+        debug!("ui_items: item use refused — shapeshifted");
+        ui_errors.0.push(crate::ui_action::UiError::key(
+            "ERR_NO_ITEMS_WHILE_SHAPESHIFTED",
+        ));
+        return false;
+    }
+    if let (Some(auras), Some(spells)) = (ctx.self_auras, ladder.spells.as_ref()) {
+        for spell_id in crate::ui_shapeshift::form_auras(form, auras, &spells.catalog) {
+            let _ = ladder
+                .commands
+                .0
+                .send(crate::net::ClientCommand::CancelAura { spell_id });
+        }
+    }
+    true
+}
+
+/// The active player's level, which the link builder stamps on every link (`0x61e290`), kept by
+/// [`track_link_level`]; 0 before a player exists.
+static LINK_LEVEL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Runs before the feeds that build links, so a login's first bag push stamps the level.
+fn track_link_level(
+    self_q: Query<&ObjectStore, (With<crate::net::SelfPlayer>, Changed<ObjectStore>)>,
+) {
+    if let Some(level) = self_q.iter().next().and_then(|s| s.0.unit_level()) {
+        LINK_LEVEL.store(level, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
-/// One item hyperlink, as the client's link builder makes every one it shows: a formatted print of
-/// `"%s|Hitem:%d:%d:%d:%d|h[%s]|h%s"`, the colour escape, item id, enchant id, random-property id,
-/// suffix factor, name, then the `|r` reset.
+/// One item hyperlink, through the client's one builder.
 pub(crate) fn item_link_full(
     item_id: u32,
-    enchant_id: u32,
-    random_property_id: u32,
-    suffix_factor: u32,
+    fields: &ItemLinkFields,
     name: &str,
     quality: u32,
 ) -> String {
-    format!(
-        "|c{}|Hitem:{item_id}:{enchant_id}:{random_property_id}:{suffix_factor}|h[{name}]|h|r",
-        quality_color(quality)
-    )
+    let level = LINK_LEVEL.load(std::sync::atomic::Ordering::Relaxed);
+    benilla_ui::script::item_hyperlink(item_id, quality, fields, level, name)
 }
 
-/// [`item_link_full`] with zero enchant, random-property and suffix ids, for a caller with no roll
-/// in hand; a rolled item's link carries the roll and its suffixed name.
+/// [`item_link_full`] with nothing past the id, for a caller with no roll in hand.
 pub(crate) fn item_link(item_id: u32, name: &str, quality: u32) -> String {
-    item_link_full(item_id, 0, 0, 0, name, quality)
+    item_link_full(item_id, &ItemLinkFields::default(), name, quality)
+}
+
+/// An item object's link fields (`0x61e3a0`): a wrapped item names nothing past its id, and a
+/// charter's enchant slot holds its petition, so its gems and enchant read 0.
+pub(crate) fn object_link_fields(
+    fields: &benilla_protocol::ObjectFields,
+    template_flags: u32,
+) -> ItemLinkFields {
+    let wrapped = fields.item_flags().unwrap_or(0) & 0x8 != 0;
+    if wrapped {
+        return ItemLinkFields::default();
+    }
+    let roll = ItemLinkFields::roll(
+        fields.item_random_properties_id() as i32,
+        fields.item_property_seed() as i32,
+    );
+    if template_flags & benilla_protocol::messages::ITEM_FLAG_CHARTER != 0 {
+        return roll;
+    }
+    ItemLinkFields {
+        enchant: fields.item_enchant(0).unwrap_or(0),
+        gems: std::array::from_fn(|i| fields.item_enchant(2 + i as u8).unwrap_or(0)),
+        ..roll
+    }
 }
 
 /// `INVTYPE_AMMO`: loaded with `CMSG_SET_AMMO`, not the equip swap.
@@ -993,6 +1045,7 @@ impl Plugin for UiItemsPlugin {
                     // The roll table, pushed whole once per VM, before the first hover.
                     feed_random_properties.in_set(UnitFeed),
                     feed_player_req.in_set(UnitFeed),
+                    track_link_level.before(UnitFeed),
                     // After the input pass, so a repair-mode click goes out the same frame; a
                     // plain `UseContainerItem` is a script call.
                     drain_container_repairs.after(UiInput),

@@ -546,7 +546,12 @@ fn cursor_info(lua: &Lua, model: &Model) -> mlua::Result<MultiValue> {
                 Some(t) => vec![
                     str("item")?,
                     int(a.action),
-                    str(&super::item_stats::item_link(a.action, &t.name, t.quality))?,
+                    str(&super::item_stats::item_link(
+                        a.action,
+                        &t.name,
+                        t.quality,
+                        model.player_req.level,
+                    ))?,
                 ],
                 None => Vec::new(),
             },
@@ -592,7 +597,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let model = lua
                 .app_data_ref::<crate::script::ModelCell>()
                 .expect("model app_data");
-            Ok(matches!(model.cursor, Some(CursorPayload::Item(_))))
+            Ok(super::binding_abi::flag(matches!(
+                model.cursor,
+                Some(CursorPayload::Item(_))
+            )))
         })?,
     )?;
     g.set(
@@ -601,7 +609,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let model = lua
                 .app_data_ref::<crate::script::ModelCell>()
                 .expect("model app_data");
-            Ok(matches!(model.cursor, Some(CursorPayload::Spell(_))))
+            Ok(super::binding_abi::flag(matches!(
+                model.cursor,
+                Some(CursorPayload::Spell(_))
+            )))
         })?,
     )?;
     g.set(

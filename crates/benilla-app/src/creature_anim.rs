@@ -16,7 +16,8 @@ use benilla_world::schedule::WorldStage;
 /// The pure selection logic: the tables, the gait, swing and ready picks, the rate math.
 pub(crate) mod select;
 pub(crate) use select::{
-    ease_strafe_yaw, move_flags, strafe_body_offset, swim_body_rotation, MovementState,
+    ease_strafe_yaw, ease_swim_pitch, move_flags, strafe_body_offset, swim_body_rotation,
+    MovementState,
 };
 use select::{Mode, Special};
 
@@ -197,6 +198,16 @@ pub(crate) fn end_ranged_mode(entity: Entity, commands: &mut Commands) {
     commands
         .entity(entity)
         .try_remove::<(AutoRepeatArmed, NockedAmmo, NockLatch)>();
+}
+
+/// The dismount ahead of a mounted swing, loot or use (`0x7412e0`): nothing on foot or on a taxi.
+pub(crate) fn dismount_first(own: &crate::net::ObjectStore, net: &crate::net::NetCommands) {
+    if own.0.unit_mount_display_id() > 0
+        && own.0.unit_flags() & crate::player::UNIT_FLAG_TAXI_FLIGHT == 0
+    {
+        debug!("dismounts first (CMSG_CANCEL_MOUNT_AURA)");
+        let _ = net.0.send(crate::net::ClientCommand::CancelMountAura);
+    }
 }
 
 /// The local StopAttack, as in the reference: when attacking, `CMSG_ATTACKSTOP`, then the
@@ -393,10 +404,8 @@ pub(crate) enum CastEventKind {
     Go,
     /// Died without release (`SMSG_SPELL_FAILED_OTHER`, or our failed `SMSG_CAST_RESULT`).
     Fail,
-    /// The spell landed on this unit (a missile arrival): impact kit, then state kit.
-    /// `weapon_visual` is the caster's ranged-weapon `SpellVisual`, carried from the GO since the
-    /// caster may despawn.
-    Impact { weapon_visual: Option<u32> },
+    /// A missile landed: `on_caster` picks the kit (`0x800d00`), `at` is its point (`0x702e5a`).
+    Impact { on_caster: bool, at: Option<Vec3> },
     /// A projectile with no live target at arrival (a despawned target too): the kit plays on the
     /// caster (`entity`) at `pos`, `SpellVisual` field 13, stage 3. Sent here only for a
     /// dest-targeted GO's missile with no hit (`MissileSpawn::ground_aim`).
@@ -412,6 +421,11 @@ pub(crate) struct CastHold {
     /// A ranged wind-up (`Attributes & 0x2`): the reference brackets it with ranged snaps, so the
     /// sheath reconcile's force-stow never survives the frame.
     pub(crate) ranged: bool,
+    /// The precast kit's start anim (`SpellVisualKit` column 1), offered once in place of
+    /// [`Self::anim_id`] until its clip ends: the latch `0x73b207` sets and `0x73bc77` clears.
+    pub(crate) start_anim: Option<u16>,
+    /// The cast edge's `PlaySeq` stamp, which tells this hold's start latch from an earlier one's.
+    pub(crate) seq: u64,
 }
 
 /// A hand's fingers close (`HandsClosed`, 15) purely because a weapon occupies its attach point,
@@ -522,11 +536,10 @@ pub(crate) struct SpellGoTargets {
     pub(crate) spell_id: u32,
     /// Units the spell landed on; each gets the impact hand-off.
     pub(crate) hits: Vec<Entity>,
-    /// Missed units with `SpellMissInfo`: the arrival plays Dodge (30) or ShieldBlock (24), never
-    /// Parry, and no impact kit; the deflect glance-off flight is not built.
+    /// Missed units with `SpellMissInfo`: no impact kit; the flight's route is
+    /// `crate::entities::missile`'s.
     pub(crate) misses: Vec<(Entity, u8)>,
-    /// A dest-targeted cast's ground point, in bevy coords; not read, the reference's
-    /// dest-anchored launch visual is untraced.
+    /// A dest-targeted cast's ground point, in bevy coords.
     pub(crate) dest: Option<Vec3>,
     /// The GO's ammo block (`castFlags & 0x20`): the ammo's `ItemDisplayInfo` id, the missile model
     /// when the visual chain has none.
@@ -535,6 +548,13 @@ pub(crate) struct SpellGoTargets {
     pub(crate) seq: u64,
     /// The GO's trajectory (`castFlags & 0x20000`).
     pub(crate) trajectory: Option<Trajectory>,
+    /// Reflects with no outcome of their own, each the caster's impact kit on it (`0x80f467`).
+    pub(crate) reflected: u8,
+    /// Each reflecting unit and the outcome on the caster of the spell it sends back.
+    pub(crate) reflects: Vec<(Entity, u8)>,
+    pub(crate) caster_guid: u64,
+    /// The server's clock at the launch.
+    pub(crate) server_time: u32,
 }
 
 /// A dest-location cast's visuals, from `SMSG_NOTIFY_DEST_LOC_SPELL_CAST` (`0x810050`), in bevy
@@ -606,6 +626,7 @@ pub(crate) mod spell_visual;
 use blood::{blood_spurts, load_blood_tables};
 use env_damage::{hard_landing_dust, load_env_damage_table};
 pub(crate) use env_damage::{EnvDamageTable, HardLanding, HARD_LANDING_DESCENT};
+pub(crate) use spell_visual::area_kit_models;
 use spell_visual::{
     arm_aura_state_fx, arm_go_loot_fx, arm_level_up_fx, arm_loot_fx, arm_morph_latch,
     arm_mount_poof_fx, load_spell_visuals, play_delayed_area_kits, play_dest_loc_casts,
@@ -616,8 +637,8 @@ use spell_visual::{
 #[cfg(test)]
 pub(crate) use spell_visual::arm_aura_state_fx as arm_aura_state_fx_for_test;
 pub(crate) use spell_visual::{
-    held_strike_sound, ChainProcPlay, FxClass, FxStage, KitPush, MissileSpawn, SpellKitFx,
-    SpellKitShake, SpellKitSound, SpellVisuals,
+    held_strike_sound, kit_fx_slots, ChainProcPlay, FxClass, FxStage, KitPush, MissileSpawn,
+    SpellKitFx, SpellKitShake, SpellKitSound, SpellVisuals,
 };
 
 /// The unit's own variation stream ([`benilla_assets::AnimRng::stream`]), cut on its first frame
@@ -662,9 +683,12 @@ pub(crate) struct AnimDriver {
     /// The reference's `[unit+0xd58] & 0xc0000`: while Knockdown, LiftOff or Land holds it, base
     /// requests are refused, so a stun's knockdown survives the root's Stand recompute.
     base_lock: driver::play::BaseAnimLock,
-    /// The committed sheath state, the reference's `[unit+0xd40]`: seeded from the descriptor,
-    /// re-adopted when it changes, overwritten by requests and the reconcile.
+    /// The committed sheath state `[unit+0xb5c]`: seeded from the descriptor, set by the setter.
     sheath_cur: Option<u8>,
+    /// The state before it `[unit+0xb58]`, which a body clip's end restores after a queued emote.
+    sheath_prev: u8,
+    /// `[unit+0xa38] & 0x8000`: the emote queue drained, so the next body clip end restores.
+    sheath_restore: bool,
     /// The last descriptor sheath byte, to detect changes.
     sheath_byte: Option<u8>,
     /// The pending mid-animation weapon swap while a draw/stow one-shot plays.
@@ -720,6 +744,8 @@ pub(crate) struct AnimDriver {
     /// (`0x73b38e`) until neither the key bone nor bone 0 plays it (`0x73bc81`). A model rebuild
     /// drops it with the driver, as the display reset does (`0x73e702`).
     special_idle: Option<u16>,
+    /// The [`CastHold::seq`] whose start anim has played out, the cleared start latch.
+    start_spent: Option<u64>,
 }
 
 impl AnimDriver {
@@ -787,6 +813,8 @@ impl Default for AnimDriver {
             interact_hold: false,
             base_lock: driver::play::BaseAnimLock::default(),
             sheath_cur: None,
+            sheath_prev: 0,
+            sheath_restore: false,
             sheath_byte: None,
             sheath_swap: None,
             started_anim: false,
@@ -805,6 +833,7 @@ impl Default for AnimDriver {
             rate_clip: None,
             base_dir: None,
             special_idle: None,
+            start_spent: None,
         }
     }
 }
@@ -835,6 +864,20 @@ impl AnimDriver {
     /// The client-side sheath state (0 stowed, 1 melee, 2 ranged), `None` until driven.
     pub(crate) fn sheath_state(&self) -> Option<u8> {
         self.sheath_cur
+    }
+
+    /// The setter's commit (`0x737019`-`0x73702b`): a change keeps the old state as PREV.
+    fn commit_sheath(&mut self, state: u8) {
+        if self.sheath_cur != Some(state) {
+            self.sheath_prev = self.sheath_cur.unwrap_or(state);
+            self.sheath_cur = Some(state);
+        }
+    }
+
+    /// The emote setter's hand-off (`0x71a30c`-`0x71a31c`): drop a pending restore, re-base PREV.
+    fn hand_off_sheath(&mut self) {
+        self.sheath_restore = false;
+        self.sheath_prev = self.sheath_cur.unwrap_or(self.sheath_prev);
     }
 
     /// Whether this unit started an animation this frame.
@@ -898,6 +941,7 @@ impl Plugin for CreatureAnimPlugin {
             .add_message::<KitPush>()
             // The aura CharProc edges, drained by `crate::aura_visual`.
             .add_message::<crate::aura_visual::AuraProc>()
+            .add_message::<crate::aura_visual::BodyProcPlay>()
             .add_message::<HardLanding>()
             // The pending-morph latch, the reference's per-unit `[+0xd54]`.
             .init_resource::<MorphLatch>()
@@ -981,7 +1025,7 @@ impl Plugin for CreatureAnimPlugin {
                 Update,
                 crate::aura_visual::apply_aura_anim_rate
                     .after(drive_animations)
-                    .after(crate::aura_visual::drain_aura_procs),
+                    .after(crate::aura_visual::tick_body_procs),
             );
     }
 }
