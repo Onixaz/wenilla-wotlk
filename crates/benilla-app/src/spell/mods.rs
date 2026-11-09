@@ -18,7 +18,8 @@ use bevy::prelude::*;
 use benilla_formats::{SpellDisplay, SpellRange};
 
 use crate::chr_classes::ChrClassTable;
-use crate::net::{ObjectStore, SelfPlayer};
+use crate::items::Items;
+use crate::net::{ObjectStore, Objects, SelfPlayer};
 
 /// SpellModOps per row: the index stride.
 const OPS: usize = 31;
@@ -33,6 +34,8 @@ pub(crate) const OP_COST: u8 = 14;
 pub(crate) const OP_CAST_TIME: u8 = 10;
 /// The range lookup (`0x7ff480`) applies op 5 to its maximum.
 pub(crate) const OP_RANGE: u8 = 5;
+/// The ranged equipment slot, 0-based (`0x7ff6c3`).
+const EQUIPMENT_SLOT_RANGED: u8 = 17;
 /// The radius lookup (`0x8019c0`) applies op 6 before the reticle's 20-yard cap.
 pub(crate) const OP_RADIUS: u8 = 6;
 /// The cooldown start (`0x805d70`) applies op 21 to `startRecoveryTime`.
@@ -74,8 +77,18 @@ impl SpellMod {
     }
 }
 
-/// The two tables and the class family the gate compares against. Written only by the wire,
-/// cleared only at world-enter, read live.
+/// What the power-cost lookup reads past the unit's fields, kept with the tables its readers hold.
+#[derive(Clone, Default, PartialEq)]
+struct CostInputs {
+    /// The active player's guid, the one caster the weapon term applies to.
+    active_player: u64,
+    /// The weapon term's main-hand and off-hand speed in ms.
+    weapon_speed: [u32; 2],
+    /// `gtNPCManaCostScaler` column 0 by row, empty until the table loads.
+    npc_scaler: std::sync::Arc<[f32]>,
+}
+
+/// The wire's two tables, read live and cleared at world-enter, the class family and cost inputs.
 #[derive(Clone, Resource)]
 pub(crate) struct SpellModifiers {
     flat: [i32; CELLS],
@@ -83,6 +96,9 @@ pub(crate) struct SpellModifiers {
     /// The local player's class spell-family (`ChrClasses.dbc` field 15); 0 until the avatar
     /// resolves, which the reader's `SpellFamilyName != 0` gate covers.
     class_family: u32,
+    cost: CostInputs,
+    /// The `RangedModRange` of the ranged-slot item, its template cached (`0x7ff6c3`).
+    ranged_mod_range: Option<f32>,
 }
 
 impl Default for SpellModifiers {
@@ -91,6 +107,8 @@ impl Default for SpellModifiers {
             flat: [0; CELLS],
             pct: [0; CELLS],
             class_family: 0,
+            cost: CostInputs::default(),
+            ranged_mod_range: None,
         }
     }
 }
@@ -118,6 +136,32 @@ impl SpellModifiers {
     /// Set the gate's class family (`0x8007a0`).
     pub(crate) fn set_class_family(&mut self, family: u32) {
         self.class_family = family;
+    }
+
+    /// Set the active player and the weapon term's hand speeds.
+    pub(crate) fn set_weapon_speed(&mut self, active_player: u64, speed: [u32; 2]) {
+        self.cost.active_player = active_player;
+        self.cost.weapon_speed = speed;
+    }
+
+    /// Bind `gtNPCManaCostScaler`'s column 0.
+    pub(crate) fn set_npc_cost_scaler(&mut self, values: impl IntoIterator<Item = f32>) {
+        self.cost.npc_scaler = values.into_iter().collect();
+    }
+
+    /// The hand speed the weapon term reads for `caster`, `None` for any caster but the player.
+    pub(crate) fn weapon_speed(&self, caster: Option<u64>, off_hand: bool) -> Option<u32> {
+        (caster == Some(self.cost.active_player))
+            .then(|| self.cost.weapon_speed[usize::from(off_hand)])
+    }
+
+    /// `gtNPCManaCostScaler`'s value for `level`, 0 outside the table (`0x7f6990`).
+    pub(crate) fn npc_cost_scaler(&self, level: u32) -> f32 {
+        level
+            .checked_sub(1)
+            .and_then(|row| self.cost.npc_scaler.get(row as usize))
+            .copied()
+            .unwrap_or(0.0)
     }
 
     /// Zero both tables and the class family, the set `0x8100e0` zeroes.
@@ -158,6 +202,7 @@ impl SpellModifiers {
         ModsDiff {
             bits,
             class_family: self.class_family != prev.class_family,
+            weapon_speed: self.cost.weapon_speed != prev.cost.weapon_speed,
         }
     }
 
@@ -224,8 +269,8 @@ impl SpellModifiers {
         })
     }
 
-    /// The range lookup modifies only the maximum at its common tail, after the moving bonus. The
-    /// on-next-swing `Attributes & 0x404` arm returns before that tail.
+    /// The range lookup modifies only the row's maximum, before the reach and the moving bonus add
+    /// (`0x7ff737`). The on-next-swing `Attributes & 0x404` arm returns before that tail.
     pub(crate) fn min_max_range(
         &self,
         d: &SpellDisplay,
@@ -233,15 +278,13 @@ impl SpellModifiers {
         caster: benilla_formats::RangeUnit,
         targets: benilla_formats::RangeTargets,
     ) -> Option<(f32, f32)> {
-        let (min, max) = benilla_formats::min_max_range(d, row, caster, targets)?;
-        Some((
-            min,
-            if d.on_next_swing() {
-                max
-            } else {
-                self.apply_float(d, OP_RANGE, max)
-            },
-        ))
+        let caster = benilla_formats::RangeUnit {
+            ranged_mod_range: self.ranged_mod_range.filter(|_| caster.player),
+            ..caster
+        };
+        benilla_formats::min_max_range_with(d, row, caster, targets, |max| {
+            self.apply_float(d, OP_RANGE, max)
+        })
     }
 }
 
@@ -251,6 +294,8 @@ pub(crate) struct ModsDiff {
     /// Bit `b` set: a cell of family-flag bit `b` changed, in either table at any op.
     pub(crate) bits: u128,
     pub(crate) class_family: bool,
+    /// The weapon term's hand speeds moved.
+    pub(crate) weapon_speed: bool,
 }
 
 /// The description expander's view of the tables.
@@ -288,6 +333,44 @@ pub(super) fn track_class_family(
     // Guarded: the tooltip feed diffs the tables whenever the resource is marked changed.
     if mods.class_family != family {
         mods.set_class_family(family);
+    }
+}
+
+/// Keep the cost inputs in step with the player and the tables, written only when they move.
+pub(crate) fn track_cost_inputs(
+    mut mods: ResMut<SpellModifiers>,
+    self_q: Query<&ObjectStore, With<SelfPlayer>>,
+    objects: Objects,
+    items: Option<Res<Items>>,
+    spells: Option<Res<crate::ui_action::Spells>>,
+    tables: Option<Res<crate::ui_char::SheetTables>>,
+) {
+    if let Some(tables) = tables.filter(|t| t.is_changed()) {
+        let id = benilla_formats::GameTableId::NpcManaCostScaler;
+        let rows = tables.gt.rows(id) as i32;
+        mods.set_npc_cost_scaler((0..rows).map(|row| tables.gt.lookup(id, row, 0)));
+    }
+    let (Some(store), Some(items)) = (self_q.iter().next(), items) else {
+        return;
+    };
+    let forms = spells.as_deref().map(|s| &s.forms);
+    let speed = [false, true].map(|off_hand| {
+        crate::spell::usable::weapon_cost_speed(store, &objects, &items, forms, off_hand)
+    });
+    let ranged_mod_range = store
+        .0
+        .player_inv_slot(EQUIPMENT_SLOT_RANGED)
+        .filter(|&g| g != 0)
+        .and_then(|g| objects.object(g)?.object_entry())
+        .and_then(|entry| items.template_cached(entry))
+        .map(|t| t.ranged_mod_range);
+    if mods.ranged_mod_range != ranged_mod_range {
+        mods.ranged_mod_range = ranged_mod_range;
+    }
+    let guid = store.0.object_guid().unwrap_or(0);
+    // Guarded: every cost reader rebuilds whenever the resource is marked changed.
+    if mods.cost.active_player != guid || mods.cost.weapon_speed != speed {
+        mods.set_weapon_speed(guid, speed);
     }
 }
 
@@ -515,7 +598,10 @@ mod tests {
         };
         let (min, max) = mods.min_max_range(&d, Some(&row), caster, target).unwrap();
         assert_eq!(min, 11.0);
-        assert!((max - 45.6).abs() < 0.001, "38 yards with +20% range");
+        assert!(
+            (max - 45.0).abs() < 0.001,
+            "35 yards +20%, then the 3 yards of reach"
+        );
         assert_eq!(mods.min_max_range(&d, None, caster, target), None);
 
         let on_next_swing = SpellDisplay {
@@ -529,10 +615,10 @@ mod tests {
         );
     }
 
-    /// The moving bonus is part of the max before op 5 scales it: a +20% talent on the melee row of
-    /// two running units scales 5 + 2.6667.
+    /// The melee arm's reach sum and the moving bonus add after op 5: a +20% talent on the melee
+    /// row of two running units leaves 5 + 2.6667.
     #[test]
-    fn range_modifier_scales_the_moving_bonus() {
+    fn range_modifier_leaves_the_melee_reach_and_the_moving_bonus() {
         let mut mods = mage_tables();
         let d = mage(&[5]);
         let melee = SpellRange {
@@ -560,8 +646,8 @@ mod tests {
             .unwrap();
         let bonus = benilla_formats::MOVING_RANGE_BONUS;
         assert!(
-            (max - (5.0 + bonus) * 1.2).abs() < 1e-4,
-            "the modifier scales the bonused max, not the bare 5.0: {max}"
+            (max - (5.0 + bonus)).abs() < 1e-4,
+            "the modifier runs on the row's max, which the melee arm leaves at 0: {max}"
         );
     }
 }

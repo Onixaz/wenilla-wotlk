@@ -310,11 +310,15 @@ fn skin_cursor_kind(type_flags: u32) -> CursorKind {
 #[derive(Resource, Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct AttackFork(pub(crate) bool);
 
-/// The player's legs of the classifier's attack leg, in its order: not dead or a ghost, not
-/// mounted, not pacified and in control. Any failure clears to Point.
-pub(crate) fn player_attack_legs(own: &ObjectStore, control_lost: bool) -> bool {
+/// The player's legs of the classifier's attack leg (`0x4f7a50`), after the NPC, loot and skin
+/// arms: the attack-now check (`0x729a70`), not pacified, in control. Any failure clears to Point.
+pub(crate) fn player_attack_legs(
+    own: &ObjectStore,
+    control_lost: bool,
+    mounted: crate::spell::validator::MountedGate,
+) -> bool {
     !own.0.is_dead_or_ghost()
-        && own.0.unit_mount_display_id() == 0
+        && !mounted.refuses(own)
         && own.0.unit_flags() & UNIT_FLAG_PACIFIED == 0
         && !control_lost
 }
@@ -777,6 +781,7 @@ pub(super) struct CursorInputs<'w, 's> {
     spells: Option<Res<'w, crate::ui_action::Spells>>,
     spell_mods: Option<Res<'w, crate::spell::SpellModifiers>>,
     range_units: crate::spell::RangeUnits<'w, 's>,
+    player_vehicles: crate::vehicle::PlayerVehicles<'w, 's>,
     quest: Res<'w, crate::ui_quest::QuestGiver>,
     loot_cfg: Res<'w, crate::ui_loot::LootConfig>,
     keys: Res<'w, ButtonInput<KeyCode>>,
@@ -784,6 +789,9 @@ pub(super) struct CursorInputs<'w, 's> {
     loot_latch: Res<'w, crate::ui_loot::LootLatch>,
     // The creature records, whose cursor name `0x715ea0` reads; absent reads no name.
     names: Option<Res<'w, crate::names::NameCache>>,
+    // The attack-now check's auto-dismount CVars (`0x71b0c0`).
+    auto_dismount: Option<Res<'w, crate::spell::cast_target::AutoDismount>>,
+    auto: crate::spell::AutoChecks<'w>,
 }
 
 /// The skinning spell's max range toward `target` (`0x802c30`), 0 for a spell with no row.
@@ -836,6 +844,9 @@ pub(super) fn classify(
         spells,
         spell_mods,
         range_units,
+        player_vehicles,
+        auto_dismount,
+        auto,
     } = inputs;
     let party = super::party_of(group.as_deref());
     let skin_max_range = |spell_id: u32, target: Option<benilla_formats::RangeUnit>| -> f32 {
@@ -950,15 +961,25 @@ pub(super) fn classify(
             return None; // a plain corpse: Point
         }
 
+        // A form the player may not leave bars the service cursor (`0x729620`).
+        let form = self_store.0.unit_shapeshift_form();
+        let form_flags = spells
+            .as_deref()
+            .and_then(|s| s.forms.get(&u32::from(form)))
+            .map_or(0, |f| f.flags);
+        let form_bars = crate::spell::validator::form_blocks_interact(form, form_flags)
+            && !auto.unshift(self_store, form_flags);
         // The interact check, asked through its timed wrapper, picks the ladder; it is not a
         // reaction threshold.
-        if super::can_interact(
-            Some(store),
-            factions.as_deref(),
-            reputations,
-            party,
-            Some(self_store),
-        ) {
+        if !form_bars
+            && super::can_interact(
+                Some(store),
+                factions.as_deref(),
+                reputations,
+                party,
+                Some(self_store),
+            )
+        {
             let status = hovered.guid.and_then(|g| quest.status(g));
             let cursor_name = store
                 .0
@@ -967,7 +988,15 @@ pub(super) fn classify(
                 .and_then(|rec| rec.cursor_name.as_deref());
             // No matching bit clears the cursor without reaching the attack leg: Point, never the
             // sword.
+            let ride = || {
+                let guid = hovered.guid?;
+                let group = group.as_deref()?;
+                (benilla_protocol::guid::is_player(guid)
+                    && player_vehicles.takes_us(hovered.target?, guid, group.is_member(guid)))
+                .then_some(CursorKind::Vehicle)
+            };
             return service_cursor(store.0.unit_npc_flags(), status, cursor_name)
+                .or_else(ride)
                 .map(|kind| (kind, dist_sq > unit_interact_reach_sq(store)));
         }
         // The attack check, the predicate TAB, the combat flash and `UnitCanAttack` share; not
@@ -982,7 +1011,11 @@ pub(super) fn classify(
             return None;
         }
         attack_fork.set(true);
-        player_attack_legs(self_store, player.control_lost)
+        let mounted = crate::spell::validator::MountedGate::player(
+            player.move_flags(),
+            auto_dismount.as_deref(),
+        );
+        player_attack_legs(self_store, player.control_lost, mounted)
             .then_some((CursorKind::Attack, dist_sq > ATTACK_RANGE_SQ))
     };
     // The corpse classifier.
@@ -1286,6 +1319,55 @@ mod tests {
             unable: true,
         };
         assert_eq!(point.stem(), "Point");
+    }
+
+    /// The attack-now check (`0x729a70`) lets a mounted player attack when the auto-dismount check
+    /// (`0x71b0c0`) allows: a grounded flyer with the default CVars, not an airborne one.
+    #[test]
+    fn a_grounded_flying_mount_keeps_the_sword() {
+        use crate::creature_anim::move_flags::FLYING;
+        use crate::spell::cast_target::AutoDismount;
+        use crate::spell::validator::MountedGate;
+        use benilla_protocol::field::FIELD_UNIT_MOUNTDISPLAYID;
+        use benilla_protocol::ObjectFields;
+        let own = |mount| {
+            ObjectStore(ObjectFields::from_pairs(&[(
+                FIELD_UNIT_MOUNTDISPLAYID,
+                mount,
+            )]))
+        };
+        let defaults = AutoDismount::default();
+        let legs = |mount, lost, flags, cvars: AutoDismount| {
+            player_attack_legs(&own(mount), lost, MountedGate::player(flags, Some(&cvars)))
+        };
+        assert!(legs(0, false, 0, defaults));
+        assert!(
+            legs(27655, false, 0, defaults),
+            "a grounded flyer auto-dismounts, so the sword stays"
+        );
+        assert!(
+            !legs(27655, false, FLYING, defaults),
+            "airborne, autoDismountFlying is off"
+        );
+        assert!(legs(
+            27655,
+            false,
+            FLYING,
+            AutoDismount {
+                ground: true,
+                flying: true
+            }
+        ));
+        assert!(!legs(
+            27655,
+            false,
+            0,
+            AutoDismount {
+                ground: false,
+                flying: false
+            }
+        ));
+        assert!(!legs(0, true, 0, defaults));
     }
 
     #[test]

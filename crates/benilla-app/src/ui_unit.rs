@@ -190,7 +190,12 @@ impl Plugin for UiUnitPlugin {
         .add_systems(Update, drain_action_bar_toggles.after(UiInput))
         .add_systems(Update, feed_default_language.in_set(UnitFeed))
         .add_systems(Update, feed_known_languages.in_set(UnitFeed))
-        .add_systems(Update, feed_option_state.in_set(UnitFeed))
+        .add_systems(
+            Update,
+            feed_option_state
+                .in_set(UnitFeed)
+                .after(crate::ui_items::feed::feed_item_stats),
+        )
         // `load_exhaustion_rows` pushes into the VM, so it runs per VM; the rest are one-shots.
         .add_systems(
             Update,
@@ -594,7 +599,12 @@ fn feed_name_records(
 /// The race id to `UnitRace`'s display name and `raceFile` token (`"Scourge"`, `"NightElf"`); the
 /// display name is also what `$R`/`$r` expand to.
 pub(crate) fn race_names(race: u8) -> Option<(&'static str, &'static str)> {
-    Some(match race {
+    race_names_of(race, None)
+}
+
+/// [`race_names`] for a known sex, whose own name the reference picks (`0x715970`).
+pub(crate) fn race_names_of(race: u8, sex: Option<u8>) -> Option<(&'static str, &'static str)> {
+    let (english, file) = match race {
         1 => ("Human", "Human"),
         2 => ("Orc", "Orc"),
         3 => ("Dwarf", "Dwarf"),
@@ -606,12 +616,21 @@ pub(crate) fn race_names(race: u8) -> Option<(&'static str, &'static str)> {
         10 => ("Blood Elf", "BloodElf"),
         11 => ("Draenei", "Draenei"),
         _ => return None,
-    })
+    };
+    Some((
+        crate::locale_names::race(race, sex).unwrap_or(english),
+        file,
+    ))
 }
 
 /// The class id to `UnitClass`'s display name and uppercase `classFileName`.
 pub(crate) fn class_names(class: u8) -> Option<(&'static str, &'static str)> {
-    Some(match class {
+    class_names_of(class, None)
+}
+
+/// [`class_names`] for a known sex, whose own name the reference picks (`0x7159e0`).
+pub(crate) fn class_names_of(class: u8, sex: Option<u8>) -> Option<(&'static str, &'static str)> {
+    let (english, file) = match class {
         1 => ("Warrior", "WARRIOR"),
         2 => ("Paladin", "PALADIN"),
         3 => ("Hunter", "HUNTER"),
@@ -623,7 +642,11 @@ pub(crate) fn class_names(class: u8) -> Option<(&'static str, &'static str)> {
         9 => ("Warlock", "WARLOCK"),
         11 => ("Druid", "DRUID"),
         _ => return None,
-    })
+    };
+    Some((
+        crate::locale_names::class(class, sex).unwrap_or(english),
+        file,
+    ))
 }
 
 /// A playable race's fixed side, for where no faction template is at hand, as at world entry,
@@ -981,9 +1004,10 @@ pub(crate) fn snapshot(
     types: CreatureTypeSources<'_>,
 ) -> UnitState {
     let power_type = store.0.unit_power_type();
-    let race = store.0.unit_race().and_then(race_names);
+    let sex = store.0.unit_gender();
+    let race = store.0.unit_race().and_then(|r| race_names_of(r, sex));
     let class_id = store.0.unit_class();
-    let class = class_id.and_then(class_names);
+    let class = class_id.and_then(|c| class_names_of(c, sex));
     UnitState {
         exists: true,
         // A live descriptor is having succeeded, all of `UnitIsVisible`.
@@ -993,6 +1017,7 @@ pub(crate) fn snapshot(
         is_connected: true,
         // What the token resolver yields, and `UnitIsUnit` compares.
         guid,
+        faction_template: store.0.unit_faction_template().unwrap_or(0),
         name,
         // The UI getters: `UNIT_DYNFLAG_DEAD` (feign death) zeroes `UnitHealth` and `UnitMana` but
         // not the maxima, so its edge fires the reference's pair; the power getters divide rage by
@@ -1259,9 +1284,9 @@ pub(crate) fn faction_group_localized(
         .map(str::to_string)
 }
 
-/// `CreatureType.dbc` id to the enUS word, a creature's level-line class slot.
+/// `CreatureType.dbc` id to its word in the running locale, a creature's level-line class slot.
 fn creature_type_word(t: u32) -> Option<&'static str> {
-    Some(match t {
+    let english = match t {
         1 => "Beast",
         2 => "Dragonkin",
         3 => "Demon",
@@ -1276,7 +1301,8 @@ fn creature_type_word(t: u32) -> Option<&'static str> {
         // Deviation: 10, "Not specified", answers None because the word would print in the
         // tooltip's level line; `UnitCreatureType` then answers nil where the reference names it.
         _ => return None,
-    })
+    };
+    Some(crate::locale_names::creature_type(t).unwrap_or(english))
 }
 
 /// The `PLAYER_QUEST_LOG` descriptor indexes, 25 slots of 5 fields.
@@ -1356,11 +1382,23 @@ pub(crate) fn fire_transitions(
     if prev.is_none_or(|p| p.rank != cur.rank) {
         script.fire_event("UNIT_CLASSIFICATION_CHANGED", vec![tok()]);
     }
-    // `UNIT_FACTION`, the PvP-icon repaint, on the fields the icon reads and on the tapped bit: the
-    // reference's dynamic-flags watcher fires event 29 on bit `0x4` and has no arm for `0x8`.
+    // `UNIT_FACTION`, the PvP-icon repaint, on the fields the icon reads, on the tapped bit (the
+    // reference's dynamic-flags watcher fires event 29 on bit `0x4` and has no arm for `0x8`), and
+    // on the raw faction-template dword (`0x723680` into `0x71f8f0`).
     if prev.is_none_or(|p| {
-        (p.pvp, p.is_pvp_ffa, &p.faction_group, p.tapped)
-            != (cur.pvp, cur.is_pvp_ffa, &cur.faction_group, cur.tapped)
+        (
+            p.pvp,
+            p.is_pvp_ffa,
+            &p.faction_group,
+            p.tapped,
+            p.faction_template,
+        ) != (
+            cur.pvp,
+            cur.is_pvp_ffa,
+            &cur.faction_group,
+            cur.tapped,
+            cur.faction_template,
+        )
     }) {
         script.fire_event("UNIT_FACTION", vec![tok()]);
     }
@@ -1739,12 +1777,13 @@ fn feed_units(
         }
     }
 
-    // `PLAYER_ENTERING_WORLD` once per world entry, after our descriptor lands, as the reference's
-    // does. At world exit, re-arm it and forget the player-global memos so the next character seeds
-    // them.
+    // `PLAYER_LOGIN` if the UI load armed it, then `PLAYER_ENTERING_WORLD`, once per world entry,
+    // after our descriptor lands, as the reference's cascade does (`0x52816d`). At world exit,
+    // re-arm the entry and forget the player-global memos so the next character seeds them.
     if self_pair.is_some() {
         if !memo.entered_world {
             gate.audit("feed_units", "the PLAYER_ENTERING_WORLD arm");
+            crate::ui_script::fire_armed_player_login(&mut script);
             script.fire_event("PLAYER_ENTERING_WORLD", vec![]);
             // The cascade's reputation world entry (`0x5d2bc0`) re-sorts and fires `UPDATE_FACTION`
             // (`0x5d1bfa`) with the player seated, which re-shows the XP bar the pre-player
@@ -1835,6 +1874,28 @@ fn feed_units(
                 // A clear fires nothing; the target frame hears `PLAYER_TARGET_CHANGED` below.
                 if memo.last.remove(token).is_some() {
                     gate.audit("feed_units", "a unit-token clear");
+                }
+            }
+        }
+    }
+
+    // A move of our own template repaints every other held unit we do not own (`0x718e50`); the
+    // reaction of each moved with it, though its own field did not.
+    if let Some((_, me)) = self_pair
+        .filter(|(_, g)| edges.moved(g.0, benilla_protocol::field::FIELD_UNIT_FACTIONTEMPLATE))
+    {
+        for (_, state) in memo.last.iter().filter(|(_, s)| s.guid != me.0) {
+            let owned = index
+                .as_ref()
+                .and_then(|i| i.0.get(&state.guid))
+                .and_then(|&e| stores.all.get(e).ok())
+                .and_then(|s| {
+                    s.0.unit_owner(benilla_protocol::messages::OwnerFallback::CreatedBy)
+                })
+                == Some(me.0);
+            if !owned {
+                for token in script.unit_tokens(state.guid) {
+                    script.fire_event("UNIT_FACTION", vec![ScriptValue::Str(token)]);
                 }
             }
         }
@@ -2019,17 +2080,101 @@ pub(crate) fn add_unit_feed(app: &mut App) {
         .add_systems(Update, feed_units);
 }
 
-/// The player state `SecureCmdOptionParse`'s `swimming` and `mounted` read, pushed each frame:
-/// the swim bit of our movement flags and our mount display.
+/// The Northrend continent, where flying also takes Cold Weather Flying (`0x7261b0`).
+const NORTHREND: u32 = 571;
+/// Rebuild what `equipped` and `worn` read, when the self descriptor or a template answer moved.
+#[derive(bevy::ecs::system::SystemParam)]
+struct EquippedFeed<'w, 's> {
+    changed: Query<'w, 's, (), (With<SelfPlayer>, Changed<ObjectStore>)>,
+    index: Option<Res<'w, crate::net::GuidIndex>>,
+    stores: Query<'w, 's, &'static ObjectStore>,
+    items: Option<Res<'w, crate::items::Items>>,
+    classes: Option<Res<'w, crate::ui_items::ItemClasses>>,
+    sub_classes: Option<Res<'w, crate::ui_items::ItemSubClasses>>,
+    epoch: Local<'s, Option<u64>>,
+}
+
+impl EquippedFeed<'_, '_> {
+    fn push(&mut self, script: &mut UiScript, store: &ObjectStore) {
+        let Some(items) = self.items.as_deref() else {
+            return;
+        };
+        let epoch = items.template_epoch();
+        if self.changed.is_empty() && *self.epoch == Some(epoch) {
+            return;
+        }
+        *self.epoch = Some(epoch);
+        let type_names = (0..29)
+            .map(|i| {
+                let token = benilla_ui::script::equip_loc_token(i);
+                let text = if token.is_empty() {
+                    None
+                } else {
+                    script
+                        .eval::<Option<String>>(&format!("return {token}"))
+                        .ok()
+                        .flatten()
+                };
+                [
+                    token.to_lowercase(),
+                    text.unwrap_or_default().to_lowercase(),
+                ]
+            })
+            .collect();
+        let rows = (0u8..19)
+            .filter_map(|slot| {
+                let guid = store.0.player_inv_slot(slot)?;
+                let entity = *self.index.as_deref()?.0.get(&guid)?;
+                let entry = self.stores.get(entity).ok()?.0.object_entry()?;
+                let t = items.template_cached(entry)?;
+                let class = self.classes.as_deref().and_then(|c| c.0.name(t.class));
+                let sub = self.sub_classes.as_deref();
+                let names = [
+                    class,
+                    sub.and_then(|s| s.0.name(t.class, t.subclass)),
+                    sub.and_then(|s| s.0.display_name(t.class, t.subclass)),
+                ]
+                .into_iter()
+                .flatten()
+                .map(str::to_lowercase)
+                .collect();
+                Some(benilla_ui::script::EquippedRow {
+                    inventory_type: t.inventory_type,
+                    names,
+                })
+            })
+            .collect();
+        script.set_equipped_for_macros(benilla_ui::script::EquippedForMacros {
+            type_names,
+            items: rows,
+        });
+    }
+}
+
+/// The player state `SecureCmdOptionParse`'s conditions read, pushed each frame.
 fn feed_option_state(
     script: Option<NonSendMut<UiScript>>,
     player: Option<Res<crate::player::Player>>,
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
+    place: Option<Res<crate::area::PlayerPlace>>,
+    map: Option<Res<benilla_world::world_map::CurrentMap>>,
+    mut equipped: EquippedFeed,
 ) {
     let Some(mut script) = script else {
         return;
     };
+    if let Some(store) = self_q.iter().next() {
+        equipped.push(&mut script, store);
+    }
     let state = benilla_ui::script::OptionState {
+        flyable: place.as_deref().is_some_and(|p| p.flyable_area),
+        northrend: map.is_some_and(|m| m.0 == NORTHREND),
+        flying: player.as_deref().is_some_and(|p| p.flying),
+        indoors: place.as_deref().is_some_and(|p| p.indoors),
+        stealthed: self_q
+            .iter()
+            .next()
+            .is_some_and(|s| s.0.unit_is_stealthed()),
         swimming: player
             .as_deref()
             .is_some_and(|p| p.move_flags() & crate::creature_anim::move_flags::SWIMMING != 0),
@@ -3200,6 +3345,46 @@ mod tests {
         );
         // The control against firing always.
         assert!(fired(base.clone(), base.clone()).is_empty());
+    }
+
+    /// A template swap that moves no derived value still repaints: the raw field's own watcher
+    /// (`0x723680`) fires the event.
+    #[test]
+    fn a_faction_template_move_fires_unit_faction_with_every_derived_value_equal() {
+        let mut s = UiScript::new().unwrap();
+        s.run(
+            r#"
+            SEEN = {}
+            local f = CreateFrame("Frame")
+            f:RegisterEvent("UNIT_FACTION")
+            f:SetScript("OnEvent", function(self, event, arg1) table.insert(SEEN, event .. ":" .. arg1) end)
+        "#,
+        )
+        .unwrap();
+        let base = UnitState {
+            exists: true,
+            has_object: true,
+            guid: 0x2a,
+            faction_template: 7,
+            ..Default::default()
+        };
+        let moved = UnitState {
+            faction_template: 14,
+            ..base.clone()
+        };
+        fire_transitions(&mut s, "target", Some(&base), &base, &FieldEdges::default());
+        assert!(s.eval::<Vec<String>>("return SEEN").unwrap().is_empty());
+        fire_transitions(
+            &mut s,
+            "target",
+            Some(&base),
+            &moved,
+            &FieldEdges::default(),
+        );
+        assert_eq!(
+            s.eval::<Vec<String>>("return SEEN").unwrap(),
+            ["UNIT_FACTION:target"]
+        );
     }
 
     /// The control is a bit no `UnitState` field decodes, so the trigger is the raw dword.

@@ -560,6 +560,51 @@ fn set_script_on_double_click_is_accepted_because_something_fires_it() {
     assert!(s.eval::<bool>("return ran").unwrap(), "…and it FIRED");
 }
 
+/// `IsEventRegistered` (`0x49f160`) follows `RegisterEvent` and `UnregisterEvent`.
+#[test]
+fn is_event_registered_follows_the_frame() {
+    let s = script();
+    s.run(r#"F = CreateFrame("Frame"); F:RegisterEvent("PLAYER_LOGIN")"#)
+        .unwrap();
+    assert!(s
+        .eval::<bool>(r#"return F:IsEventRegistered("PLAYER_LOGIN") == 1"#)
+        .unwrap());
+    s.run(r#"F:UnregisterEvent("PLAYER_LOGIN")"#).unwrap();
+    assert!(s
+        .eval::<bool>(r#"return F:IsEventRegistered("PLAYER_LOGIN") == nil"#)
+        .unwrap());
+    assert!(s.run("F:IsEventRegistered(nil)").is_err());
+}
+
+/// A move across a hyperlink span fires its enter and leave, `self, link, text`.
+#[test]
+fn a_pointer_crossing_a_link_span_fires_enter_then_leave() {
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.run(
+        r#"
+        seen = {}
+        F = CreateFrame("Frame", "Spanned", UIParent)
+        F:SetPoint("BOTTOMLEFT", 0, 0); F:SetWidth(100); F:SetHeight(100); F:EnableMouse(true)
+        F:SetScript("OnHyperlinkEnter", function(self, link, text) seen[#seen + 1] = "in " .. link end)
+        F:SetScript("OnHyperlinkLeave", function(self, link, text) seen[#seen + 1] = "out " .. text end)
+    "#,
+    )
+    .unwrap();
+    s.resolve();
+    let h = s.model_ref().arena.lookup("Spanned").unwrap();
+    let rect = crate::layout::Rect::new(10.0, 10.0, 20.0, 20.0);
+    s.set_link_spans(vec![(h, rect, "item:1".into(), "[One]".into())]);
+    s.mouse_move(50.0, 50.0);
+    s.mouse_move(15.0, 15.0);
+    s.mouse_move(16.0, 16.0);
+    s.mouse_move(50.0, 50.0);
+    assert_eq!(
+        s.eval::<String>("return table.concat(seen, ',')").unwrap(),
+        "in item:1,out [One]"
+    );
+}
+
 /// Script names nothing fires still raise; a name leaves this list only when something fires it.
 #[test]
 fn the_unfired_script_kinds_still_raise_rather_than_silently_accepting() {
@@ -568,9 +613,8 @@ fn the_unfired_script_kinds_still_raise_rather_than_silently_accepting() {
         .unwrap();
     // Real slots that benilla does not fire.
     for name in [
-        "OnHyperlinkEnter",
         "OnMessageScrollChanged",
-        "OnTooltipSetItem",
+        "OnTooltipSetFrameStack",
         "OnMovieFinished",
     ] {
         let err = s
@@ -772,18 +816,131 @@ fn a_press_and_release_on_one_frame_is_unchanged() {
     assert_eq!(log_of(&mut s), "A:down A:up");
 }
 
-/// `Model::mouse_down_on` is keyed by button name, so the capture is per button.
+/// One capture for every button: a chorded press and its release go to the frame already held,
+/// and the capture ends with the last button up (`0x495470`, `0x4947a0`).
 #[test]
-fn the_capture_is_per_button() {
+fn a_chorded_press_and_release_go_to_the_held_capture() {
     let mut s = two_frames();
-    s.mouse_button(200.0, 300.0, "LeftButton", true); // A holds the left button
+    s.mouse_button(200.0, 300.0, "LeftButton", true);
     s.mouse_move(500.0, 300.0);
-    s.mouse_button(500.0, 300.0, "RightButton", false); // a right release, never pressed
-    assert_eq!(
-        log_of(&mut s),
-        "A:down",
-        "the right button captured nothing, so its release dispatches nothing"
+    s.mouse_button(500.0, 300.0, "RightButton", true);
+    s.mouse_button(500.0, 300.0, "RightButton", false);
+    s.mouse_button(500.0, 300.0, "LeftButton", false);
+    assert_eq!(log_of(&mut s), "A:down A:down A:up A:up");
+    s.run("log = {}").unwrap();
+    s.mouse_button(500.0, 300.0, "RightButton", true);
+    s.mouse_button(500.0, 300.0, "RightButton", false);
+    assert_eq!(log_of(&mut s), "B:down B:up", "the capture ended");
+}
+
+fn one_button() -> crate::script::UiScript {
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.run(
+        r#"
+        log = {}
+        B1 = CreateFrame("Button", "B1")
+        B1:SetPoint("BOTTOMLEFT", 100, 200); B1:SetWidth(200); B1:SetHeight(200); B1:EnableMouse(true)
+        for _, name in ipairs({ "OnMouseDown", "OnMouseUp", "OnClick", "OnLeave", "OnEnter" }) do
+            B1:SetScript(name, function() table.insert(log, name) end)
+        end
+    "#,
+    )
+    .unwrap();
+    s.resolve();
+    s.mouse_move(200.0, 300.0);
+    s.run("log = {}").unwrap();
+    s
+}
+
+fn joined(s: &crate::script::UiScript) -> String {
+    s.eval::<String>("return table.concat(log, ' ')").unwrap()
+}
+
+#[test]
+fn a_release_outside_the_button_does_not_click_but_inside_it_does() {
+    let mut s = one_button();
+    s.mouse_button(200.0, 300.0, "LeftButton", true);
+    s.mouse_move(600.0, 300.0);
+    s.mouse_button(600.0, 300.0, "LeftButton", false);
+    assert_eq!(joined(&s), "OnMouseDown OnLeave OnMouseUp");
+    s.mouse_move(200.0, 300.0);
+    s.run("log = {}").unwrap();
+    s.mouse_button(200.0, 300.0, "LeftButton", true);
+    s.mouse_button(200.0, 300.0, "LeftButton", false);
+    assert_eq!(joined(&s), "OnMouseDown OnMouseUp OnClick");
+}
+
+#[test]
+fn a_release_on_a_button_no_longer_pushed_does_not_click() {
+    let mut s = one_button();
+    s.mouse_button(200.0, 300.0, "LeftButton", true);
+    s.run("B1:SetButtonState('NORMAL') log = {}").unwrap();
+    s.mouse_button(200.0, 300.0, "LeftButton", false);
+    assert_eq!(joined(&s), "OnMouseUp");
+}
+
+/// Hiding the held frame drops the capture and the press: the release clicks nothing, fires
+/// nothing on it, and the next press hits normally.
+#[test]
+fn hiding_a_pressed_button_drops_its_capture_and_press() {
+    let mut s = one_button();
+    s.mouse_button(200.0, 300.0, "LeftButton", true);
+    s.run("B1:Hide() log = {}").unwrap();
+    let consumed = s.mouse_button(200.0, 300.0, "LeftButton", false);
+    assert_eq!(joined(&s), "");
+    assert!(
+        !consumed,
+        "no capture, so the release is nothing the UI took"
     );
+    assert_eq!(
+        s.eval::<String>("return B1:GetButtonState()").unwrap(),
+        "NORMAL"
+    );
+}
+
+/// `EnableMouse(false)` under a held button: as a hide for hover, capture and press, but the art
+/// stays pushed, as no hide notify runs.
+#[test]
+fn disabling_the_mouse_on_a_pressed_hovered_button_drops_it_like_a_hide() {
+    let mut s = one_button();
+    s.mouse_button(200.0, 300.0, "LeftButton", true);
+    s.run("B1:EnableMouse(false)").unwrap();
+    assert_eq!(joined(&s), "OnMouseDown OnLeave");
+    s.run("log = {}").unwrap();
+    s.mouse_button(200.0, 300.0, "LeftButton", false);
+    assert_eq!(joined(&s), "");
+    assert_eq!(
+        s.eval::<String>("return B1:GetButtonState()").unwrap(),
+        "PUSHED"
+    );
+}
+
+/// The leave from a hide or a disable reports no motion (`0x4959b2`).
+#[test]
+fn a_leave_without_cursor_motion_passes_false() {
+    let s = one_button();
+    s.run(
+        r#"B1:SetScript("OnLeave", function(self, motion) seen = tostring(motion) end)
+           B1:EnableMouse(false)"#,
+    )
+    .unwrap();
+    assert_eq!(s.eval::<String>("return seen").unwrap(), "false");
+}
+
+/// Only a frame joining the mouse index arms the re-pick: a plain frame shown under a still
+/// cursor stirs no enter or leave.
+#[test]
+fn showing_a_frame_with_no_mouse_does_not_repick_the_hover() {
+    let mut s = one_button();
+    s.run(r#"Plain = CreateFrame("Frame", nil, UIParent) Plain:Hide()"#)
+        .unwrap();
+    s.tick(0.0);
+    s.run("Plain:Show() log = {}").unwrap();
+    s.tick(0.0);
+    assert_eq!(joined(&s), "");
+    let due = s.model_ref().hover_repick;
+    assert!(!due);
 }
 
 /// A disabled Button fires neither `OnEnter` nor `OnLeave`: the button's enter and leave notifies

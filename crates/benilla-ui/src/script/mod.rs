@@ -182,9 +182,12 @@ mod cooldown_widget;
 mod input_verbs;
 mod inspect;
 mod inventory_verbs;
+mod item_link;
 mod item_search;
 mod item_stats;
+mod item_summary;
 mod item_text;
+mod item_verbs;
 mod kb_system;
 pub mod keybind;
 mod keyboard;
@@ -202,6 +205,7 @@ mod merchant;
 mod messageframe;
 mod minimap;
 pub mod nameplate;
+pub(crate) mod quest_blob;
 mod quest_poi;
 mod quest_poi_frame;
 pub use nameplate::{PlateGeometry, PlateState};
@@ -244,14 +248,15 @@ mod shapeshift;
 mod simplehtml;
 mod skills;
 mod slash;
-mod slider;
+pub(crate) mod slider;
 mod social;
 mod sound;
 mod spell_info;
 mod spellbook;
 mod stable;
-mod statusbar;
+pub(crate) mod statusbar;
 mod stdlib;
+pub use stdlib::lua_message;
 mod summon;
 mod talent;
 mod taxi;
@@ -260,6 +265,7 @@ mod tick;
 mod title;
 mod tooltip;
 mod tooltip_item;
+mod tooltip_quest;
 mod tooltip_spell;
 mod tooltip_unit;
 mod totem;
@@ -294,6 +300,7 @@ pub use auction::{
     AuctionStartRequest, AuctionState, AuctionSubCategory, BIDDER, LIST, OWNER, SORT_COLUMNS,
 };
 pub use aura::AuraState;
+pub(crate) use backdrop::set_edge_blend as backdrop_set_edge_blend;
 pub use backdrop::{inset_atlas_bleed, pieces, Backdrop, BackdropPiece, Insets};
 pub use bank::BankState;
 pub use barber::{BarberHost, BarberIntent, BarberStyle};
@@ -359,7 +366,8 @@ pub use guild_bank::{
     GUILD_BANK_MONEY_LOG, GUILD_BANK_TABS, GUILD_BANK_TAB_SLOTS,
 };
 pub use input_verbs::{BindingInput, FiredInput, HeldInput};
-pub use macro_options::OptionState;
+pub use item_link::{item_hyperlink, ItemLinkFields};
+pub use macro_options::{EquippedForMacros, EquippedRow, OptionState};
 pub use mirror_timer::{MirrorTimer, MIRROR_TIMER_TOKENS};
 pub use modelframe::ModelPaneFrame;
 pub use petition::{
@@ -370,6 +378,7 @@ pub use tabard::{
     emblem_mask_path, TabardHost, TabardIntent, EMBLEM_MASK_TOKEN, TABARD_COUNTS,
     TABARD_CREATION_COST,
 };
+pub use tooltip_quest::QuestTooltipView;
 pub use unit_cast::UnitCast;
 pub use video_pairs::VIDEO_PAIR_CVARS;
 pub use worldmap_arrow::ARROW_MODEL;
@@ -398,8 +407,10 @@ pub use glyph::{
 };
 pub use inspect::{InspectView, UnitReach};
 pub use instance::InstanceLock;
+pub use item_stats::equip_loc_token;
 pub use item_stats::{
-    item_usable, GemView, ItemSetMember, ItemSetView, ItemTemplateView, PlayerReqState,
+    item_usable, EnchantEffectView, EnchantRowView, GemView, ItemSetMember, ItemSetView,
+    ItemSpellView, ItemTemplateView, PlayerReqState, RandomSuffixView,
 };
 pub use item_text::ItemTextState;
 pub use layout_cache::PlacedFrame;
@@ -455,7 +466,7 @@ pub(crate) use simplehtml::{
 pub use skills::{SkillEntry, SkillRequest, SkillsState};
 pub use social::{FriendInfo, SocialRequest, SocialState, WhoInfo, WhoRecords};
 pub use sound::{MusicRequest, SoundRequest};
-pub use spell_info::{SpellInfo, SpellInfoSource};
+pub use spell_info::{SpellInfo, SpellInfoSource, SpellStatEffect, SpellStatEffects};
 pub use spellbook::{
     resolve_spell_by_name, PetBookState, SpellBookState, SpellSlotView, SpellTabView,
 };
@@ -634,7 +645,7 @@ pub const SCREEN: crate::layout::Handle = 0;
 /// ScrollFrame's three scroll kinds are `+0x32c`/`+0x334`/`+0x33c`. The EditBox's vtable replaces
 /// the key and char slots: an EditBox never fires `OnKeyDown`, and fires `OnChar` only from
 /// `Insert`, with the inserted text.
-const SCRIPT_KINDS: [&str; 47] = [
+const SCRIPT_KINDS: [&str; 54] = [
     "OnLoad",
     "OnEvent",
     "OnUpdate",
@@ -674,6 +685,9 @@ const SCRIPT_KINDS: [&str; 47] = [
     // A release over a message-frame hyperlink span, `OnHyperlinkClick(link, text, button)`;
     // `ChatFrameTemplate` passes it to `SetItemRef` (`ChatFrame.xml:15`, `ChatFrame.lua:1534`).
     "OnHyperlinkClick",
+    // The pointer entering and leaving such a span (`0x978540`, `0x978570`), fired by [`pointer`]'s move.
+    "OnHyperlinkEnter",
+    "OnHyperlinkLeave",
     // The GameTooltip's engine-fired scripts: money render, money clear and world-hover default
     // placement, all three wired by the stock template (`GameTooltipTemplate.xml:617-625`).
     "OnTooltipAddMoney",
@@ -704,6 +718,14 @@ const SCRIPT_KINDS: [&str; 47] = [
     // The GameTooltip's (`0x61a30b`, `+0x4ec`), fired once a unit's lines are built
     // ([`tooltip_unit`]).
     "OnTooltipSetUnit",
+    // The item, spell, quest, achievement and equipment-set builders' (`+0x4f4`..), each fired once
+    // its lines are built and before the show ([`tooltip_item`], [`tooltip_spell`],
+    // [`tooltip_quest`]).
+    "OnTooltipSetItem",
+    "OnTooltipSetSpell",
+    "OnTooltipSetQuest",
+    "OnTooltipSetAchievement",
+    "OnTooltipSetEquipmentSet",
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -1297,11 +1319,14 @@ impl UiScript {
             })
             .collect();
         for h in arrows {
+            // The arrow draws in the minimap's overlay; its pane paints only if an addon anchors
+            // it, so a turn otherwise leaves the extract its paint path.
+            let paints = model.resolved.contains_key(&h);
             if let Some(frame) = model.arena.frame_mut(h) {
                 if let KindState::Model(state) = &mut frame.kind_state {
                     if state.facing != facing {
                         state.facing = facing;
-                        moved = true;
+                        moved |= paints;
                     }
                 }
             }
@@ -1471,6 +1496,19 @@ impl UiScript {
                 .or_default()
                 .push((rect, link, markup));
         }
+    }
+
+    /// The centre of the first hyperlink span whose link holds `text`, for a probe's click.
+    pub fn link_span_center(&self, text: &str) -> Option<(f32, f32)> {
+        let model = self.model_ref();
+        model
+            .link_spans
+            .values()
+            .flatten()
+            .find_map(|(r, link, _)| {
+                link.contains(text)
+                    .then_some(((r.left + r.right) / 2.0, (r.bottom + r.top) / 2.0))
+            })
     }
 
     /// Whether the frame with this global name is shown with every ancestor (`IsVisible()`).
@@ -1867,15 +1905,15 @@ impl UiScript {
     }
 
     /// Report a script error the host caught outside the VM's dispatch (an addon file that failed
-    /// to compile or raised at file scope): it joins the handler-dispatch queue and the retained
-    /// log, not `errors`, since the caller has already logged it.
-    pub fn report_script_error(&self, msg: &str) {
+    /// to compile or raised at file scope): `host` joins the retained log, not `errors`, since the
+    /// caller has already logged it, and `bare` the handler-dispatch queue.
+    pub fn report_script_error(&self, host: &str, bare: &str) {
         // A Load row, not an Error one: to the player a file scope that raised and a missing file
         // are the same fact, the addon is not running.
-        diagnostics::record_load_failure(&self.lua, msg);
+        diagnostics::record_load_failure(&self.lua, host);
         self.model_mut()
             .pending_error_dispatch
-            .push(msg.to_string());
+            .push(bare.to_string());
     }
 
     /// Hand each queued script error to the Lua error handler, as the reference's catch closure
@@ -1918,7 +1956,7 @@ impl UiScript {
                     .and_then(|()| stdlib::protected_call(&self.lua, &handler, arg));
                 let _ = in_handler(false);
                 let Err(e) = called else { break };
-                arg = match self.lua.create_string(e.to_string()) {
+                arg = match self.lua.create_string(stdlib::lua_message(&e)) {
                     Ok(s) => mlua::MultiValue::from_vec(vec![mlua::Value::String(s)]),
                     Err(_) => break,
                 };
@@ -1984,8 +2022,18 @@ impl UiScript {
         self.model_mut().set_epoch(epoch);
     }
 
+    /// Arm the `PLAYER_LOGIN` one-shot (`0x52a9e6`); `IsLoggedIn` answers nil until it fires.
+    pub fn arm_player_login(&mut self) {
+        set_field!(self, player_login_armed, true);
+    }
+
+    /// Take the `PLAYER_LOGIN` one-shot for the world entry to fire.
+    pub fn take_player_login_armed(&mut self) -> bool {
+        std::mem::take(&mut self.model_mut().player_login_armed)
+    }
+
     fn push_error(&self, e: mlua::Error) {
-        self.model_mut().record_script_error(e.to_string());
+        self.model_mut().record_lua_error(&e);
     }
 }
 

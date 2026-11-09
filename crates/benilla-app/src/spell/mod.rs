@@ -24,6 +24,7 @@ pub(crate) mod learn_place;
 mod mods;
 pub(crate) mod multicast;
 pub(crate) mod net;
+mod range_check;
 mod range_units;
 pub(crate) mod targeting;
 pub(crate) mod text_caster;
@@ -33,16 +34,21 @@ pub(crate) mod validator;
 // The one cast path: every caster takes [`CastLadder`] and commits through [`CastCommit`];
 // `send_spell_cast` is private to `cast_send`, so no second send path can exist.
 pub(crate) use cast_send::{CastCommit, CastLadder, HeldCast, HeldForPick, TargetedBind};
-pub(crate) use cast_target::{AutoDismount, AutoSelfCast, SecureAbilityToggle};
+pub(crate) use cast_target::{
+    AutoChecks, AutoDismount, AutoPosture, AutoSelfCast, SecureAbilityToggle,
+};
 pub(crate) use combo::ComboPoints;
 pub(crate) use cooldowns::Cooldowns;
 pub(crate) use inflight::{
     inflight, ActiveChannel, AutoRepeatActive, LocalMoveStart, PendingCast, QueuedMeleeSpell,
     SelfCancel, SPELL_INTERRUPT_MOVEMENT,
 };
-pub(crate) use mods::{ModsDiff, SpellModifiers, OP_CAST_TIME, OP_COST, OP_GCD, OP_RADIUS};
+pub(crate) use mods::{
+    track_cost_inputs, ModsDiff, SpellModifiers, OP_CAST_TIME, OP_COST, OP_GCD, OP_RADIUS,
+};
 #[cfg(test)]
 pub(crate) use mods::{OP_COOLDOWN, OP_RANGE};
+pub(crate) use range_check::{range_check, RangeFacts};
 pub(crate) use range_units::{RangeUnits, DEFAULT_REACH};
 // `TargetingWants` is exported for the ground reticle, which draws for the location word alone.
 pub(crate) use targeting::{
@@ -107,6 +113,7 @@ impl Plugin for SpellPlugin {
             .init_resource::<SpellModifiers>()
             .init_resource::<AutoSelfCast>()
             .init_resource::<AutoDismount>()
+            .init_resource::<AutoPosture>()
             .init_resource::<SecureAbilityToggle>()
             .init_resource::<SpellTargeting>()
             .init_resource::<HeldForPick>()
@@ -122,7 +129,8 @@ impl Plugin for SpellPlugin {
                     inflight::local_self_cancel
                         .in_set(UnitFeed)
                         .in_set(LocalCancel),
-                    mods::track_class_family
+                    (mods::track_class_family, mods::track_cost_inputs)
+                        .chain()
                         .after(WorldStage::Net)
                         .before(UnitFeed),
                     // The state push runs before the input pass's `ToggleGameMenu`, whose

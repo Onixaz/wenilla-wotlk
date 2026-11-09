@@ -7,7 +7,9 @@ use crate::widget::{FrameHandle, HandleMap, HandleSet};
 
 use super::clip::{effective_clip, scroll_clip_sources};
 use super::model::ExtractIndex;
-use super::{colorselect, slider, ExtractedQuad, FontObject, QuadContent, TexCoords, UiScript};
+use super::{
+    backdrop, colorselect, slider, ExtractedQuad, FontObject, QuadContent, TexCoords, UiScript,
+};
 
 impl UiScript {
     /// Every live draw target, visible or not: each frame's slot then its regions, in arena order.
@@ -164,6 +166,11 @@ fn extract_one(
                 Some(crate::widget::KindState::Cooldown(c)) => c
                     .paint(frame.map_or(1.0, |f| f.effective_scale))
                     .map_or(QuadContent::Frame, QuadContent::Cooldown),
+                // Blobs only for a shown frame: a closed map walks no frame here at all.
+                Some(crate::widget::KindState::QuestPoi(p)) => {
+                    super::quest_blob::paint(model, p, fh)
+                        .map_or(QuadContent::Frame, QuadContent::QuestBlobs)
+                }
                 // A `<Model>`/`<PlayerModel>` pane's content hole, named so the app can join it to
                 // that window's bake. Both kinds share `KindState::Model`, as the client's
                 // character model widget extends its model widget.
@@ -267,8 +274,7 @@ fn extract_one(
             // A Button's non-current state textures emit no quad, and its ButtonText takes
             // the current state's font object (disabled > highlighted > normal).
             let mut state_font: Option<&FontObject> = None;
-            let mut state_color: Option<[f32; 4]> = None;
-            let mut button_font: Option<&crate::widget::ButtonFont> = None;
+            let mut pushed_offset: Option<[f32; 2]> = None;
             if let Some(crate::widget::KindState::Button(bs)) = owner_frame.map(|f| &f.kind_state) {
                 let hovered = owner.is_some() && model.mouseover == owner;
                 // The press is not read here: the state texture latches on the transition
@@ -283,16 +289,17 @@ fn extract_one(
                     // normal one. An empty slot unlinks and keeps the last paint
                     // (`SetFontObject 0x485160`), modelled as staying on normal.
                     let highlighted = hovered || bs.locked_highlight;
-                    let (name, color) = if !bs.enabled() && bs.disabled_font.is_some() {
-                        (bs.disabled_font.as_ref(), bs.disabled_color)
+                    let name = if !bs.enabled() && bs.disabled_font.is_some() {
+                        bs.disabled_font.as_ref()
                     } else if bs.enabled() && highlighted && bs.highlight_font.is_some() {
-                        (bs.highlight_font.as_ref(), bs.highlight_color)
+                        bs.highlight_font.as_ref()
                     } else {
-                        (bs.normal_font.as_ref(), bs.normal_color)
+                        bs.normal_font.as_ref()
                     };
                     state_font = name.and_then(|n| model.font_object(n));
-                    button_font = bs.font.as_ref();
-                    state_color = color;
+                    // The pushed label's justification offset (`0x96f4a0`).
+                    pushed_offset = (bs.button_state() == crate::widget::ButtonVisualState::Pushed)
+                        .then_some(bs.pushed_text_offset);
                 }
             }
             // A title region never draws: `CreateTitleRegion` builds a plain Region with no
@@ -310,6 +317,33 @@ fn extract_one(
             // brightens its bar instead. It stays a real shown ADD region, as
             // `glow:IsShown()` is the mouseover signal 1.12 nameplate addons read.
             if data_ref.is_some_and(super::nameplate::is_unpainted_glow) {
+                return;
+            }
+            // A plain backdrop piece emits one atlas quad straight off its region, with no clone.
+            if let Some((d, (path, tile))) =
+                data_ref.and_then(|d| backdrop::plain_piece(d).map(|p| (d, p)))
+            {
+                let mut rect = model.region_resolved.get(&rh).copied();
+                if let (Some(r), Some(&(dx, dy))) = (rect.as_mut(), model.anims.offsets.get(&rh)) {
+                    r.left += dx;
+                    r.right += dx;
+                    r.bottom += dy;
+                    r.top += dy;
+                }
+                out.push(ExtractedQuad {
+                    target,
+                    z: zkey.raw(),
+                    rect,
+                    alpha: owner_frame.map_or(1.0, |f| f.effective_alpha) * d.alpha.unwrap_or(1.0),
+                    content: QuadContent::Backdrop {
+                        path: path.clone(),
+                        color: d.vertex_color.unwrap_or([1.0, 1.0, 1.0, 1.0]),
+                        uvs: backdrop::piece_uvs(d),
+                        tile,
+                    },
+                    clip,
+                    scale: owner_frame.map_or(1.0, |f| f.effective_scale),
+                });
                 return;
             }
             let mut data = data_ref.cloned().unwrap_or_default();
@@ -350,24 +384,6 @@ fn extract_one(
                     }
                 }
             }
-            // `Button:SetFont` sits between: a local set on the embedded font outranks its
-            // object (clearing the `inheritMask` bit, the font string's `+0xD4`, for good)
-            // but loses to the label's own, so `font_explicit` gates it too.
-            if let Some(bf) = button_font {
-                if !data.font_explicit.face {
-                    data.font_path = Some(bf.path.clone());
-                }
-                if !data.font_explicit.height {
-                    data.font_height = Some(bf.height);
-                }
-                if !data.font_explicit.outline {
-                    data.outline = super::Outline::flags(&bf.flags);
-                }
-            }
-            // The state colour repaints the label outright, even over its own colour.
-            if let Some(c) = state_color {
-                data.vertex_color = Some(c);
-            }
             // A region draws at its resolved rect only: drawable regions carry anchors (authored,
             // or `region::implicit_creation_anchor`) and a failed resolve latches unresolvable, so
             // an unanchored Lua region draws nowhere, as in the reference. The bar fill and thumbs
@@ -380,6 +396,12 @@ fn extract_one(
             }
             // An animation's translation moves the drawn quad only, not the layout rect.
             if let (Some(r), Some(&(dx, dy))) = (rect.as_mut(), model.anims.offsets.get(&rh)) {
+                r.left += dx;
+                r.right += dx;
+                r.bottom += dy;
+                r.top += dy;
+            }
+            if let (Some(r), Some([dx, dy])) = (rect.as_mut(), pushed_offset) {
                 r.left += dx;
                 r.right += dx;
                 r.bottom += dy;
@@ -448,6 +470,8 @@ fn extract_one(
     // its own OVERLAY and HIGHLIGHT regions.
     let z = match &content {
         QuadContent::ModelPane { .. } => zkey.callback(order::DrawLayer::Artwork).raw(),
+        // Queued on OVERLAY only (`0x590660`), after that layer's quads.
+        QuadContent::QuestBlobs(_) => zkey.callback(order::DrawLayer::Overlay).raw(),
         _ => zkey.raw(),
     };
     out.push(ExtractedQuad {
@@ -462,10 +486,9 @@ fn extract_one(
     // A ScrollingMessageFrame adds one Text quad per visible ring line, stacked bottom-up
     // with each line's fade alpha; the ring lives in its kind state, not in FontStrings.
     if let (ZTarget::Frame(fh), Some(fr)) = (target, rect) {
-        // The Backdrop draws at the frame slot; the lines take the ARTWORK content key,
-        // where the client's message strings live, over the BACKGROUND (hover box) art.
+        // The lines take the ARTWORK content key, where the client's message strings live, over
+        // the BACKGROUND (hover box) art.
         let paint = super::layout::FramePaint { alpha, scale };
-        UiScript::emit_backdrop(model, fh, fr, zkey.raw(), paint, clip, out);
         UiScript::emit_message_lines(
             model,
             fh,

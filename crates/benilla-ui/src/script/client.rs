@@ -14,17 +14,22 @@ pub(super) const INTERFACE_VERSION: f64 = 30300.0;
 pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     let g = lua.globals();
 
-    // `GetLocale()` returns one string, `enUS`, as benilla is enUS-only. `IsMacClient()` returns
+    // `GetLocale()` (`0x4dbfd0`) returns the running locale's script name. `IsMacClient()` returns
     // one nil, the PC build's answer, which takes FrameXML's PC key-label arm.
     g.set(
         "GetLocale",
-        lua.create_function(|lua, ()| lua.create_string("enUS"))?,
+        lua.create_function(|lua, ()| lua.create_string(crate::locale::script_name()))?,
     )?;
     g.set("IsMacClient", lua.create_function(|_, ()| Ok(Value::Nil))?)?;
-    // `GetExistingLocales()` (`0x511c80`): one string per installed locale, so enUS alone.
+    // `GetExistingLocales()` (`0x511c80`): one string per installed locale, in the table's order.
     g.set(
         "GetExistingLocales",
-        lua.create_function(|lua, _: MultiValue| lua.create_string("enUS"))?,
+        lua.create_function(|lua, _: MultiValue| {
+            crate::locale::existing()
+                .iter()
+                .map(|name| lua.create_string(name).map(Value::String))
+                .collect::<mlua::Result<MultiValue>>()
+        })?,
     )?;
     // The PC build's other two platform answers: `IsWindowsClient()` pushes the number 1 and
     // `IsLinuxClient()` one nil. Arguments are ignored.
@@ -142,10 +147,23 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 .set_mode(mlua::ChunkMode::Text)
                 .exec()
             {
-                crate::script::model_mut_of(lua)
-                    .record_script_error(super::stdlib::lua_message(&e));
+                // Both channels bare: this message names its chunk by its own source.
+                let bare = super::stdlib::lua_message(&e);
+                crate::script::model_mut_of(lua).record_script_error(bare.clone(), bare);
             }
             Ok(())
+        })?,
+    )?;
+
+    // `IsLoggedIn()` (`0x60a450`): nil while the `PLAYER_LOGIN` one-shot is armed, else 1.
+    g.set(
+        "IsLoggedIn",
+        lua.create_function(|lua, ()| {
+            let armed = lua
+                .app_data_ref::<crate::script::ModelCell>()
+                .expect("model app_data")
+                .player_login_armed;
+            Ok(super::binding_abi::flag(!armed))
         })?,
     )?;
 

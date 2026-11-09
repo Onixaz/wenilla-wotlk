@@ -39,6 +39,7 @@ pub(super) struct Held {
     pub(super) item_id: u32,
     name: String,
     link: Option<String>,
+    count: u32,
     pub(super) locked: bool,
     /// A zero-durability item, or one flagged broken, the state filter drops (`0x7546f0`).
     broken: bool,
@@ -59,11 +60,30 @@ pub(super) enum ItemQuery {
 /// A link's fields, `item:` onward.
 fn link_fields(link: &str) -> Option<[i64; 7]> {
     let rest = &link[link.find("item:")? + 5..];
-    let mut fields = rest.split(':').map(super::item_stats::reference_atoi);
+    let mut fields = rest.split(':').map(super::item_link::reference_atoi);
     let mut next = || fields.next().unwrap_or(0);
     let (id, enchant, gems) = (next(), next(), [next(), next(), next()]);
     next();
     Some([id, enchant, gems[0], gems[1], gems[2], next(), next()])
+}
+
+impl Held {
+    /// The fields of the item's own link.
+    pub(super) fn link_fields(&self) -> Option<super::item_link::ItemLinkFields> {
+        let link = self.link.as_deref()?;
+        Some(super::item_link::ItemLinkFields::parse(link)?.1)
+    }
+}
+
+/// The stacks of `item_id` a search reads (`0x7546f0`): the bank with `bank`, and a broken item
+/// too with `every`.
+pub(super) fn held_count(model: &Model, item_id: u32, bank: bool, every: bool) -> u32 {
+    let flags = if bank { IN_BANK } else { 0 } | if every { IGNORE_STATE } else { 0 };
+    walk(model, flags)
+        .iter()
+        .filter(|h| h.item_id == item_id)
+        .map(|h| h.count)
+        .sum()
 }
 
 impl ItemQuery {
@@ -120,6 +140,7 @@ fn contents(model: &Model, bag: i64, out: &mut Vec<Held>) {
             item_id: s.item_id,
             name: item_link_name(s.link.as_deref()),
             link: s.link.clone(),
+            count: s.count.max(1),
             locked: s.locked,
             broken: s.durability.is_some_and(|(now, _)| now == 0),
         });
@@ -144,6 +165,7 @@ fn worn(model: &Model, id: usize, out: &mut Vec<Held>) {
             None => s.name.clone().unwrap_or_default(),
         },
         link: s.link.clone(),
+        count: s.count.max(1),
         locked: s.locked,
         broken: s.flags & 0x10 != 0 || (!wrapped && s.durability.is_some_and(|(now, _)| now == 0)),
     });
@@ -240,6 +262,23 @@ fn use_spell(model: &Model, item_id: u32) -> Option<u32> {
         .filter(|(t, _, _)| *t == 0)
         .map(|(_, s, _)| *s)
         .next()
+}
+
+/// The item's use spell, as `GetItemSpell` picks it, and the VM's spell source.
+#[allow(clippy::type_complexity)]
+fn item_range_spell(
+    lua: &Lua,
+    item: &Value,
+) -> mlua::Result<(
+    Option<u32>,
+    Option<std::rc::Rc<dyn super::spell_info::SpellInfoSource>>,
+)> {
+    let model = lua
+        .app_data_ref::<crate::script::ModelCell>()
+        .expect("model app_data");
+    let id = item_id_of(lua, &model, item)?;
+    let spell = use_spell(&model, id).or_else(|| enchant_use_spell(&model, id));
+    Ok((spell, model.spell_info.clone()))
 }
 
 /// With no on-use spell, the use spell of an enchant on the worn item (`0x5a86b0`, `0x707c60`).
@@ -380,6 +419,32 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 out[1] = Value::String(lua.create_string(&info.rank)?);
             }
             Ok(MultiValue::from_vec(out))
+        })?,
+    )?;
+
+    // ItemHasRange(item) (`0x51c870`): 1 when the item's use spell has a range, else nil.
+    g.set(
+        "ItemHasRange",
+        lua.create_function(|lua, item: Value| {
+            let (spell, source) = item_range_spell(lua, &item)?;
+            let has = spell
+                .zip(source)
+                .is_some_and(|(id, s)| s.spell_has_range(id, false));
+            Ok(if has { Value::Integer(1) } else { Value::Nil })
+        })?,
+    )?;
+
+    // IsItemInRange(item, unit) (`0x51c9c0`): the use spell's range check: 1, 0 or nil.
+    g.set(
+        "IsItemInRange",
+        lua.create_function(|lua, (item, unit): (Value, Value)| {
+            let (spell, source) = item_range_spell(lua, &item)?;
+            let target = super::spell_info::range_unit(lua, &unit);
+            let near = spell
+                .zip(source)
+                .zip(target)
+                .and_then(|((id, s), guid)| s.spell_in_range(id, false, guid));
+            Ok(super::spell_info::range_answer(near))
         })?,
     )?;
 
@@ -564,6 +629,7 @@ mod tests {
             bag: 0,
             slot: 1,
             item_id: 25,
+            count: 1,
             name: "Worn Sword".into(),
             link: Some("|Hitem:25:7:0:0:0:0:3:9:80|h[Worn Sword]|h".into()),
             locked: false,

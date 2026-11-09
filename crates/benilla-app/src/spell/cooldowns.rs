@@ -1402,6 +1402,7 @@ mod tests {
             runes: super::super::usable::RuneCheck {
                 state: &state,
                 costs: &costs,
+                player: &benilla_protocol::ObjectFields::default(),
             },
             catalog: &catalog,
             mods: &mods,

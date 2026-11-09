@@ -130,6 +130,13 @@ pub fn wants_rig(m: &M2Model) -> bool {
         )
 }
 
+/// Whether [`spawn_anim_host`] would host this model: [`wants_rig`] or a bind-posed sound arm.
+pub(crate) fn wants_host(m: &M2Model) -> bool {
+    wants_rig(m)
+        || (!crate::dev_state::deterministic_run()
+            && m.animations.as_ref().is_some_and(arms_for_sound))
+}
+
 /// Spawn the animation host for one placed M2 that animates: a root at the placement transform with
 /// the collapsed [`RigPose`] and, per tier, an `AnimationPlayer` looping the loader-idle seed (the
 /// reference's load arm, `(bone 0, animation id 0, linkFlag=1)`) and/or a [`GlobalSeqDrive`].
@@ -139,17 +146,14 @@ pub fn spawn_anim_host(
     m: &M2Model,
     transform: Transform,
 ) -> Option<AnimHostSpawn> {
-    // Captures keep every doodad static, so their frames are deterministic.
-    if crate::dev_state::deterministic_run() {
+    // No host for a capture, whose frames are deterministic, or a model nothing arms.
+    if !wants_host(m) {
         return None;
     }
     let tier = classify(&m.skeleton, m.animations.as_ref());
     // The sound arm, orthogonal to the tier: a bind-posed model still runs its event track, as in
     // the reference, so it gets a host with the arm bookkeeping but no `AnimationPlayer`.
     let sound_arm = m.animations.as_ref().is_some_and(arms_for_sound);
-    if matches!(tier, DoodadAnimTier::Static) && !sound_arm {
-        return None;
-    }
     let anims = m
         .animations
         .as_ref()
@@ -294,34 +298,25 @@ fn reroll_doodad_variation(
 #[allow(clippy::type_complexity)] // one Bevy system's full input set
 fn gate_doodad_anim(
     time: Res<Time>,
-    // The walk, and a still frame's one reason to walk anyway: a host born since.
-    mut host_set: ParamSet<(
-        Query<(
-            Entity,
-            &mut DoodadAnimHost,
-            Option<&lazy::LazyRig>,
-            Option<&RigPose>,
-            Has<crate::rig_palette::RigSkin>,
-            Option<&mut AnimationPlayer>,
-            Option<&mut GlobalSeqDrive>,
-            Has<AnimParked>,
-        )>,
-        Query<(), Added<DoodadAnimHost>>,
+    mut hosts: Query<(
+        Entity,
+        &mut DoodadAnimHost,
+        Option<&lazy::LazyRig>,
+        Option<&RigPose>,
+        Has<crate::rig_palette::RigSkin>,
+        Option<&mut AnimationPlayer>,
+        Option<&mut GlobalSeqDrive>,
+        Has<AnimParked>,
     )>,
     vis: Query<&Visibility>,
     cam: Query<
         (
-            Ref<GlobalTransform>,
+            &GlobalTransform,
             &bevy::camera::primitives::Frustum,
-            Ref<bevy::camera::Projection>,
-            // The seat's own write: `GlobalTransform` propagates after this system, so on a
-            // teleport frame only the local shows the camera moved.
-            Option<Ref<Transform>>,
+            &bevy::camera::Projection,
         ),
         With<crate::view::WorldCamera>,
     >,
-    // With no part's `Visibility` changed and the camera still, every verdict is last frame's.
-    changed_vis: Query<(), (Changed<Visibility>, With<crate::model_render::ModelPart>)>,
     // The draw-set inputs (far clip, exterior-window gate, camera room, portal instances), the
     // same `SystemParam` the particle and ribbon sims read, so a placement's riders agree.
     scene: crate::particles::sim::SceneGates,
@@ -332,27 +327,16 @@ fn gate_doodad_anim(
     mut twin_parts: lazy::TwinParts,
     mut commands: Commands,
     mut logged: Local<bool>,
-    // A still frame re-judges nothing; only a new host or a retried rig promote needs the walk.
-    mut promote_pending: Local<bool>,
 ) {
     // One log line per session, the first frame any host exists.
-    if !*logged && !host_set.p0().is_empty() {
+    if !*logged && !hosts.is_empty() {
         *logged = true;
         info!("doodad anim: first host armed");
     }
     let now = time.elapsed_secs();
     let world_cam = cam.single().ok();
     let (farclip, exterior_gate, camera_instance) =
-        scene.scene(world_cam.as_ref().map(|(tf, _, proj, _)| (&**tf, &**proj)));
-    let verdicts_still = world_cam.as_ref().is_some_and(|(tf, _, proj, local)| {
-        !tf.is_changed() && !proj.is_changed() && !local.as_ref().is_some_and(|l| l.is_changed())
-    }) && !scene.changed()
-        && changed_vis.is_empty();
-    if verdicts_still && host_set.p1().is_empty() && !*promote_pending {
-        return;
-    }
-    let mut pending = false;
-    // Fixed at spawn (`EmitterFade`), so a reused verdict never sees the sphere move.
+        scene.scene(world_cam.map(|(tf, _, proj)| (tf, proj)));
     let in_frustum = |frustum: &bevy::camera::primitives::Frustum,
                       fade: &crate::particles::EmitterFade| {
         frustum.intersects_sphere(
@@ -363,16 +347,12 @@ fn gate_doodad_anim(
             false,
         )
     };
-    let mut hosts = host_set.p0();
     for (entity, mut host, lazy, pose, has_rig, player, drive, parked) in &mut hosts {
-        // A host born this frame has no verdict to reuse (`active` starts false).
-        let drawn = if verdicts_still && !host.is_added() {
-            host.active
-        } else if host.meshes.is_empty() {
+        let drawn = if host.meshes.is_empty() {
             // Meshless: the reference ticks any model in the draw set, and a 0-batch model is
             // admitted on its fade sphere like its emitters, through the same `in_draw_set`.
             let fade = &host.fade;
-            world_cam.as_ref().is_some_and(|(cam_tf, frustum, _, _)| {
+            world_cam.is_some_and(|(cam_tf, frustum, _)| {
                 fade.in_draw_set(
                     cam_tf.translation(),
                     Vec3::from(cam_tf.forward()),
@@ -389,18 +369,15 @@ fn gate_doodad_anim(
             host.meshes
                 .iter()
                 .any(|&e| vis.get(e).is_ok_and(|v| *v != Visibility::Hidden))
-                && world_cam
-                    .as_ref()
-                    .is_none_or(|(_, frustum, _, _)| in_frustum(frustum, &host.fade))
+                && world_cam.is_none_or(|(_, frustum, _)| in_frustum(frustum, &host.fade))
         };
         // The lazy-rig promote, retried every frame the host stays drawn so a full table is only
         // a delay. It needs a second drawn frame (`host.active`): on its first, a spawned part's
         // `Visibility` is still the `Inherited` default the fade and cull authorities have not
         // judged, so every far doodad of a new tile reads drawn.
-        if drawn && host.active && !has_rig {
+        if drawn && !has_rig && host.active {
             if let Some(lazy) = lazy {
-                // A full table re-walks next frame to retry; a landed promote rigs the host.
-                pending |= !lazy::promote_lazy_rig(
+                lazy::promote_lazy_rig(
                     &mut commands,
                     &mut palettes,
                     &ibps,
@@ -446,7 +423,6 @@ fn gate_doodad_anim(
             d.set_paused(!drawn);
         }
     }
-    *promote_pending = pending;
 }
 
 pub struct DoodadAnimPlugin;
@@ -1071,102 +1047,6 @@ mod tests {
             !active(&app, map_doodad),
             "the control: a map doodad carries no building, so the sealed room stops it"
         );
-    }
-
-    /// The gate runs before transform propagation, so on a teleport frame only the camera's local
-    /// has moved, and the verdict reuse must still re-judge every host.
-    #[test]
-    fn a_reseated_camera_is_not_a_still_scene() {
-        let mut app = App::new();
-        app.add_plugins((MinimalPlugins, AssetPlugin::default()));
-        app.init_resource::<crate::view::ViewDistance>();
-        app.init_resource::<crate::wmo_portal::ExteriorWindows>();
-        app.init_resource::<crate::wmo_portal::CameraInteriorClaim>();
-        app.init_resource::<crate::rig_palette::RigPalettes>();
-        app.init_asset::<SkinnedMeshInverseBindposes>();
-        app.add_systems(Update, gate_doodad_anim);
-
-        // A camera 1000 yd off, looking away: not drawn. With no propagation, `GlobalTransform`
-        // never follows `Transform`, as on the real snap frame.
-        let far =
-            Transform::from_xyz(1000.0, 0.0, 0.0).looking_at(Vec3::new(2000.0, 0.0, 0.0), Vec3::Y);
-        let projection = bevy::camera::Projection::from(bevy::camera::PerspectiveProjection {
-            far: 5000.0,
-            ..default()
-        });
-        let frustum = bevy::camera::primitives::Frustum::from_clip_from_world(
-            &(projection.get_clip_from_view() * GlobalTransform::from(far).affine().inverse()),
-        );
-        let cam = app
-            .world_mut()
-            .spawn((
-                crate::view::WorldCamera,
-                GlobalTransform::from(far),
-                far,
-                frustum,
-                projection,
-            ))
-            .id();
-        let node = AnimationNodeIndex::new(1);
-        let mut player = AnimationPlayer::default();
-        player.play(node).repeat();
-        let joint = app.world_mut().spawn(Transform::default()).id();
-        let drive = GlobalSeqDrive::new(
-            &anims(Vec::new(), None, true).global_bones,
-            &[Entity::PLACEHOLDER, joint],
-        )
-        .expect("one gseq bone maps");
-        let host = app
-            .world_mut()
-            .spawn((
-                DoodadAnimHost {
-                    meshes: Vec::new(),
-                    fade: crate::particles::EmitterFade::sphere(1.0, Vec3::ZERO),
-                    clip: Some((node, 2.0)),
-                    armed_at: 0.0,
-                    window_hi: f32::INFINITY,
-                    anim_id: Some(0),
-                    active: true,
-                    parked_at: 0.0,
-                },
-                player,
-                drive,
-            ))
-            .id();
-        let active = |app: &App| {
-            app.world()
-                .entity(host)
-                .get::<DoodadAnimHost>()
-                .unwrap()
-                .active
-        };
-        app.update();
-        assert!(!active(&app), "far and facing away ⇒ parked");
-        app.update();
-        app.update();
-        assert!(!active(&app), "still ⇒ the verdict is reused, still parked");
-
-        // The snap: the seat writes the local next to the host, facing it; the global stays stale.
-        let near = Transform::from_xyz(0.0, 0.0, 10.0).looking_at(Vec3::ZERO, Vec3::Y);
-        let near_frustum = bevy::camera::primitives::Frustum::from_clip_from_world(
-            &(bevy::camera::Projection::from(bevy::camera::PerspectiveProjection {
-                far: 5000.0,
-                ..default()
-            })
-            .get_clip_from_view()
-                * GlobalTransform::from(near).affine().inverse()),
-        );
-        {
-            let mut e = app.world_mut().entity_mut(cam);
-            *e.get_mut::<Transform>().unwrap() = near;
-            *e.get_mut::<bevy::camera::primitives::Frustum>().unwrap() = near_frustum;
-            // Written without a change tick, so the local is this frame's only moved signal.
-            *e.get_mut::<GlobalTransform>()
-                .unwrap()
-                .bypass_change_detection() = GlobalTransform::from(near);
-        }
-        app.update();
-        assert!(active(&app), "the snap frame re-judges the host: drawn");
     }
 
     /// Bevy's frustum culling writes `ViewVisibility` only, so a meshed doodad off-screen keeps an

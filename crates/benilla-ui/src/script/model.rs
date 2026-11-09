@@ -159,10 +159,14 @@ pub(crate) struct Model {
     pub(crate) layout_rounds: u64,
     /// Per frame, rasterized links `(y-up rect, link, full |H…|h markup)` for `OnHyperlinkClick`.
     pub(crate) link_spans: crate::widget::HandleMap<FrameHandle, Vec<(Rect, String, String)>>,
+    /// The span under the pointer, `(frame id, link, markup)`, for `OnHyperlinkLeave`.
+    pub(crate) hovered_link: Option<(u32, String, String)>,
     /// Region visuals (texture, colour, text) and layout (anchors, size, justify).
     pub(crate) region_data: crate::widget::HandleMap<RegionHandle, RegionData>,
     /// Each frame's backdrop plate (`<Backdrop>` or `SetBackdrop`, the client's `frame+0x1ac`).
     pub(crate) backdrops: crate::widget::HandleMap<FrameHandle, backdrop::Backdrop>,
+    /// Each backdrop's nine texture slots (`frame+0x1ac`'s `+0x0..+0x20`).
+    pub(crate) backdrop_slots: crate::widget::HandleMap<FrameHandle, backdrop::BackdropSlots>,
     /// The SimpleHTML widgets' state: element fonts `+0x350`, link format `+0x360`, content nodes
     /// `+0x340`.
     pub(crate) simple_html: simplehtml::SimpleHtmlStates,
@@ -246,6 +250,8 @@ pub(crate) struct Model {
     /// Errors owed to `geterrorhandler()`, which the reference calls on each caught error; one the
     /// handler itself raises skips this queue, which stops the recursion.
     pub(crate) pending_error_dispatch: Vec<String>,
+    /// The `PLAYER_LOGIN` one-shot, `[0xbd0793]`, between the UI load and the world entry.
+    pub(crate) player_login_armed: bool,
     /// The session's retained diagnostic log, deduplicated and bounded; `errors` drains each frame.
     pub(crate) diagnostics: super::diagnostics::DiagnosticLog,
     /// Non-fatal warnings for the host, such as a dropped `inherits=` template.
@@ -544,6 +550,8 @@ pub(crate) struct Model {
     pub(crate) spellbook: spellbook::SpellBookState,
     /// The book's highest-rank view, rebuilt with every [`Self::spellbook`] push.
     pub(crate) spellbook_highest_rank: spellbook::HighestRankView,
+    /// The full known-spell set, a superset of [`Self::spellbook`], and the rank table the item tests walk.
+    pub(crate) known_spells: spellbook::KnownSpells,
     /// The pet's spellbook, a second array as in the reference.
     pub(crate) pet_book: spellbook::PetBookState,
     /// The critter and mount lists (`0xbe8df4`).
@@ -990,8 +998,16 @@ pub(crate) struct Model {
     /// `ItemRandomProperties` id to its view, pushed whole at startup: a clicked tooltip cannot
     /// repaint on a late answer. The reference reads its loaded store.
     pub(crate) random_properties: HashMap<u32, super::RandomPropertyView>,
-    /// `ItemRandomSuffix.dbc`'s names, the suffix a negative random-property id takes.
-    pub(crate) random_suffixes: HashMap<u32, String>,
+    /// `ItemRandomSuffix.dbc`, what a negative random-property id takes.
+    pub(crate) random_suffixes: HashMap<u32, super::RandomSuffixView>,
+    /// `SpellItemEnchantment.dbc`, pushed whole at startup: a link names any row.
+    pub(crate) enchant_rows: HashMap<u32, super::EnchantRowView>,
+    /// Quest tooltips by quest id, the quests a tooltip asked for, and the tooltips waiting.
+    pub(crate) quest_tooltips: HashMap<u32, super::QuestTooltipView>,
+    pub(crate) quest_tooltip_asks: HashSet<u32>,
+    pub(crate) quest_tooltip_waits: HashMap<FrameHandle, u32>,
+    /// A waiting item setter is running again, which `SetHyperlink`'s toggle must not read.
+    pub(crate) item_setter_again: bool,
     /// The player's level, class, race and skills, for a tooltip's red requirement lines.
     pub(crate) player_req: PlayerReqState,
     /// Spell id to its tooltip view, and the misses asked for.
@@ -1195,6 +1211,12 @@ pub(crate) struct Model {
     pub(crate) click_button: Option<String>,
     /// The player state `SecureCmdOptionParse`'s conditions read beside the unit snapshots.
     pub(crate) option_state: super::OptionState,
+    /// `flyable`'s Northrend training, from the spell book.
+    pub(crate) knows_cold_weather_flying: bool,
+    /// What the macro conditions `equipped` and `worn` read.
+    pub(crate) equipped_for_macros: super::EquippedForMacros,
+    /// Whispered names by folded name: the spelling and the time last used, for autocomplete.
+    pub(crate) autocomplete_contacts: std::collections::HashMap<String, (String, f64)>,
     /// Condition names `SecureCmdOptionParse` did not know, for `ERR_UNKNOWN_MACRO_OPTION_S`.
     pub(crate) unknown_macro_options: Vec<String>,
 }
@@ -1217,13 +1239,20 @@ impl Model {
         }
     }
 
-    /// Records a caught script error for the host, the retained log and the Lua error handler; an
-    /// error raised by the handler itself goes back to the handler alone, never through here.
-    pub(crate) fn record_script_error(&mut self, msg: String) {
+    /// Records a caught Lua error: the decorated text for the host and the retained log, the bare
+    /// message for the Lua error handler ([`Self::record_script_error`]).
+    pub(crate) fn record_lua_error(&mut self, e: &mlua::Error) {
+        self.record_script_error(e.to_string(), super::stdlib::lua_message(e));
+    }
+
+    /// Records a caught script error: `host` for the host and the retained log, `bare` for the Lua
+    /// error handler, which never sees a decoration; an error raised by the handler itself goes
+    /// back to the handler alone, never through here.
+    pub(crate) fn record_script_error(&mut self, host: String, bare: String) {
         self.diagnostics
-            .record(super::diagnostics::DiagnosticKind::Error, &msg);
-        self.pending_error_dispatch.push(msg.clone());
-        self.errors.push(msg);
+            .record(super::diagnostics::DiagnosticKind::Error, &host);
+        self.pending_error_dispatch.push(bare);
+        self.errors.push(host);
     }
 
     /// Records a non-fatal warning for the host's terminal and the retained diagnostic log.
@@ -1351,6 +1380,7 @@ impl Model {
             link_spans: Default::default(),
             region_data: Default::default(),
             backdrops: Default::default(),
+            backdrop_slots: Default::default(),
             simple_html: simplehtml::SimpleHtmlStates::new(),
             font_objects_by_lower: HashMap::new(),
             region_resolved: Default::default(),
@@ -1384,6 +1414,7 @@ impl Model {
             pending_size_changed: Vec::new(),
             errors: Vec::new(),
             pending_error_dispatch: Vec::new(),
+            player_login_armed: false,
             diagnostics: Default::default(),
             warnings: Vec::new(),
             // 1024x768 until the host calls `set_screen_size`; y-up `[bottom, left, top, right]`.
@@ -1520,6 +1551,7 @@ impl Model {
             action_sets: Vec::new(),
             ui_errors: Vec::new(),
             spellbook: spellbook::SpellBookState::default(),
+            known_spells: spellbook::KnownSpells::default(),
             spellbook_highest_rank: spellbook::HighestRankView::default(),
             pet_book: spellbook::PetBookState::default(),
             companions: super::companion::CompanionState::default(),
@@ -1746,7 +1778,13 @@ impl Model {
             item_sets: HashMap::new(),
             item_set_asks: HashSet::new(),
             random_properties: HashMap::new(),
+            hovered_link: None,
             random_suffixes: HashMap::new(),
+            enchant_rows: HashMap::new(),
+            quest_tooltips: HashMap::new(),
+            quest_tooltip_asks: HashSet::new(),
+            quest_tooltip_waits: HashMap::new(),
+            item_setter_again: false,
             item_stat_asks: HashSet::new(),
             player_req: PlayerReqState::default(),
             spell_tooltips: HashMap::new(),
@@ -1791,6 +1829,9 @@ impl Model {
             modifiers: (false, false, false),
             click_button: None,
             option_state: Default::default(),
+            knows_cold_weather_flying: false,
+            equipped_for_macros: Default::default(),
+            autocomplete_contacts: Default::default(),
             unknown_macro_options: Vec::new(),
             money: 0,
             net_latency_ms: 0,

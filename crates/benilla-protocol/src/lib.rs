@@ -183,11 +183,17 @@ impl Logon {
 /// The blocking twin of [`logon_async`], for the CLIs, probes and the native net thread.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn logon(host: &str, username: &str, password: &str) -> Result<Logon> {
-    futures_lite::future::block_on(logon_async(host, username, password))
+    logon_locale(host, username, password, u32::from_be_bytes(*b"enUS"))
 }
 
-/// The full SRP6 logon against a `realmd`, then the realm list.
-pub async fn logon_async(host: &str, username: &str, password: &str) -> Result<Logon> {
+/// [`logon`] for a client running another locale, its four letters packed big-endian.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn logon_locale(host: &str, username: &str, password: &str, locale: u32) -> Result<Logon> {
+    futures_lite::future::block_on(logon_async(host, username, password, locale))
+}
+
+/// The full SRP6 logon against a `realmd`, then the realm list, for a client running `locale`.
+pub async fn logon_async(host: &str, username: &str, password: &str, locale: u32) -> Result<Logon> {
     let (host, port) = host_port(host, AUTH_PORT);
 
     let username_n =
@@ -202,7 +208,7 @@ pub async fn logon_async(host: &str, username: &str, password: &str) -> Result<L
         let mut dialed = None;
         for _ in 0..MAX_CHALLENGE_DIALS {
             let mut stream = dial(host, port).await?;
-            auth::write_logon_challenge(&mut stream, &username.to_uppercase())
+            auth::write_logon_challenge(&mut stream, &username.to_uppercase(), locale)
                 .context("sending logon challenge")?;
             let Some(reply) = auth::read_challenge_reply(&mut stream)
                 .await
