@@ -153,7 +153,8 @@ export function missingWebGpu() {
 async function dataStore() {
   if (!window.__wenilla_data) {
     const { createStore } = await import(new URL('./datastore.js', import.meta.url).href);
-    window.__wenilla_data ??= createStore();
+    // Beside the page, so `/eses/` reads `/eses/data` (`data_base` in benilla-formats' web.rs).
+    window.__wenilla_data ??= createStore({ base: new URL('./data', import.meta.url).pathname });
   }
   return window.__wenilla_data;
 }

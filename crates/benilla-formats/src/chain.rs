@@ -205,6 +205,13 @@ pub fn data_locale(path: &Path) -> Result<String> {
         .context("no locale folder holds the locale archives")
 }
 
+/// Every locale folder a `Data` directory holds, in the client's table order (`0x402d50`).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn data_locales(path: &Path) -> Result<Vec<&'static str>> {
+    let (files, _) = data_listing(path)?;
+    Ok(locale::existing(&files))
+}
+
 /// On the page the locale is the web host's: it answers `GET /data/__locale` from its own `Data`
 /// folder through the same [`data_locale`] the native client asks.
 #[cfg(target_arch = "wasm32")]

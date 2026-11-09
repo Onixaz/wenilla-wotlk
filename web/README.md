@@ -37,6 +37,11 @@ cargo run --release -p wenilla-host -- --www web/dist --data /path/to/WoW/Data -
 # then open http://127.0.0.1:8090/
 ```
 
+The host serves one site per locale folder in `Data`, at that folder's lowercase name: `/enus/`,
+`/eses/`, and so on. `/` redirects to `enUS` when the install has it, otherwise to the next locale
+in the client's table order, and a locale the install lacks is a 404. The data routes below live
+under each prefix (`/eses/data/…`); `--data` pointing at a single `.MPQ` serves one site at `/`.
+
 `wenilla-host` (`crates/wenilla-host`) is the whole server side: static files
 (precompressed), `GET /data/{name}` (`HEAD` too; with `?v=<the data version>` the answer is
 `public` so a CDN can keep it, a stale `v=` is `no-store`; `GET /data/__index` lists the chain,

@@ -79,16 +79,17 @@ mod wasm {
     use wasm_bindgen::JsValue;
     use web_sys::XmlHttpRequest;
 
-    /// The root every chain fetch is served from: `/data` under this page's own origin. The web
-    /// host answers both the client bundle and the `/data/*` routes from one process (Lane H), so
-    /// there is never a cross-origin question to configure — this is the whole answer.
+    /// The root every chain fetch is served from: `data` beside this page, so `/eses/` reads
+    /// `/eses/data`. The web host answers both the client bundle and the data routes from one
+    /// process (Lane H), so there is never a cross-origin question to configure.
     pub fn data_base() -> String {
-        let origin = web_sys::window()
+        let location = web_sys::window()
             .expect("benilla_formats::web only runs inside a browser tab")
-            .location()
-            .origin()
-            .expect("window.location.origin");
-        format!("{origin}/data")
+            .location();
+        let origin = location.origin().expect("window.location.origin");
+        let path = location.pathname().expect("window.location.pathname");
+        let dir = &path[..path.rfind('/').map_or(0, |slash| slash + 1)];
+        format!("{origin}{dir}data")
     }
 
     /// Append `name` to the page's boot-read trace, if the page armed one — the input to
