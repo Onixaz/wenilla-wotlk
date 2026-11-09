@@ -494,3 +494,112 @@ test('dropAhead forgets unsent GETs ahead, leaves the rest, and a dropped name c
   await settle();
   assert.equal(s.ready(['a.adt']), true);
 });
+
+/// A persistent cache a test can look into, and a host that answers at once.
+function diskCache() {
+  const disk = new Map();
+  return {
+    disk,
+    caches: {
+      keys: async () => [],
+      delete: async () => {},
+      open: async () => ({
+        match: async (u) => (disk.has(u) ? new Response(disk.get(u)) : undefined),
+        put: async (u, r) => disk.set(u, new Uint8Array(await r.arrayBuffer())),
+      }),
+    },
+  };
+}
+
+function instantHost(files) {
+  const calls = [];
+  const fetch = async (url) => {
+    const path = decodeURIComponent(url.slice('/data/'.length).split('?')[0]);
+    calls.push(path);
+    if (path === '__version') return new Response('v1');
+    return files[path] ? new Response(files[path]) : new Response('', { status: 404 });
+  };
+  return { fetch, calls };
+}
+
+test('a pinned name outlives eviction that takes older and newer neighbours', async () => {
+  const h = host({ pin: bytes(1, 1, 1, 1), a: bytes(2, 2, 2, 2), b: bytes(3, 3, 3, 3) });
+  const s = versioned(h, { budgetBytes: 8 });
+  const first = s.prefetch(['pin'], { pin: true });
+  await settle();
+  h.openAll();
+  await first;
+  const rest = s.prefetch(['a']);
+  await settle();
+  h.openAll();
+  await rest;
+  const last = s.prefetch(['b']);
+  await settle();
+  h.openAll();
+  await last;
+  assert.equal(s.has('pin'), true, 'the oldest entry, but pinned');
+  assert.equal(s.has('a'), false, 'the oldest unpinned one goes instead');
+  assert.equal(s.has('b'), true);
+  assert.equal(s.stats().evicted, 1);
+});
+
+test('a fill reaches the disk and leaves memory alone', async () => {
+  const { disk, caches } = diskCache();
+  const h = instantHost({ 'a.blp': bytes(1), 'b.blp': bytes(2) });
+  const s = createStore({ fetch: h.fetch, caches, storage: null, version: 'v1' });
+  assert.equal(await s.fill(['A.blp', 'b.blp', 'gone.blp'], { idleMs: 0 }), true);
+  await settle();
+  assert.deepEqual(disk.get('/data/a.blp'), bytes(1));
+  assert.deepEqual(disk.get('/data/b.blp'), bytes(2));
+  assert.equal(s.stats().memBytes, 0, 'nothing held in memory');
+  assert.equal(s.has('a.blp'), false);
+  assert.deepEqual(await s.load('a.blp'), bytes(1), 'a later reader finds it');
+});
+
+test('a fill skips what is on disk and does not walk a finished tag again', async () => {
+  const { disk, caches } = diskCache();
+  disk.set('/data/a.blp', bytes(9));
+  const h = instantHost({ 'a.blp': bytes(1), 'b.blp': bytes(2) });
+  const kv = new Map();
+  const storage = { getItem: (k) => kv.get(k) ?? null, setItem: (k, v) => kv.set(k, v) };
+  const s = createStore({ fetch: h.fetch, caches, storage, version: 'v1' });
+  assert.equal(await s.fill(['a.blp', 'b.blp'], { tag: 'ui', idleMs: 0 }), true);
+  assert.equal(h.calls.includes('a.blp'), false, 'already on disk: no request');
+  assert.equal(h.calls.includes('b.blp'), true);
+
+  const again = createStore({ fetch: h.fetch, caches, storage, version: 'v1' });
+  const before = h.calls.length;
+  assert.equal(await again.fill(['a.blp', 'c.blp'], { tag: 'ui', idleMs: 0 }), false);
+  assert.equal(h.calls.length, before, 'a finished tag sends nothing');
+
+  const changed = createStore({ fetch: h.fetch, caches, storage, version: 'v2' });
+  assert.equal(await changed.fill(['b.blp'], { tag: 'ui', idleMs: 0 }), true, 'a new install walks again');
+});
+
+test('a fill with no persistent cache does nothing', async () => {
+  const h = instantHost({ 'a.blp': bytes(1) });
+  const s = createStore({ fetch: h.fetch, persist: false, storage: null, version: 'v1' });
+  assert.equal(await s.fill(['a.blp'], { idleMs: 0 }), false);
+  assert.equal(h.calls.includes('a.blp'), false);
+});
+
+test('a fill waits while a reader or a fetch ahead wants the network', async () => {
+  const { caches } = diskCache();
+  const h = host({ 'x.m2': bytes(1), 'a.blp': bytes(2) });
+  const s = createStore({ fetch: h.fetch, caches, storage: null, version: 'v1' });
+  const reader = s.load('x.m2');
+  await settle();
+  h.openAll();
+  await settle();
+  const filling = s.fill(['a.blp'], { workers: 1, idleMs: 1 });
+  for (let i = 0; i < 5; i++) await settle();
+  assert.equal(h.calls.some((c) => c.path === 'a.blp') && s.reading() > 0, false, 'held back while a reader waits');
+  for (let i = 0; i < 40; i++) {
+    h.openAll();
+    await settle();
+    await new Promise((r) => setTimeout(r, 2));
+  }
+  await reader;
+  assert.equal(await filling, true);
+  assert.equal(h.calls.some((c) => c.path === 'a.blp'), true, 'then it goes');
+});

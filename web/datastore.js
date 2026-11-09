@@ -13,7 +13,9 @@
 //     flight, reads the persistent cache, or fetches. `keep` holds the bytes in memory for a
 //     later reader (a fetch ahead); without it the reader takes them (memory → consumed).
 //   - `prefetch(names)` is `load` with `keep` at low priority, so fetches ahead never crowd out
-//     a read something is waiting on.
+//     a read something is waiting on. `pin` keeps them from eviction.
+//   - `fill(names, {tag})` downloads to the persistent cache alone, a few at a time and only when
+//     nothing else wants the network: art a `ready` then reads off the disk, in no one's memory.
 //   - `ready(names)` (sync) says whether a frame can read `names` now, and otherwise starts them:
 //     the caller draws without them and asks again next frame, so a miss costs a late image and
 //     not a frozen frame. A name that cannot arrive answers true, and its read fails as it would.
@@ -41,6 +43,7 @@
 const DEFAULT_BUDGET = 384 * 1024 * 1024;
 const LEARNED_KEY = 'wenilla:data:learned';
 const LEARNED_MAX = 6000;
+const FILLED_KEY = 'wenilla:data:filled';
 const CACHE_PREFIX = 'wenilla-data-';
 const DROPPED = new Error('fetch ahead dropped');
 
@@ -57,6 +60,7 @@ export function createStore(opts = {}) {
   const storage = opts.storage === undefined ? safeLocalStorage() : opts.storage;
 
   const mem = new Map(); // key -> Uint8Array, oldest first
+  const pinned = new Set(); // keys eviction leaves alone
   let memBytes = 0;
   const flights = new Map(); // key -> flight
   const missing = new Set(); // keys the host answered 404 for
@@ -71,7 +75,7 @@ export function createStore(opts = {}) {
   const settled = new Set(); // keys `ready` asked for that did not land: never asked for again
   const stats = {
     memHits: 0, getMisses: 0, joined: 0, cacheHits: 0, network: 0, networkBytes: 0,
-    batches: 0, requests: 0, notFound: 0, errors: 0, evicted: 0,
+    batches: 0, requests: 0, notFound: 0, errors: 0, evicted: 0, filled: 0,
   };
   const urlFor = (key) => `${base}/${encodeURIComponent(key)}`;
   const net = createNetwork({
@@ -93,11 +97,13 @@ export function createStore(opts = {}) {
     if (bytes.byteLength > budget) return;
     mem.set(key, bytes);
     memBytes += bytes.byteLength;
-    while (memBytes > budget) {
-      const [k, v] = mem.entries().next().value;
+    if (memBytes <= budget) return;
+    for (const [k, v] of mem) {
+      if (pinned.has(k)) continue;
       mem.delete(k);
       memBytes -= v.byteLength;
       stats.evicted += 1;
+      if (memBytes <= budget) break;
     }
   }
 
@@ -250,9 +256,11 @@ export function createStore(opts = {}) {
     return all;
   }
 
-  /// Fetch `names` ahead into memory; resolves when every one has landed or failed.
-  function prefetch(names, { priority = 'low', ahead = false, onProgress } = {}) {
+  /// Fetch `names` ahead into memory; resolves when every one has landed or failed. `pin` keeps
+  /// them from eviction: what a blocking reader needs on the player's click, not the next frame.
+  function prefetch(names, { priority = 'low', ahead = false, pin = false, onProgress } = {}) {
     const list = Array.from(names ?? []);
+    if (pin) for (const n of list) pinned.add(dataKey(n));
     let done = 0;
     const one = (n) =>
       load(n, { priority, keep: true, ahead })
@@ -262,6 +270,60 @@ export function createStore(opts = {}) {
           if (onProgress) onProgress(done, list.length);
         });
     return Promise.all(list.map(one)).then(() => undefined);
+  }
+
+  /// Download `names` into the persistent cache without holding them in memory, a few at a time
+  /// and only while nothing else wants the network, so a later `ready` reads the disk. A `tag`
+  /// that finished for this data version is not walked again. Resolves to whether it ran.
+  async function fill(names, { tag, workers = 6, idleMs = 250 } = {}) {
+    if (globalThis.navigator?.connection?.saveData) return false; // the player asked for less data
+    const cache = await openCache();
+    if (!cache) return false;
+    const version = await dataVersion();
+    if (tag && readFilled(version).includes(tag)) return false;
+    const list = Array.from(names ?? []);
+    const busy = () => {
+      const n = net.state();
+      return reading > 0 || n.queuedHigh > 0 || n.queuedLow > 0;
+    };
+    let next = 0;
+    let failed = 0;
+    const worker = async () => {
+      while (next < list.length) {
+        while (busy()) await new Promise((r) => setTimeout(r, idleMs));
+        if (next >= list.length) return;
+        const key = dataKey(list[next++]);
+        if (mem.has(key) || missing.has(key)) continue;
+        if (await cache.match(urlFor(key)).catch(() => undefined)) continue;
+        try {
+          await flight(key, 'low', false).promise;
+          stats.filled += 1;
+        } catch (_) {
+          failed += 1;
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: workers }, worker));
+    if (tag && failed === 0) writeFilled(version, tag);
+    return true;
+  }
+
+  function readFilled(version) {
+    try {
+      const v = JSON.parse(storage?.getItem(FILLED_KEY) ?? 'null');
+      return v?.version === version && Array.isArray(v.tags) ? v.tags : [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function writeFilled(version, tag) {
+    try {
+      const tags = [...readFilled(version), tag];
+      storage?.setItem(FILLED_KEY, JSON.stringify({ version, tags }));
+    } catch (_) {
+      /* quota or private mode: the next visit walks the list again and finds it cached */
+    }
   }
 
   /// Memory only, synchronous: the bytes, or `undefined`. A miss is learned for the next visit.
@@ -300,6 +362,7 @@ export function createStore(opts = {}) {
     get,
     load,
     prefetch,
+    fill,
     has: (name) => mem.has(dataKey(name)),
     reading: () => reading,
     ready,
