@@ -627,6 +627,20 @@ pub fn resolve_rect_edges(
     [cvt(bottom), cvt(left), cvt(top), cvt(right)]
 }
 
+/// Which axes, `(x, y)`, `frame`'s anchors fix on their own: both edges' anchor scans hit, so
+/// [`resolve_rect_edges`] returns those edges without reading that axis's span.
+#[allow(clippy::float_cmp)]
+pub fn axes_fixed_by_anchors(
+    frame: &LayoutInput,
+    target_rect: impl FnMut(Handle) -> Option<Rect>,
+) -> (bool, bool) {
+    let input = build_edge_input(frame, target_rect);
+    (
+        anchor_scan_x(&IDS_LEFT, &input) != UNSET && anchor_scan_x(&IDS_RIGHT, &input) != UNSET,
+        anchor_scan_y(&IDS_TOP, &input) != UNSET && anchor_scan_y(&IDS_BOTTOM, &input) != UNSET,
+    )
+}
+
 // ── Graph driver ─────────────────────────────────────────────────────────────────────────────
 
 /// Resolves anchored frames in dependency order, a driver of benilla's own: the client resolves

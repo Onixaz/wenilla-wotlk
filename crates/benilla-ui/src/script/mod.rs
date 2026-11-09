@@ -1496,6 +1496,7 @@ impl UiScript {
     /// text of every resized EditBox and fire `OnScrollRangeChanged` for every shown ScrollFrame
     /// whose range moved ([`scrollframe::fire_range_changes`]).
     pub fn resolve(&mut self) {
+        self.relayout_landed_spans();
         // A resolve that solved nothing moved no rect and fired no size or range handler (both
         // read the rects a solve wrote): the mutation count stands ([`ModelCell`]).
         let quiet = self.visual_epoch();
@@ -1568,6 +1569,26 @@ impl UiScript {
             .map(|&(id, w, h, key)| (id, w, h, w, key))
             .collect();
         self.set_measured_text(&widened);
+    }
+
+    /// Lay out again once art layout passed over has landed: no layout input moved, so nothing
+    /// else would reach the regions waiting on its span.
+    fn relayout_landed_spans(&mut self) {
+        if self.model_ref().texture_span_waits.is_empty() {
+            return;
+        }
+        let landed = {
+            let mut guard = self.model_mut();
+            let model: &mut Model = &mut guard;
+            let before = model.texture_span_waits.len();
+            if let Some(ready) = &model.texture_span_ready {
+                model.texture_span_waits.retain(|path| !ready(path));
+            }
+            model.texture_span_waits.len() != before
+        };
+        if landed {
+            self.force_full_layout_resolve();
+        }
     }
 
     /// Force the next [`UiScript::resolve`] past both change gates to rebuild the whole layout

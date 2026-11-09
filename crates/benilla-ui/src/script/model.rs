@@ -88,6 +88,12 @@ pub(crate) struct Model {
     /// A path's texel size, which an axis authored as 0 takes, one texel per unit, as the client's
     /// `GetWidth` and `GetHeight` do; `None` leaves it as authored.
     pub(crate) texture_size_probe: Option<TextureSizeProbe>,
+    /// Whether layout may measure a path now, on a host whose read of an absent file would stop
+    /// the frame (the page); `None` measures always, as the reference's disk read does.
+    pub(crate) texture_span_ready: Option<TextureProbe>,
+    /// The paths layout passed over for [`Self::texture_span_ready`]: when one lands, the regions
+    /// that need its span lay out again.
+    pub(crate) texture_span_waits: HashSet<String>,
     /// Whether a font path loads: `SetFont`'s 1 or nil, nil meaning a load failure. Unlike
     /// `texture_probe`, `None` answers 1 for a non-empty path: without a font backend nothing
     /// failed, and addons revert their font on a nil.
@@ -1315,6 +1321,8 @@ impl Model {
             texture_probe: None,
             world_ui_visible: true,
             texture_size_probe: None,
+            texture_span_ready: None,
+            texture_span_waits: Default::default(),
             font_probe: None,
             addons_saved_account: None,
             addons_saved_character: None,
