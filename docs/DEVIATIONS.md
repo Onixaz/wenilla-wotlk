@@ -117,3 +117,14 @@ serve what they ask for.
 | `ChannelSilenceVoice` | `0x501140` | no voice chat |
 | `ChannelUnSilenceVoice` | `0x5012f0` | no voice chat |
 | `SetActiveVoiceChannelBySessionID` | `0x7db280` | no voice chat |
+
+## The browser build
+
+- **Which locale runs.** 12340 mounts the folder its `locale` CVar names, else the next existing
+  one in its table (`0x402d50`), and a change applies at the next start. The browser page has no
+  install to list, so it chooses before the client starts, out of the locales its host serves
+  (`GET /data/__locales`): `?locale=` in the address, then the choice saved in the browser
+  (`wenilla:locale`), then the browser's languages, then the host's default. A choice the host
+  does not serve falls through to the next of those, not to the next folder in the table. The
+  in-game `locale` setting saves that choice and offers a page reload, the web's restart
+  (`crates/benilla-app/src/webprogress.rs`, `web/boot.js`).

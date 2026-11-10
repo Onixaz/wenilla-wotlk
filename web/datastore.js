@@ -39,6 +39,12 @@
 // Memory is a byte-bounded LRU. Under it sits the Cache API, keyed by the host's data version
 // (`GET /data/__version`), so a second visit reads the disk instead of the network and a changed
 // install drops the old copy. Names are matched as the MPQ hash matches them: any case, `/` ≡ `\`.
+//
+// A host serves each locale's chain under its own root (`/data/__l/<locale>`, plain `/data` the
+// default one's), and each root is its own install: the Cache API copy, the learned names and the
+// filled tags are named by the root's scope (`dataScope`), and dropping a stale copy drops only
+// that scope's, so switching locale keeps the other locale's game data. Plain `/data` keeps the
+// names it had before there were locales.
 
 const DEFAULT_BUDGET = 384 * 1024 * 1024;
 const LEARNED_KEY = 'wenilla:data:learned';
@@ -46,6 +52,28 @@ const LEARNED_MAX = 6000;
 const FILLED_KEY = 'wenilla:data:filled';
 const CACHE_PREFIX = 'wenilla-data-';
 const DROPPED = new Error('fetch ahead dropped');
+/// A scoped Cache API name: `wenilla-data-<locale>-<version>`.
+const SCOPED_CACHE = /^wenilla-data-[a-z]{2}[A-Z]{2}-/;
+
+/// The scope of a data root: its locale under `/data/__l/<locale>`, else `''`, the unscoped names.
+export function dataScope(base) {
+  const m = /\/__l\/([^/]+)\/?$/.exec(String(base));
+  return m ? decodeURIComponent(m[1]) : '';
+}
+
+/// The persistent names of a scope: its Cache API name for a version, whether a cache name is one
+/// of the scope's, and its localStorage keys.
+export function scopeNames(scope) {
+  const tag = scope ? `${scope}-` : '';
+  const suffix = scope ? `:${scope}` : '';
+  return {
+    cache: (version) => CACHE_PREFIX + tag + version,
+    owns: (name) =>
+      scope ? name.startsWith(CACHE_PREFIX + tag) : name.startsWith(CACHE_PREFIX) && !SCOPED_CACHE.test(name),
+    learned: LEARNED_KEY + suffix,
+    filled: FILLED_KEY + suffix,
+  };
+}
 
 /// The MPQ-equivalence key: lowercase, backslash-separated.
 export function dataKey(name) {
@@ -54,6 +82,7 @@ export function dataKey(name) {
 
 export function createStore(opts = {}) {
   const base = opts.base ?? '/data';
+  const names = scopeNames(opts.scope ?? dataScope(base));
   const budget = opts.budgetBytes ?? DEFAULT_BUDGET;
   const fetchFn = opts.fetch ?? ((...a) => globalThis.fetch(...a));
   const cacheStorage = opts.persist === false ? null : (opts.caches ?? globalThis.caches ?? null);
@@ -66,7 +95,7 @@ export function createStore(opts = {}) {
   const missing = new Set(); // keys the host answered 404 for
   let versionPromise = null;
   let cachePromise = null;
-  const learnedMap = new Map(loadLearned(storage)); // name -> phase
+  const learnedMap = new Map(loadLearned(storage, names.learned)); // name -> phase
   let phase = 'boot';
   let learnedDirty = false;
   let reading = 0;
@@ -144,9 +173,10 @@ export function createStore(opts = {}) {
         if (!cacheStorage) return null;
         const version = await dataVersion();
         if (!version) return null;
-        const name = CACHE_PREFIX + version;
+        // Only this root's older copies go: another locale's is still that locale's.
+        const name = names.cache(version);
         for (const n of await cacheStorage.keys()) {
-          if (n.startsWith(CACHE_PREFIX) && n !== name) cacheStorage.delete(n).catch(() => {});
+          if (names.owns(n) && n !== name) cacheStorage.delete(n).catch(() => {});
         }
         return await cacheStorage.open(name);
       })().catch(() => null);
@@ -310,7 +340,7 @@ export function createStore(opts = {}) {
 
   function readFilled(version) {
     try {
-      const v = JSON.parse(storage?.getItem(FILLED_KEY) ?? 'null');
+      const v = JSON.parse(storage?.getItem(names.filled) ?? 'null');
       return v?.version === version && Array.isArray(v.tags) ? v.tags : [];
     } catch (_) {
       return [];
@@ -320,7 +350,7 @@ export function createStore(opts = {}) {
   function writeFilled(version, tag) {
     try {
       const tags = [...readFilled(version), tag];
-      storage?.setItem(FILLED_KEY, JSON.stringify({ version, tags }));
+      storage?.setItem(names.filled, JSON.stringify({ version, tags }));
     } catch (_) {
       /* quota or private mode: the next visit walks the list again and finds it cached */
     }
@@ -352,7 +382,7 @@ export function createStore(opts = {}) {
     learnedDirty = false;
     try {
       const entries = Array.from(learnedMap).slice(-LEARNED_MAX);
-      storage.setItem(LEARNED_KEY, JSON.stringify(entries));
+      storage.setItem(names.learned, JSON.stringify(entries));
     } catch (_) {
       /* quota or private mode: the next visit just learns again */
     }
@@ -614,9 +644,9 @@ function safeLocalStorage() {
   }
 }
 
-function loadLearned(storage) {
+function loadLearned(storage, key) {
   try {
-    const v = JSON.parse(storage?.getItem(LEARNED_KEY) ?? '[]');
+    const v = JSON.parse(storage?.getItem(key) ?? '[]');
     return Array.isArray(v)
       ? v.filter((e) => Array.isArray(e) && typeof e[0] === 'string' && typeof e[1] === 'string')
       : [];

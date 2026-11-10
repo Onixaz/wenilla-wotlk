@@ -79,16 +79,60 @@ mod wasm {
     use wasm_bindgen::JsValue;
     use web_sys::XmlHttpRequest;
 
-    /// The root every chain fetch is served from: `/data` under this page's own origin. The web
-    /// host answers both the client bundle and the `/data/*` routes from one process (Lane H), so
-    /// there is never a cross-origin question to configure — this is the whole answer.
+    /// The root every chain fetch is served from, under this page's own origin: the locale's root
+    /// the page chose before the client started (`window.__wenilla_data_base`, `/data` or
+    /// `/data/__l/<locale>`, see `web/boot.js`), else `/data`. The web host answers both the
+    /// client bundle and the `/data/*` routes from one process (Lane H), so there is never a
+    /// cross-origin question to configure.
     pub fn data_base() -> String {
-        let origin = web_sys::window()
-            .expect("benilla_formats::web only runs inside a browser tab")
-            .location()
-            .origin()
-            .expect("window.location.origin");
-        format!("{origin}/data")
+        thread_local! {
+            static BASE: std::cell::OnceCell<String> = const { std::cell::OnceCell::new() };
+        }
+        BASE.with(|base| {
+            base.get_or_init(|| {
+                let window =
+                    web_sys::window().expect("benilla_formats::web only runs inside a browser tab");
+                let origin = window.location().origin().expect("window.location.origin");
+                let root = js_sys::Reflect::get(&window, &"__wenilla_data_base".into())
+                    .ok()
+                    .and_then(|v| v.as_string())
+                    .filter(|r| r.starts_with('/'))
+                    .unwrap_or_else(|| "/data".to_string());
+                format!("{origin}{}", root.trim_end_matches('/'))
+            })
+            .clone()
+        })
+    }
+
+    /// The locale folders the web host serves, in the client's table order: the list the page
+    /// read from `GET /data/__locales` (`window.__wenilla_locales.locales`), else that route asked
+    /// here; `None` from a host without it.
+    pub fn host_locales() -> Option<Vec<String>> {
+        let window = web_sys::window()?;
+        let listed = js_sys::Reflect::get(&window, &"__wenilla_locales".into())
+            .ok()
+            .filter(|v| v.is_object())
+            .and_then(|v| js_sys::Reflect::get(&v, &"locales".into()).ok())
+            .filter(|v| js_sys::Array::is_array(v))
+            .map(|v| {
+                js_sys::Array::from(&v)
+                    .iter()
+                    .filter_map(|l| l.as_string())
+                    .collect::<Vec<_>>()
+            });
+        if listed.is_some() {
+            return listed;
+        }
+        let origin = window.location().origin().ok()?;
+        let bytes = fetch_sync(&format!("{origin}/data/__locales")).ok()?;
+        let listing: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        let locales = listing.get("locales")?.as_array()?;
+        Some(
+            locales
+                .iter()
+                .filter_map(|l| l.as_str().map(str::to_string))
+                .collect(),
+        )
     }
 
     /// Append `name` to the page's boot-read trace, if the page armed one — the input to
@@ -446,6 +490,7 @@ mod wasm {
 
 #[cfg(target_arch = "wasm32")]
 pub use wasm::{
-    data_base, drop_ahead, exists_sync, expand, fetch_sync, fill_in_turn, index_has, index_names,
-    landed, load, prefetch_parents, prefetch_pinned, ready, ready_tree, resident, trace,
+    data_base, drop_ahead, exists_sync, expand, fetch_sync, fill_in_turn, host_locales, index_has,
+    index_names, landed, load, prefetch_parents, prefetch_pinned, ready, ready_tree, resident,
+    trace,
 };

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createStore, dataKey, readFrames } from '../datastore.js';
+import { createStore, dataKey, dataScope, readFrames, scopeNames } from '../datastore.js';
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
 const settle = async () => {
@@ -602,4 +602,98 @@ test('a fill waits while a reader or a fetch ahead wants the network', async () 
   await reader;
   assert.equal(await filling, true);
   assert.equal(h.calls.some((c) => c.path === 'a.blp'), true, 'then it goes');
+});
+
+test('a data root names its scope: its locale under /data/__l, else none', () => {
+  assert.equal(dataScope('/data'), '');
+  assert.equal(dataScope('https://example.test/data'), '');
+  assert.equal(dataScope('/data/__l/esES'), 'esES');
+  assert.equal(dataScope('/data/__l/esMX/'), 'esMX');
+  const plain = scopeNames('');
+  const es = scopeNames('esES');
+  assert.equal(plain.cache('v1'), 'wenilla-data-v1', 'plain /data keeps the name it had');
+  assert.equal(es.cache('v1'), 'wenilla-data-esES-v1');
+  assert.deepEqual([plain.learned, plain.filled], ['wenilla:data:learned', 'wenilla:data:filled']);
+  assert.deepEqual([es.learned, es.filled], ['wenilla:data:learned:esES', 'wenilla:data:filled:esES']);
+});
+
+/// A Cache API holding `names`, recording what a store opens and deletes.
+function namedCaches(names) {
+  const kept = new Set(names);
+  const opened = [];
+  return {
+    kept,
+    opened,
+    caches: {
+      keys: async () => [...kept],
+      delete: async (n) => kept.delete(n),
+      open: async (n) => {
+        opened.push(n);
+        kept.add(n);
+        return { match: async () => undefined, put: async () => {} };
+      },
+    },
+  };
+}
+
+test('opening a locale\'s cache drops only that locale\'s older copies', async () => {
+  const existing = [
+    'wenilla-data-v0', // the default root's older copy
+    'wenilla-data-v1', // the default root's copy from before locales
+    'wenilla-data-esES-v0',
+    'wenilla-data-esMX-v9',
+    'other-cache',
+  ];
+  const es = namedCaches(existing);
+  const h = instantHost({ 'a.blp': bytes(1) });
+  const fetch = (url) => h.fetch(url.replace('/data/__l/esES/', '/data/'));
+  await createStore({ fetch, caches: es.caches, storage: null, base: '/data/__l/esES', version: 'v1' }).load('a.blp');
+  assert.deepEqual(es.opened, ['wenilla-data-esES-v1']);
+  assert.deepEqual(
+    [...es.kept].sort(),
+    ['other-cache', 'wenilla-data-esES-v1', 'wenilla-data-esMX-v9', 'wenilla-data-v0', 'wenilla-data-v1'],
+  );
+
+  const plain = namedCaches(existing);
+  await createStore({ fetch: h.fetch, caches: plain.caches, storage: null, version: 'v1' }).load('a.blp');
+  assert.deepEqual(plain.opened, ['wenilla-data-v1'], 'an enUS player keeps the cache they had');
+  assert.deepEqual(
+    [...plain.kept].sort(),
+    ['other-cache', 'wenilla-data-esES-v0', 'wenilla-data-esMX-v9', 'wenilla-data-v1'],
+  );
+});
+
+test('learned names and filled tags are kept per locale', async (t) => {
+  const kv = new Map();
+  const storage = { getItem: (k) => kv.get(k) ?? null, setItem: (k, v) => kv.set(k, v) };
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const es = createStore({ fetch: host({}).fetch, persist: false, storage, base: '/data/__l/esES' });
+  es.get('Interface\Spanish.blp');
+  t.mock.timers.tick(2000);
+  const en = createStore({ fetch: host({}).fetch, persist: false, storage });
+  en.get('Interface\English.blp');
+  t.mock.timers.tick(2000);
+  assert.deepEqual(
+    createStore({ fetch: host({}).fetch, persist: false, storage, base: '/data/__l/esES' }).learned('boot'),
+    ['Interface\Spanish.blp'],
+  );
+  assert.deepEqual(createStore({ fetch: host({}).fetch, persist: false, storage }).learned('boot'), [
+    'Interface\English.blp',
+  ]);
+  assert.ok(kv.has('wenilla:data:learned') && kv.has('wenilla:data:learned:esES'));
+});
+
+test('a fill finished for one locale is walked again for another', async (t) => {
+  const kv = new Map();
+  const storage = { getItem: (k) => kv.get(k) ?? null, setItem: (k, v) => kv.set(k, v) };
+  const h = instantHost({ 'a.blp': bytes(1) });
+  const esFetch = (url) => h.fetch(url.replace('/data/__l/esES/', '/data/'));
+  const en = createStore({ fetch: h.fetch, caches: diskCache().caches, storage, version: 'v1' });
+  assert.equal(await en.fill(['a.blp'], { tag: 'ui', idleMs: 0 }), true);
+  const es = createStore({
+    fetch: esFetch, caches: diskCache().caches, storage, version: 'v1', base: '/data/__l/esES',
+  });
+  assert.equal(await es.fill(['a.blp'], { tag: 'ui', idleMs: 0 }), true, 'its own tag');
+  const enAgain = createStore({ fetch: h.fetch, caches: diskCache().caches, storage, version: 'v1' });
+  assert.equal(await enAgain.fill(['a.blp'], { tag: 'ui', idleMs: 0 }), false, 'enUS kept its tag');
 });

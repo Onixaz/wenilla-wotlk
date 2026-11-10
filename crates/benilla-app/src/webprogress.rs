@@ -25,25 +25,51 @@
 //!
 //! Native builds: every function is a no-op; there is no page.
 
+use bevy::prelude::{Commands, On};
+
+use crate::cvars::CvarChanged;
+
 /// Call `window.__wenilla_progress(stage)` if the page defined it; silently do nothing
 /// otherwise. See the module header for the stage vocabulary.
-#[cfg(target_arch = "wasm32")]
 pub(crate) fn signal(stage: &str) {
+    call_page("__wenilla_progress", stage);
+}
+
+/// Call `window.<hook>(arg)` if the page defined it; every failure is swallowed.
+#[cfg(target_arch = "wasm32")]
+fn call_page(hook: &str, arg: &str) {
     use wasm_bindgen::JsCast;
     let Some(window) = web_sys::window() else {
         return;
     };
-    let Ok(hook) = js_sys::Reflect::get(&window, &"__wenilla_progress".into()) else {
+    let Ok(hook) = js_sys::Reflect::get(&window, &hook.into()) else {
         return;
     };
     let Ok(hook) = hook.dyn_into::<js_sys::Function>() else {
         return; // absent (undefined) or not a function — a page that doesn't care
     };
-    let _ = hook.call1(&wasm_bindgen::JsValue::NULL, &stage.into());
+    let _ = hook.call1(&wasm_bindgen::JsValue::NULL, &arg.into());
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn signal(_stage: &str) {}
+fn call_page(_hook: &str, _arg: &str) {}
+
+/// The `locale` setting changed by the player: `window.__wenilla_locale(folder)`. The page's data
+/// root is the locale, chosen before the client starts (`web/boot.js`), so a change takes effect
+/// at the next load, as the reference's takes effect at the next start (the stock panel's
+/// `CLIENT_RESTART_ALERT`): the page saves the choice and offers the reload. Observed from
+/// `PostStartup` on, so the boot's own write of the running locale (`cvars::load_config`) is
+/// not a change the player made.
+pub(crate) fn on_locale_change(ev: On<CvarChanged>) {
+    if ev.is("locale") && ev.old != ev.new {
+        call_page("__wenilla_locale", &ev.new);
+    }
+}
+
+/// The `PostStartup` system that starts [`on_locale_change`] observing.
+pub(crate) fn observe_locale(mut commands: Commands) {
+    commands.add_observer(on_locale_change);
+}
 
 /// `signal("ready")`, at most once per process — the callers run per-frame and "ready" is an
 /// edge, not a state. Relaxed is enough: wasm is single-threaded and native is a no-op anyway.
