@@ -23,7 +23,13 @@
 // Page contract: `const w = await boot(init); bind(w.memory);` — bind must stay immediately
 // after (the Lua WASI shims need the module's linear memory). Query switches: `?boottrace=1`
 // arms window.__wenilla_boottrace and skips the prefetch (a manifest-capture boot must show the
-// true read order); `?noprefetch=1` skips the prefetch only (the A/B lever).
+// true read order); `?noprefetch=1` skips the prefetch only (the A/B lever); `?locale=esES` picks
+// the game data's locale (see `pickLocale`).
+//
+// Locale: the host serves each locale folder of its `Data` under `/data/__l/<locale>`, plain
+// `/data` being its default (`GET /data/__locales`). Before anything is fetched the page picks
+// one and names its data root once, `window.__wenilla_data_base`, which the store and the client's
+// chain (benilla-formats `web::data_base`) both read. A host without `__locales` is plain `/data`.
 
 // The wasm travels brotli-compressed: content-length counts .br bytes while the counted stream
 // yields decompressed ones. Dividing the two on a real build gives ~5.0; it drifts a little per
@@ -34,6 +40,8 @@ const READY_TIMEOUT_MS = 20000;
 // next file a frame or more after the last one lands, and the screen's first reads follow the
 // long frame that built it.
 const SETTLE_MS = 1500;
+/// The player's saved locale, written when they change the `locale` setting in game.
+export const LOCALE_KEY = 'wenilla:locale';
 
 export async function boot(init, opts = {}) {
   const q = new URLSearchParams(location.search);
@@ -48,9 +56,11 @@ export async function boot(init, opts = {}) {
   if (q.get('boottrace') === '1') window.__wenilla_boottrace = [];
   const skipPrefetch = q.get('boottrace') === '1' || q.get('noprefetch') === '1';
   installProgressHook(ui, skipPrefetch);
+  installLocaleHook();
 
-  // The store must exist before the client starts: its synchronous reads look for it once.
-  const store = dataStore();
+  // The store must exist before the client starts: its synchronous reads look for it once. Its
+  // root, the chosen locale's, is known before the first byte of game data is asked for.
+  const store = chooseDataRoot(q).then(dataStore);
   const prefetch = skipPrefetch
     ? store
     : store
@@ -148,14 +158,115 @@ export function missingWebGpu() {
   );
 }
 
-/// The page's data store, created once (datastore.js). Loaded by URL so the module resolves
-/// beside this one wherever the page serves it.
-async function dataStore() {
+/// The page's data store, created once (datastore.js) on the data root `base`. Loaded by URL so
+/// the module resolves beside this one wherever the page serves it.
+async function dataStore(base) {
   if (!window.__wenilla_data) {
     const { createStore } = await import(new URL('./datastore.js', import.meta.url).href);
-    window.__wenilla_data ??= createStore();
+    window.__wenilla_data ??= createStore({ base });
   }
   return window.__wenilla_data;
+}
+
+/// Ask the host which locales it serves, pick one, and name its data root on the page:
+/// `window.__wenilla_data_base`, and `window.__wenilla_locales` (`{default, locales, current}`),
+/// which the client reads for its locale list. Any failure is plain `/data`, as an older host is.
+export async function chooseDataRoot(q, fetchFn = (...a) => globalThis.fetch(...a)) {
+  let base = '/data';
+  try {
+    const r = await fetchFn('/data/__locales', { cache: 'no-cache' });
+    const listing = r.ok ? await r.json() : null;
+    if (listing && Array.isArray(listing.locales) && listing.locales.includes(listing.default)) {
+      const current = pickLocale(listing, {
+        query: q.get('locale'),
+        saved: savedLocale(),
+        languages: globalThis.navigator?.languages ?? [globalThis.navigator?.language],
+      });
+      window.__wenilla_locales = { default: listing.default, locales: listing.locales, current };
+      if (current !== listing.default) base = `/data/__l/${encodeURIComponent(current)}`;
+    }
+  } catch (_) {
+    /* an older host: plain /data */
+  }
+  window.__wenilla_data_base = base;
+  return base;
+}
+
+/// `window.__wenilla_locale(locale)` — the client's call when the player changes the `locale`
+/// setting (webprogress.rs). The data root is chosen before the client starts, so the change
+/// applies at the next load, as the reference's applies at the next start: save it, and offer the
+/// reload while the choice differs from the running locale.
+function installLocaleHook() {
+  let bar = null;
+  window.__wenilla_locale = (locale) => {
+    try {
+      globalThis.localStorage?.setItem(LOCALE_KEY, locale);
+    } catch (_) {
+      /* private mode: the URL's ?locale= still works */
+    }
+    const current = window.__wenilla_locales?.current;
+    bar?.remove();
+    bar = null;
+    if (current && locale !== current) bar = createReloadBar(locale);
+  };
+}
+
+/// This page's address without `?locale=`, which would otherwise outrank the saved choice.
+export function reloadUrl(href) {
+  const url = new URL(href);
+  url.searchParams.delete('locale');
+  return url.href;
+}
+
+/// The bottom bar that offers the reload a locale change waits for.
+function createReloadBar(locale) {
+  const el = document.createElement('div');
+  el.id = 'wenilla-reload';
+  el.style.cssText =
+    'position:fixed;left:50%;bottom:.8rem;transform:translateX(-50%);z-index:30;' +
+    'font:14px system-ui,sans-serif;color:#ddd;background:rgba(0,0,0,.8);padding:.4rem .8rem;' +
+    'border:1px solid #c9a227;border-radius:4px;display:flex;gap:.8rem;align-items:center';
+  const text = document.createElement('span');
+  text.textContent = `The game data switches to ${locale} when the page reloads.`;
+  const button = document.createElement('button');
+  button.textContent = 'Reload now';
+  button.style.cssText = 'font:inherit;cursor:pointer';
+  button.onclick = () => location.assign(reloadUrl(location.href));
+  el.appendChild(text);
+  el.appendChild(button);
+  document.body.appendChild(el);
+  return el;
+}
+
+function savedLocale() {
+  try {
+    return globalThis.localStorage?.getItem(LOCALE_KEY) ?? null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/// The locale a visit runs, out of the host's `listing` (`{default, locales}`, locales in the
+/// client's table order): the `?locale=` the URL names, else the one the player saved, else the
+/// browser's first language one is installed for, else the host's default. Only installed
+/// locales count. A browser language matches a locale by language and region first (`es-MX` is
+/// esMX), then by language alone (`es`, or `es-MX` with no esMX, is the first installed `es..`,
+/// the default when it is one).
+export function pickLocale(listing, { query = null, saved = null, languages = [] } = {}) {
+  const installed = listing.locales;
+  const exact = (want) => installed.find((l) => l.toLowerCase() === String(want ?? '').toLowerCase());
+  const picked = exact(query) ?? exact(saved);
+  if (picked) return picked;
+  for (const tag of languages) {
+    const [lang = '', region = ''] = String(tag ?? '').toLowerCase().split(/[-_]/);
+    if (lang.length !== 2) continue;
+    const both = region.length === 2 && exact(lang + region);
+    if (both) return both;
+    const sameLang = (l) => l.slice(0, 2).toLowerCase() === lang;
+    const loose = sameLang(listing.default) ? listing.default : installed.find(sameLang);
+    if (loose) return loose;
+  }
+  return listing.default;
 }
 
 /// Fill the store with a phase's read-set: the manifest's names plus the names synchronous reads

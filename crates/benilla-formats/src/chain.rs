@@ -199,10 +199,7 @@ fn list(dir: &Path, want_files: bool) -> Result<Vec<String>> {
 /// from, which is also the loose-file alternate (`Data\<locale>\`).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn data_locale(path: &Path) -> Result<String> {
-    let (files, _) = data_listing(path)?;
-    locale::resolve(&files, locale::wanted())
-        .map(str::to_string)
-        .context("no locale folder holds the locale archives")
+    resolve_data_locale(path, locale::wanted()).map(str::to_string)
 }
 
 /// On the page the locale is the web host's: it answers `GET /data/__locale` from its own `Data`
@@ -235,6 +232,43 @@ fn data_listing(path: &Path) -> Result<(Vec<String>, Vec<String>)> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// A `Data` directory's listing, the folder a `locale` CVar value of `wanted` mounts, and that
+/// folder's [`mount_order`].
+fn plan(path: &Path, wanted: &str) -> Result<(Vec<String>, &'static str, Vec<String>)> {
+    let wrong_install = || format!("{} is not a 3.3.5a (12340) Data folder", path.display());
+    let (files, _) = data_listing(path)?;
+    let folder = locale::resolve(&files, wanted)
+        .context("no locale folder holds the locale archives")
+        .with_context(wrong_install)?;
+    let order = mount_order(&LAYOUT, &files, folder).with_context(wrong_install)?;
+    Ok((files, folder, order))
+}
+
+/// The archives [`Chain::open_locale`] mounts from the `Data` directory `path` for a `locale`
+/// CVar value of `wanted`, as paths relative to `path` (`/`-separated, as found on disk), lowest
+/// priority first. Lists the folder; opens nothing.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn mounted_archives(path: &Path, wanted: &str) -> Result<Vec<String>> {
+    plan(path, wanted).map(|(_, _, order)| order)
+}
+
+/// The locale folders of the `Data` directory `path`, those holding `<loc>/locale-<loc>.MPQ`, in
+/// the client's table order (`0x402d50`, `0xad3028`).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn data_locales(path: &Path) -> Result<Vec<&'static str>> {
+    let (files, _) = data_listing(path)?;
+    Ok(locale::existing(&files))
+}
+
+/// The locale folder a `locale` CVar value of `wanted` mounts from the `Data` directory `path`:
+/// itself when it exists, else the next existing one in table order (`0x402d50`).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn resolve_data_locale(path: &Path, wanted: &str) -> Result<&'static str> {
+    let (files, _) = data_listing(path)?;
+    locale::resolve(&files, wanted).context("no locale folder holds the locale archives")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 impl Chain {
     /// Open a `Data` directory's archives in the client's [`mount_order`] for the `locale` CVar, or
     /// a single `.MPQ` file.
@@ -256,18 +290,45 @@ impl Chain {
                 locale: ClientLocale::lone_archive(),
             });
         }
-        let layout = &LAYOUT;
-        let wrong_install = || format!("{} is not a 3.3.5a (12340) Data folder", path.display());
-        let (files, _) = data_listing(path)?;
-        let folder = locale::resolve(&files, wanted)
-            .context("no locale folder holds the locale archives")
-            .with_context(wrong_install)?;
-        let order = mount_order(layout, &files, folder).with_context(wrong_install)?;
+        Self::open_shared(path, wanted, &mut std::collections::HashMap::new())
+    }
+
+    /// [`Chain::open_locale`] for each of `wanted`, in order, each with its own result, opening an
+    /// archive two chains mount (the shared `common.MPQ`, `patch.MPQ`, …) once: the chains hold
+    /// one handle to it.
+    pub fn open_locales(path: &Path, wanted: &[&str]) -> Vec<Result<Self>> {
+        let mut opened = std::collections::HashMap::new();
+        wanted
+            .iter()
+            .map(|w| Self::open_shared(path, w, &mut opened))
+            .collect()
+    }
+
+    /// [`Chain::open_locale`] over a `Data` directory, taking each archive from `opened` (by
+    /// case-folded relative path) when an earlier chain opened it.
+    fn open_shared(
+        path: &Path,
+        wanted: &str,
+        opened: &mut std::collections::HashMap<String, Archive>,
+    ) -> Result<Self> {
+        if !path.is_dir() {
+            return Self::open_locale(path, wanted);
+        }
+        let (files, folder, order) = plan(path, wanted)?;
         let mut archives = Vec::new();
         for name in order {
-            let mpq = path.join(&name);
-            archives
-                .push(Archive::open(&mpq).with_context(|| format!("opening {}", mpq.display()))?);
+            let key = name.to_ascii_lowercase();
+            let archive = match opened.get(&key) {
+                Some(archive) => archive.clone(),
+                None => {
+                    let mpq = path.join(&name);
+                    let archive = Archive::open(&mpq)
+                        .with_context(|| format!("opening {}", mpq.display()))?;
+                    opened.insert(key, archive.clone());
+                    archive
+                }
+            };
+            archives.push(archive);
         }
         if archives.is_empty() {
             bail!("no known 3.3.5a MPQs found in {}", path.display());

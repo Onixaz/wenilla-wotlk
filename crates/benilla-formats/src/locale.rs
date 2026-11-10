@@ -43,15 +43,28 @@ pub fn boot_locale(cvar: Option<&str>) -> &'static ClientLocale {
     RUNNING.get_or_init(|| found.unwrap_or_else(ClientLocale::lone_archive))
 }
 
-/// The locale of the web host's `Data` folder: no listing reaches the page, so that one folder is
-/// the only locale that exists, and its `Wow.ini` picks the slot and the code as on disk.
+/// The locale of the data root the page chose: its folder (`__locale`), the folders the web host
+/// serves (`GET /data/__locales`) as the ones that exist, and its `Wow.ini` for the slot and the
+/// code as on disk.
 #[cfg(target_arch = "wasm32")]
 fn page_locale() -> Option<ClientLocale> {
     let data = crate::wow_data()?;
     let folder = crate::data_locale(&data).ok()?;
-    let existing = FOLDERS.into_iter().filter(|f| *f == folder).collect();
+    let existing = page_existing(&folder, crate::web::host_locales());
     let ini = crate::Chain::open(&data).ok()?.read("Wow.ini").ok();
     Some(ClientLocale::from_ini(&folder, existing, ini.as_deref()))
+}
+
+/// The folders that exist for the page, in table order: those the web host lists, and `folder`,
+/// which it runs, always; names the client does not know are dropped. A host that lists none
+/// (an older one) has `folder` alone.
+#[cfg(any(target_arch = "wasm32", test))]
+fn page_existing(folder: &str, host: Option<Vec<String>>) -> Vec<&'static str> {
+    let host = host.unwrap_or_default();
+    FOLDERS
+        .into_iter()
+        .filter(|f| *f == folder || host.iter().any(|h| h == f))
+        .collect()
 }
 
 /// The running locale, enUS before [`boot_locale`] or with no install.
@@ -342,6 +355,24 @@ mod tests {
 
     fn owned(names: &[&str]) -> Vec<String> {
         names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// The page's locales are the web host's, in the client's table order, so
+    /// `GetExistingLocales` offers each; the running one is always among them.
+    #[test]
+    fn the_page_s_locales_are_the_host_s() {
+        let host = |l: &[&str]| Some(owned(l));
+        assert_eq!(
+            page_existing("esES", host(&["enUS", "esES"])),
+            ["enUS", "esES"]
+        );
+        assert_eq!(
+            page_existing("enUS", host(&["esES", "xxYY", "enUS"])),
+            ["enUS", "esES"],
+            "table order, unknown names dropped"
+        );
+        assert_eq!(page_existing("esES", host(&["enUS"])), ["enUS", "esES"]);
+        assert_eq!(page_existing("enUS", None), ["enUS"], "an older host");
     }
 
     #[test]

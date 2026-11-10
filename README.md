@@ -13,7 +13,8 @@ sysroot. WebGPU is required for the world.
 ### What you need
 
 - Rust (the toolchain in `rust-toolchain.toml` installs itself) and about 10 GB free for `target/`.
-- Your own 3.3.5a (build 12340) install's `Data` folder, with its locale folder (`Data/enUS`, …).
+- Your own 3.3.5a (build 12340) install's `Data` folder, with its locale folders (`Data/enUS`,
+  `Data/esES`, …). The host serves every one it finds.
 - A 3.3.5a server you can reach: auth on 3724 and world on 8085 (AzerothCore, TrinityCore, …),
   with Warden off.
 - A WebGPU browser: Chrome or Edge, or Safari 26+.
@@ -38,6 +39,11 @@ cargo run -p wenilla-host -- --www web/dist --data /path/to/WoW/Data --upstream 
 After a rebuild (`scripts/web-build.sh`), reload the page; the host only needs restarting when
 its own code changes. `--bind <addr:port>` serves on another address or port (`127.0.0.1:8090` by
 default); `--upstream` is the server the host connects your game session to.
+
+Every locale folder in `Data` is served. A player gets the one their browser's language asks for
+when it is installed, or `?locale=esES` in the address, or the one they pick in the game's
+Languages options (it applies on reload); otherwise the host's default, `enUS` unless you pass
+`--locale <folder>`. Adding a locale folder leaves the data players already downloaded valid.
 
 The first visit downloads the game data the world needs as you go; later visits read it from the
 browser's own storage and start much faster. Clearing the site's data in the browser resets

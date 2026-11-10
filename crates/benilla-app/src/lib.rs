@@ -538,6 +538,10 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
 
     // Boot-progress bridge (webprogress.rs): tell the hosting page the Startup pile is done.
     app.add_systems(PostStartup, webprogress::signal_startup);
+    if cfg!(target_arch = "wasm32") {
+        // The page saves a changed `locale` and offers the reload that applies it.
+        app.add_systems(PostStartup, webprogress::observe_locale);
+    }
     app.add_systems(
         OnEnter(char_select::ClientState::CharSelect),
         webprogress::signal_charselect_once,

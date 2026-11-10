@@ -25,8 +25,9 @@ behind a seam the native build already had:
 - On the build machine: stable Rust, `rustup`, ~10 GB of `target/`; `scripts/web-setup.sh`
   fetches the rest (the `wasm32-unknown-unknown` target, `wasm-bindgen-cli` at the exact
   version `Cargo.lock` pins, wasi-sdk into `tools/wasi-sdk/`). No sudo.
-- To *serve*: a 3.3.5a (build 12340) `Data/` directory (with its locale folder, e.g. `Data/enUS`) and a
-  reachable authserver (3724) + worldserver (8085). The host also answers `GET /data/__locale`.
+- To *serve*: a 3.3.5a (build 12340) `Data/` directory (with its locale folders, e.g. `Data/enUS`,
+  `Data/esES`) and a reachable authserver (3724) + worldserver (8085). The host serves every
+  locale folder it finds (see "Locales" below).
 
 ## Build and run
 
@@ -41,7 +42,7 @@ cargo run --release -p wenilla-host -- --www web/dist --data /path/to/WoW/Data -
 (precompressed), `GET /data/{name}` (`HEAD` too; with `?v=<the data version>` the answer is
 `public` so a CDN can keep it, a stale `v=` is `no-store`; `GET /data/__index` lists the chain,
 `POST /data/__batch` answers many names in one streamed response, `GET /data/__version` names the
-install so the page knows when its kept copy is stale), and
+install so the page knows when its kept copy is stale, `GET /data/__locale` names its locale), and
 `GET /ws/{port}` — a WebSocket↔TCP proxy that only ever dials `--upstream` on 3724 or 8085.
 **`wenilla-host` is for local testing only.** `/data` serves the game files you point it at to
 anyone who can reach the socket, with no login, so it binds to `127.0.0.1` by default and must
@@ -53,6 +54,35 @@ session cookie. The page derives `ws://`/`wss://` from its own origin, so any ht
 
 Each tab is a full independent client with its own upstream connection; players need their
 own accounts (a second login on one account kicks the first, as in the real client).
+
+### Locales
+
+One host serves every locale folder of its `Data` (each one holding `<loc>/locale-<loc>.MPQ`, as
+the client looks for them), and each player picks one:
+
+- Plain `/data/*` and its `__index`, `__locale`, `__version` and `__batch` serve the **default**
+  locale, exactly as a one-locale host did: the folder the client mounts with no `locale` set
+  (`enUS`, else the next one in the client's table), or `--locale <folder>`.
+- `/data/__l/<locale>/` serves each locale with the same routes, its own chain, name index and
+  data version. An unknown locale is a 404. Every URL stays under `/data/`, so a reverse proxy
+  or CDN rule for `/data/` covers it, and `/data/__l/<locale>/<name>?v=<version>` follows the
+  same cache rule as plain `/data`.
+- `GET /data/__locales` lists them, `{"default":"enUS","locales":["enUS","esES"]}`, in the
+  client's table order (`no-cache`).
+- The data version counts only the archives that locale's chain mounts, so adding a locale folder
+  leaves the others' versions, and every URL and copy cached under them, as they were.
+
+The page (`web/boot.js`) asks `__locales` before it fetches any game data and picks, among the
+installed locales only: `?locale=esES` in the address, then the choice saved in game
+(`localStorage` `wenilla:locale`), then the browser's languages (`es-MX` is esMX, else any
+installed `es..`; `es` alone is the first `es..` in table order), then the host's default. It
+reads the default locale from plain `/data` and any other from `/data/__l/<locale>`
+(`window.__wenilla_data_base`); a host without `__locales` is plain `/data`. The in-game Languages
+panel lists every locale the host serves; changing it saves the choice and offers a reload, the
+web's restart (the stock panel already says the change waits for one). The page keeps each
+locale's game data apart: plain `/data` in the Cache API as `wenilla-data-<version>`, as before,
+and another locale as `wenilla-data-<locale>-<version>`; a newer version drops only that locale's
+older copy, so switching back and forth keeps both.
 
 ### Over https: from another PC, or deployed
 
@@ -131,7 +161,7 @@ public deployment belongs behind a login (`wenilla-realm`), not this host.
   `'get'` forces either way. It
   holds bytes fetched ahead in a bounded memory LRU, and keeps every file it fetched in the Cache
   API under the host's `__version`, so a second visit reads the disk and a changed install starts
-  clean. The client's synchronous reads (`Chain::read`, ~60 call sites) answer from that memory
+  clean. Each locale's root keeps its own copy (see "Locales"). The client's synchronous reads (`Chain::read`, ~60 call sites) answer from that memory
   instead of a synchronous XHR; a miss still works, and is remembered in `localStorage` so the
   next visit fetches it ahead (at boot, or while at the glue screens for world-entry reads). The
   bytes a file's loader reads after it — a WMO's groups, an M2's skin and `.anim` files, an ADT's

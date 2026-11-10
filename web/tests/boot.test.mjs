@@ -4,7 +4,7 @@ import test from 'node:test';
 
 const source = (await readFile(new URL('../boot.js', import.meta.url), 'utf8'))
   .replaceAll('import.meta.url', JSON.stringify(new URL('../boot.js', import.meta.url).href));
-const { boot, missingWebGpu, whenSettled } = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
+const { boot, chooseDataRoot, missingWebGpu, pickLocale, reloadUrl, whenSettled } = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
 const wasmBytes = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]);
 const deferred = () => {
   let resolve;
@@ -15,7 +15,7 @@ const deferred = () => {
 function setup(t, fetch) {
   const children = new Map();
   const element = () => ({
-    style: {}, classList: { add() {} }, remove() {},
+    style: {}, classList: { add() {} }, remove() {}, appendChild() {},
     querySelector(selector) {
       if (!children.has(selector)) children.set(selector, element());
       return children.get(selector);
@@ -126,4 +126,105 @@ test('a screen settles only after the client\'s reads stay at zero', async () =>
 
 test('no store has nothing to wait for', async () => {
   await whenSettled(undefined);
+});
+
+test('the locale is the URL\'s, then the saved one, then the browser\'s, then the host\'s', () => {
+  const listing = { default: 'enUS', locales: ['enUS', 'esES', 'esMX'] };
+  const pick = (o) => pickLocale(listing, o);
+  assert.equal(pick({}), 'enUS');
+  assert.equal(pick({ query: 'esMX', saved: 'esES', languages: ['es-ES'] }), 'esMX');
+  assert.equal(pick({ query: 'frFR', saved: 'esES' }), 'esES', 'an uninstalled locale does not count');
+  assert.equal(pick({ query: 'eses' }), 'esES', 'any case');
+  assert.equal(pick({ saved: 'esES', languages: ['en-US'] }), 'esES');
+  assert.equal(pick({ saved: 'deDE', languages: ['fr-FR', 'es-MX', 'en-US'] }), 'esMX');
+  assert.equal(pick({ languages: ['es'] }), 'esES', 'a language alone: the first installed in table order');
+  assert.equal(pick({ languages: ['es-ES'] }), 'esES');
+  assert.equal(pick({ languages: ['es-AR'] }), 'esES');
+  assert.equal(pick({ languages: ['en-GB'] }), 'enUS', 'the default when it speaks the language');
+  assert.equal(pick({ languages: ['de-DE', 'ja'] }), 'enUS');
+  const noMx = { default: 'enUS', locales: ['enUS', 'esES'] };
+  assert.equal(pickLocale(noMx, { languages: ['es-MX'] }), 'esES', 'es-MX with no esMX');
+  assert.equal(pickLocale(noMx, { query: 'esMX' }), 'enUS');
+});
+
+/// `chooseDataRoot` against a host answering `/data/__locales` with `listing` (or `status`).
+async function rootFor(t, { listing, status = 200, search = '', saved = null, languages = ['en-US'] }) {
+  const store = new Map(saved ? [['wenilla:locale', saved]] : []);
+  for (const [key, value] of Object.entries({
+    window: {},
+    navigator: { languages },
+    localStorage: { getItem: (k) => store.get(k) ?? null },
+  })) {
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, key);
+    Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
+    t.after(() => descriptor ? Object.defineProperty(globalThis, key, descriptor) : delete globalThis[key]);
+  }
+  const asked = [];
+  const fetch = async (url) => {
+    asked.push(url);
+    if (status === 'throw') throw new TypeError('network');
+    return new Response(JSON.stringify(listing), { status });
+  };
+  const base = await chooseDataRoot(new URLSearchParams(search), fetch);
+  assert.deepEqual(asked, ['/data/__locales']);
+  assert.equal(window.__wenilla_data_base, base);
+  return base;
+}
+
+test('the data root is plain /data for the default locale and /data/__l/<locale> otherwise', async (t) => {
+  const listing = { default: 'enUS', locales: ['enUS', 'esES'] };
+  assert.equal(await rootFor(t, { listing }), '/data');
+  assert.deepEqual(window.__wenilla_locales, { ...listing, current: 'enUS' });
+  assert.equal(await rootFor(t, { listing, search: '?locale=esES' }), '/data/__l/esES');
+  assert.deepEqual(window.__wenilla_locales, { ...listing, current: 'esES' });
+  assert.equal(await rootFor(t, { listing, saved: 'esES' }), '/data/__l/esES');
+  assert.equal(await rootFor(t, { listing, languages: ['es-ES', 'en'] }), '/data/__l/esES');
+  assert.equal(await rootFor(t, { listing: { default: 'esES', locales: ['enUS', 'esES'] }, languages: ['es'] }), '/data');
+});
+
+test('a host without __locales is plain /data, silently', async (t) => {
+  assert.equal(await rootFor(t, { listing: null, status: 404, search: '?locale=esES' }), '/data');
+  assert.equal(window.__wenilla_locales, undefined);
+  assert.equal(await rootFor(t, { listing: null, status: 'throw' }), '/data');
+  assert.equal(await rootFor(t, { listing: { locales: 'nope' } }), '/data');
+});
+
+test('the boot prefetch asks the chosen locale\'s root', async t => {
+  const asked = [];
+  setup(t, async url => {
+    asked.push(String(url));
+    if (String(url) === '/data/__locales') {
+      return new Response(JSON.stringify({ default: 'enUS', locales: ['enUS', 'esES'] }));
+    }
+    if (String(url).endsWith('manifest.json')) return new Response(JSON.stringify({ names: [] }));
+    if (String(url).startsWith('/data/')) return new Response('esES');
+    return new Response(wasmBytes, { headers: { 'content-type': 'application/wasm' } });
+  });
+  globalThis.location.search = '?locale=esES';
+  await boot(async () => ({ memory: null }));
+  const data = asked.filter(u => u.startsWith('/data/'));
+  assert.equal(data[0], '/data/__locales');
+  assert.ok(data.includes('/data/__l/esES/__index'), data.join(' '));
+  assert.ok(data.includes('/data/__l/esES/__locale'), data.join(' '));
+  assert.ok(!data.includes('/data/__index') && !data.includes('/data/__locale'), data.join(' '));
+});
+
+test('a locale change in game is saved and offers a reload that drops ?locale=', async t => {
+  const saved = new Map();
+  const appended = [];
+  setup(t, async url => String(url) === '/data/__locales'
+    ? new Response(JSON.stringify({ default: 'enUS', locales: ['enUS', 'esES'] }))
+    : String(url).endsWith('manifest.json') ? new Response(JSON.stringify({ names: [] }))
+    : String(url).startsWith('/data/') ? new Response('')
+    : new Response(wasmBytes, { headers: { 'content-type': 'application/wasm' } }));
+  globalThis.localStorage = { getItem: k => saved.get(k) ?? null, setItem: (k, v) => saved.set(k, v) };
+  t.after(() => delete globalThis.localStorage);
+  globalThis.document.body.appendChild = el => appended.push(el);
+  await boot(async () => ({ memory: null }));
+  assert.equal(window.__wenilla_locales.current, 'enUS');
+  window.__wenilla_locale('esES');
+  assert.equal(saved.get('wenilla:locale'), 'esES');
+  assert.ok(appended.some(el => el.id === 'wenilla-reload'), 'the reload is offered');
+  assert.equal(reloadUrl('https://h.test/play?locale=enUS&x=1'), 'https://h.test/play?x=1');
+  assert.equal(reloadUrl('https://h.test/?locale=esES'), 'https://h.test/');
 });
