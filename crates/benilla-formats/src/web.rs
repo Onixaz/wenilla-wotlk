@@ -113,7 +113,7 @@ mod wasm {
             .ok()
             .filter(|v| v.is_object())
             .and_then(|v| js_sys::Reflect::get(&v, &"locales".into()).ok())
-            .filter(|v| js_sys::Array::is_array(v))
+            .filter(js_sys::Array::is_array)
             .map(|v| {
                 js_sys::Array::from(&v)
                     .iter()
