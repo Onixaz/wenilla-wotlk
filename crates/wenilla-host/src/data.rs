@@ -110,56 +110,40 @@ pub fn router_with(chain: Arc<Chain>, locale: Option<String>, version: Option<St
         })
 }
 
-/// The identity of the install under `data`: a hash of every archive's path (relative, any case),
-/// size and modification time. Any patch added, removed or replaced changes it; reading the files
-/// is never needed. `None` when the folder cannot be walked.
+/// [`data_version_for`] the chain [`Chain::open`] mounts in this process, which sets no `locale`
+/// CVar: the folder `enUS` resolves to.
 pub fn data_version(data: &std::path::Path) -> Option<String> {
-    fn walk(
-        dir: &std::path::Path,
-        root: &std::path::Path,
-        depth: u32,
-        out: &mut Vec<(String, u64, u64)>,
-    ) -> Option<()> {
-        for entry in std::fs::read_dir(dir).ok()? {
-            let entry = entry.ok()?;
-            let path = entry.path();
-            let meta = entry.metadata().ok()?;
-            if meta.is_dir() {
-                if depth > 0 {
-                    walk(&path, root, depth - 1, out)?;
-                }
-            } else if path
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("mpq"))
-            {
-                let rel = path
-                    .strip_prefix(root)
-                    .ok()?
-                    .to_string_lossy()
-                    .to_ascii_lowercase();
-                let mtime = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map_or(0, |d| d.as_secs());
-                out.push((rel, meta.len(), mtime));
-            }
-        }
-        Some(())
-    }
-    let mut files = Vec::new();
-    if data.is_dir() {
-        walk(data, data, 2, &mut files)?;
-    } else {
-        let meta = std::fs::metadata(data).ok()?;
-        let name = data.file_name()?.to_string_lossy().to_ascii_lowercase();
+    data_version_for(data, "enUS")
+}
+
+/// The identity of the chain a `locale` CVar of `locale` mounts from `data`: a hash of each
+/// archive [`benilla_formats::mounted_archives`] names, by path (relative, any case), size and
+/// modification time. Only those archives count, so a locale folder added beside the mounted one
+/// leaves it alone, while any of its patches added, removed or replaced changes it; reading the
+/// files is never needed. A single `.MPQ` is hashed by its name. `None` when the folder holds no
+/// such chain or an archive cannot be read.
+pub fn data_version_for(data: &std::path::Path, locale: &str) -> Option<String> {
+    fn stamp(path: &std::path::Path, name: String) -> Option<(String, u64, u64)> {
+        let meta = std::fs::metadata(path).ok()?;
         let mtime = meta
             .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or(0, |d| d.as_secs());
-        files.push((name, meta.len(), mtime));
+        Some((name.to_ascii_lowercase(), meta.len(), mtime))
     }
+    let mut files = if data.is_dir() {
+        benilla_formats::mounted_archives(data, locale)
+            .ok()?
+            .into_iter()
+            .map(|rel| stamp(&data.join(&rel), rel))
+            .collect::<Option<Vec<_>>>()?
+    } else {
+        vec![stamp(
+            data,
+            data.file_name()?.to_string_lossy().into_owned(),
+        )?]
+    };
     files.sort();
     // FNV-1a, 64-bit: stable across builds and platforms, unlike `DefaultHasher`.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -405,7 +389,7 @@ async fn index(State(state): State<DataState>) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{compressible, content_type, data_version, file_cache_control};
+    use super::{compressible, content_type, data_version, data_version_for, file_cache_control};
 
     /// Only `v=` as a whole parameter counts, wherever it sits in the query, and a host that
     /// names no version can never vouch for one.
@@ -423,26 +407,82 @@ mod tests {
         assert_eq!(cc(Some("nv=abc"), Some("abc")), PRIVATE);
     }
 
-    /// The version names the archives, not the folder's other files, and moves when one changes.
-    #[test]
-    fn the_data_version_tracks_the_archives() {
-        let dir = std::env::temp_dir().join(format!("wenilla-host-version-{}", std::process::id()));
+    /// A fake `Data` folder holding `names` (relative, `/`-separated), each one byte.
+    fn fake_data(tag: &str, names: &[&str]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("wenilla-host-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("enUS")).unwrap();
-        std::fs::write(dir.join("common.MPQ"), b"a").unwrap();
-        std::fs::write(dir.join("enUS").join("locale-enUS.MPQ"), b"b").unwrap();
+        for name in names {
+            let path = dir.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"a").unwrap();
+        }
+        dir
+    }
+
+    const ENUS: &[&str] = &["common.MPQ", "enUS/locale-enUS.MPQ", "enUS/speech-enUS.MPQ"];
+
+    /// The version names the mounted archives, not the folder's other files, and moves when one
+    /// changes.
+    #[test]
+    fn the_data_version_tracks_the_mounted_archives() {
+        let dir = fake_data("version", ENUS);
         let v1 = data_version(&dir).unwrap();
         assert_eq!(v1.len(), 16);
         assert_eq!(data_version(&dir).unwrap(), v1, "stable");
         std::fs::write(dir.join("notes.txt"), b"not an archive").unwrap();
-        assert_eq!(data_version(&dir).unwrap(), v1, "other files do not count");
+        std::fs::write(dir.join("enUS").join("backup-enUS.MPQ"), b"not mounted").unwrap();
+        assert_eq!(
+            data_version(&dir).unwrap(),
+            v1,
+            "unmounted files do not count"
+        );
         std::fs::write(dir.join("patch-4.MPQ"), b"c").unwrap();
         let v2 = data_version(&dir).unwrap();
         assert_ne!(v2, v1, "a new patch");
         std::fs::write(dir.join("patch-4.MPQ"), b"cc").unwrap();
-        assert_ne!(data_version(&dir).unwrap(), v2, "a replaced patch");
+        let v3 = data_version(&dir).unwrap();
+        assert_ne!(v3, v2, "a replaced shared patch");
+        std::fs::write(dir.join("enUS").join("locale-enUS.MPQ"), b"bb").unwrap();
+        assert_ne!(data_version(&dir).unwrap(), v3, "a replaced locale archive");
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    /// A second locale folder beside enUS leaves enUS's version alone, and has its own.
+    #[test]
+    fn another_locale_folder_leaves_the_version_alone() {
+        let dir = fake_data("locales", ENUS);
+        let before = data_version(&dir).unwrap();
+        for name in [
+            "esES/locale-esES.MPQ",
+            "esES/speech-esES.MPQ",
+            "esES/patch-esES.MPQ",
+            "esES/patch-esES-2.MPQ",
+        ] {
+            std::fs::create_dir_all(dir.join("esES")).unwrap();
+            std::fs::write(dir.join(name), b"es").unwrap();
+        }
+        assert_eq!(data_version(&dir).unwrap(), before);
+        assert_eq!(data_version_for(&dir, "enUS").unwrap(), before);
+        let es = data_version_for(&dir, "esES").unwrap();
+        assert_ne!(es, before);
+        std::fs::write(dir.join("common.MPQ"), b"shared, replaced").unwrap();
+        assert_ne!(
+            data_version_for(&dir, "esES").unwrap(),
+            es,
+            "a shared archive"
+        );
+        assert_ne!(data_version(&dir).unwrap(), before, "a shared archive");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// No chain, no version: the page then keeps no copy rather than one under a wrong name.
+    #[test]
+    fn a_folder_without_a_chain_has_no_version() {
+        let dir = fake_data("nochain", &["common.MPQ"]);
+        assert_eq!(data_version(&dir), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;

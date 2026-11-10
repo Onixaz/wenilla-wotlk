@@ -235,6 +235,27 @@ fn data_listing(path: &Path) -> Result<(Vec<String>, Vec<String>)> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// A `Data` directory's listing, the folder a `locale` CVar value of `wanted` mounts, and that
+/// folder's [`mount_order`].
+fn plan(path: &Path, wanted: &str) -> Result<(Vec<String>, &'static str, Vec<String>)> {
+    let wrong_install = || format!("{} is not a 3.3.5a (12340) Data folder", path.display());
+    let (files, _) = data_listing(path)?;
+    let folder = locale::resolve(&files, wanted)
+        .context("no locale folder holds the locale archives")
+        .with_context(wrong_install)?;
+    let order = mount_order(&LAYOUT, &files, folder).with_context(wrong_install)?;
+    Ok((files, folder, order))
+}
+
+/// The archives [`Chain::open_locale`] mounts from the `Data` directory `path` for a `locale`
+/// CVar value of `wanted`, as paths relative to `path` (`/`-separated, as found on disk), lowest
+/// priority first. Lists the folder; opens nothing.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn mounted_archives(path: &Path, wanted: &str) -> Result<Vec<String>> {
+    plan(path, wanted).map(|(_, _, order)| order)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 impl Chain {
     /// Open a `Data` directory's archives in the client's [`mount_order`] for the `locale` CVar, or
     /// a single `.MPQ` file.
@@ -256,13 +277,7 @@ impl Chain {
                 locale: ClientLocale::lone_archive(),
             });
         }
-        let layout = &LAYOUT;
-        let wrong_install = || format!("{} is not a 3.3.5a (12340) Data folder", path.display());
-        let (files, _) = data_listing(path)?;
-        let folder = locale::resolve(&files, wanted)
-            .context("no locale folder holds the locale archives")
-            .with_context(wrong_install)?;
-        let order = mount_order(layout, &files, folder).with_context(wrong_install)?;
+        let (files, folder, order) = plan(path, wanted)?;
         let mut archives = Vec::new();
         for name in order {
             let mpq = path.join(&name);
