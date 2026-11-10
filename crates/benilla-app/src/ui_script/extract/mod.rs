@@ -1741,6 +1741,7 @@ fn convert_entry(
                 },
                 out,
                 link_spans,
+                &mut |path| assets.as_mut().and_then(|a| a.sprite_texture(path, images)),
             );
         }
     }
