@@ -12,9 +12,9 @@ use benilla_dbc::{DbcParser, Schema};
 pub use benilla_blp::BlpTexels;
 
 mod chain;
-#[cfg(not(target_arch = "wasm32"))]
-pub use chain::mounted_archives;
 pub use chain::{data_locale, Chain, ChainEntry};
+#[cfg(not(target_arch = "wasm32"))]
+pub use chain::{data_locales, mounted_archives, resolve_data_locale};
 mod locale;
 pub use locale::{boot_locale, client_locale, dbc_strings, packed as packed_locale, ClientLocale};
 /// Loose `.tga` art, as addon folders ship it.

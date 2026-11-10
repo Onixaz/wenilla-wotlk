@@ -25,18 +25,55 @@ use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Pr
 use tower_http::compression::CompressionLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
 
-/// Router state: the opened patch chain. `Chain::read`/`list` are `&self` and lock-free (see the
-/// chain module doc). The serialized index is shared across requests for this mounted chain.
+/// One locale's chain as the routes serve it: plain `/data/*` for the default locale, and
+/// `/data/__l/{locale}/*` for each.
+pub struct LocaleData {
+    /// The locale folder (`enUS`, `esES`, …): the `{locale}` in `/data/__l/{locale}/` and what
+    /// `__locale` answers.
+    pub locale: String,
+    pub chain: Arc<Chain>,
+    /// The chain's identity ([`data_version_for`]), which the page keys its persistent copy by and
+    /// a shared cache keeps `?v=` URLs under; `None` answers 404 and the page keeps no copy.
+    pub version: Option<String>,
+}
+
+/// One served chain. `Chain::read`/`list` are `&self` and lock-free (see the chain module doc);
+/// the serialized index is shared across requests for this chain.
+struct Mount {
+    chain: Arc<Chain>,
+    index: IndexCache,
+    /// The chain's locale folder, which the wasm `data_locale` asks for; `None` when the chain
+    /// was opened from a single `.MPQ`.
+    locale: Option<Arc<str>>,
+    version: Option<Arc<str>>,
+}
+
+/// Router state: the served chains, in the client's locale table order, and which one plain
+/// `/data/*` serves.
 #[derive(Clone)]
 pub struct DataState {
+    /// The default locale's chain.
     pub chain: Arc<Chain>,
-    index: Arc<IndexCache>,
-    /// The `Data` folder's locale (`enUS`, …), which the wasm `data_locale` asks for; `None` when
-    /// the chain was opened from a single `.MPQ`.
-    locale: Option<Arc<str>>,
-    /// The install's identity ([`data_version`]), which the page keys its persistent copy of
-    /// `/data` by; `None` answers 404 and the page keeps no copy.
-    version: Option<Arc<str>>,
+    mounts: Arc<[Mount]>,
+    default: usize,
+}
+
+impl DataState {
+    /// The chain a request path names, and the path below its root: `/data/__l/<locale>/<rest>`
+    /// is that locale's, any other `/data/<rest>` the default's. `None` for a locale this host
+    /// does not serve.
+    fn mount<'a>(&self, path: &'a str) -> Option<(&Mount, &'a str)> {
+        let rest = path.strip_prefix("/data/").unwrap_or("");
+        let Some(scoped) = rest.strip_prefix("__l/") else {
+            return Some((&self.mounts[self.default], rest));
+        };
+        let (locale, rest) = scoped.split_once('/')?;
+        let mount = self
+            .mounts
+            .iter()
+            .find(|m| m.locale.as_deref() == Some(locale))?;
+        Some((mount, rest))
+    }
 }
 
 /// Single-flight initialization; transient list errors are retried on the next request.
@@ -78,14 +115,56 @@ pub fn router_with_locale(chain: Arc<Chain>, locale: Option<String>) -> Router {
 }
 
 /// [`router_with_locale`], also answering `GET /data/__version` with `version`: the page keeps
-/// its fetched game files across visits under that name, and drops them when it changes.
+/// its fetched game files across visits under that name, and drops them when it changes. With a
+/// `locale`, that one locale is also `/data/__l/{locale}/` and `/data/__locales` lists it.
 pub fn router_with(chain: Arc<Chain>, locale: Option<String>, version: Option<String>) -> Router {
+    routes(
+        vec![Mount {
+            chain,
+            index: IndexCache::default(),
+            locale: locale.map(Arc::from),
+            version: version.map(Arc::from),
+        }],
+        0,
+    )
+}
+
+/// The `/data/*` router over every locale of a `Data` folder, `locales` in the client's table
+/// order: plain `/data/*` serves `default`, `/data/__l/{locale}/*` each one (any other locale is a
+/// 404), and `GET /data/__locales` lists them. Panics when `default` is not one of `locales`.
+pub fn router_locales(locales: Vec<LocaleData>, default: &str) -> Router {
+    let default = locales
+        .iter()
+        .position(|l| l.locale == default)
+        .unwrap_or_else(|| panic!("the default locale {default} is not served"));
+    let mounts = locales
+        .into_iter()
+        .map(|l| Mount {
+            chain: l.chain,
+            index: IndexCache::default(),
+            locale: Some(Arc::from(l.locale)),
+            version: l.version.map(Arc::from),
+        })
+        .collect();
+    routes(mounts, default)
+}
+
+fn routes(mounts: Vec<Mount>, default: usize) -> Router {
     Router::new()
+        .route("/data/__locales", get(locales_route))
         .route("/data/__index", get(index))
         .route("/data/__locale", get(locale_route))
         .route("/data/__version", get(version_route))
         .route("/data/__batch", post(batch))
-        // axum's matchit picks the more specific literal route above over this wildcard on its
+        // One locale's chain: the same routes under its root. matchit prefers the literal `__l`
+        // segment to the wildcard below, so these never reach the default chain as a name
+        // (`tests/data.rs`, `a_locale_route_wins_over_the_wildcard`).
+        .route("/data/__l/{locale}/__index", get(index))
+        .route("/data/__l/{locale}/__locale", get(locale_route))
+        .route("/data/__l/{locale}/__version", get(version_route))
+        .route("/data/__l/{locale}/__batch", post(batch))
+        .route("/data/__l/{locale}/{*name}", get(file).head(file))
+        // axum's matchit picks the more specific literal routes above over this wildcard on its
         // own — registration order here doesn't matter.
         .route("/data/{*name}", get(file).head(file))
         // On the fly, not precompressed like `static_site`'s: that route serves the handful of
@@ -103,11 +182,34 @@ pub fn router_with(chain: Arc<Chain>, locale: Option<String>, version: Option<St
             HeaderValue::from_static("same-origin"),
         ))
         .with_state(DataState {
-            chain,
-            index: Arc::default(),
-            locale: locale.map(Arc::from),
-            version: version.map(Arc::from),
+            chain: Arc::clone(&mounts[default].chain),
+            mounts: mounts.into(),
+            default,
         })
+}
+
+/// `GET /data/__locales` — the locales this host serves, in the client's table order, and the
+/// one plain `/data/*` serves: `{"default":"enUS","locales":["enUS","esES"]}`. Asked once per
+/// visit, so never kept. 404 when the host knows no locale (a single `.MPQ`), which the page
+/// reads as plain `/data` alone.
+async fn locales_route(State(state): State<DataState>) -> Response {
+    let Some(default) = state.mounts[state.default].locale.as_deref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let locales: Vec<&str> = state
+        .mounts
+        .iter()
+        .filter_map(|m| m.locale.as_deref())
+        .collect();
+    let body = serde_json::json!({ "default": default, "locales": locales });
+    (
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body.to_string(),
+    )
+        .into_response()
 }
 
 /// [`data_version_for`] the chain [`Chain::open`] mounts in this process, which sets no `locale`
@@ -170,14 +272,17 @@ const BATCH_READS: usize = 8;
 /// `u32 name length, name (UTF-8, exactly as asked), i32 body length (−1 not in the chain, −2 a
 /// read failure), body`, all little-endian. A browser on HTTP/1.1 runs six requests to a host at
 /// once, so a world of small files is a queue of round trips; one request per batch is not.
-async fn batch(State(state): State<DataState>, body: Bytes) -> Response {
+async fn batch(uri: Uri, State(state): State<DataState>, body: Bytes) -> Response {
+    let Some((mount, _)) = state.mount(uri.path()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let Ok(names) = serde_json::from_slice::<Vec<String>>(&body) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     if names.len() > BATCH_MAX {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     }
-    let chain = Arc::clone(&state.chain);
+    let chain = Arc::clone(&mount.chain);
     let frames = futures_util::stream::iter(names)
         .map(move |name| {
             let chain = Arc::clone(&chain);
@@ -227,8 +332,11 @@ pub fn batch_frame(name: &str, body: Result<Vec<u8>, i32>) -> Vec<u8> {
 
 /// `GET /data/__version` — the install's identity as plain text, never cached by the browser: the
 /// page asks it once per visit to know whether its kept copy still matches.
-async fn version_route(State(state): State<DataState>) -> Response {
-    match state.version {
+async fn version_route(uri: Uri, State(state): State<DataState>) -> Response {
+    let Some((mount, _)) = state.mount(uri.path()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match &mount.version {
         Some(version) => (
             [
                 (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
@@ -242,8 +350,11 @@ async fn version_route(State(state): State<DataState>) -> Response {
 }
 
 /// `GET /data/__locale` — the `Data` folder's locale as plain text, or 404 when there is none.
-async fn locale_route(State(state): State<DataState>) -> Response {
-    match state.locale {
+async fn locale_route(uri: Uri, State(state): State<DataState>) -> Response {
+    let Some((mount, _)) = state.mount(uri.path()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match &mount.locale {
         Some(locale) => (
             [(
                 axum::http::header::CONTENT_TYPE,
@@ -318,15 +429,17 @@ fn file_cache_control(query: Option<&str>, version: Option<&str>) -> &'static st
 }
 
 async fn file(method: Method, uri: Uri, State(state): State<DataState>) -> Response {
-    let raw = uri.path().strip_prefix("/data/").unwrap_or("");
+    let Some((mount, raw)) = state.mount(uri.path()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let decoded = percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
     let name = decoded.replace('/', "\\");
     // Before the move into `spawn_blocking` — the classification is pure string math on the
     // name and yields a `&'static str`, so it costs nothing to take it out of the task's way.
     let content_type = content_type(&name);
-    let cache_control = file_cache_control(uri.query(), state.version.as_deref());
+    let cache_control = file_cache_control(uri.query(), mount.version.as_deref());
 
-    let chain = Arc::clone(&state.chain);
+    let chain = Arc::clone(&mount.chain);
     // `Chain::read` does synchronous file I/O (through benilla-mpq's blocking reads); running it
     // on the async runtime thread would stall every other in-flight request behind one disk seek.
     let read = tokio::task::spawn_blocking(move || chain.read(&name)).await;
@@ -361,9 +474,12 @@ async fn file(method: Method, uri: Uri, State(state): State<DataState>) -> Respo
 
 /// `GET /data/__index` — every name [`Chain::list`] can enumerate, for the wasm `Chain::list`
 /// (Lane A) to mirror the native directory walk it can't do in a browser.
-async fn index(State(state): State<DataState>) -> Response {
-    let chain = Arc::clone(&state.chain);
-    let listed = state
+async fn index(uri: Uri, State(state): State<DataState>) -> Response {
+    let Some((mount, _)) = state.mount(uri.path()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let chain = Arc::clone(&mount.chain);
+    let listed = mount
         .index
         .get(move || {
             let entries = chain.list()?;

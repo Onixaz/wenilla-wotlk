@@ -9,7 +9,7 @@
 //! never be exposed on the open internet. Multi-user hosting is `wenilla-realm`, which mounts the
 //! same routers behind a session cookie.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -41,6 +41,11 @@ struct Cli {
     /// itself runs against, so it defaults to loopback.
     #[arg(long, default_value = "127.0.0.1")]
     upstream: String,
+    /// The locale folder plain `/data/*` serves (`esES`, …), which must be one under `--data`.
+    /// Without it, the folder the 3.3.5a client mounts with no `locale` CVar: `enUS`, else the
+    /// next one in the client's table. Every locale folder is served under `/data/__l/{locale}/`.
+    #[arg(long)]
+    locale: Option<String>,
 }
 
 #[tokio::main]
@@ -50,16 +55,19 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
 
-    let chain = Arc::new(
-        Chain::open(&cli.data).with_context(|| format!("opening {}", cli.data.display()))?,
-    );
-    tracing::info!(data = %cli.data.display(), "patch chain open");
-
-    let locale = benilla_formats::data_locale(&cli.data).ok();
-    tracing::info!(locale = ?locale, "data locale");
-    let version = wenilla_host::data::data_version(&cli.data);
-    tracing::info!(version = ?version, "data version");
-    let app = wenilla_host::data::router_with(chain, locale, version)
+    let app = if cli.data.is_dir() {
+        data_router(&cli.data, cli.locale.as_deref())?
+    } else {
+        // A single `.MPQ`: one chain, no locale, as before.
+        anyhow::ensure!(cli.locale.is_none(), "--locale needs a Data folder");
+        let chain = Arc::new(
+            Chain::open(&cli.data).with_context(|| format!("opening {}", cli.data.display()))?,
+        );
+        let version = wenilla_host::data::data_version(&cli.data);
+        tracing::info!(data = %cli.data.display(), version = ?version, "archive open");
+        wenilla_host::data::router_with(chain, None, version)
+    };
+    let app = app
         .merge(wenilla_host::ws::router(
             cli.upstream.clone(),
             wenilla_host::ALLOWED_PORTS,
@@ -79,6 +87,50 @@ async fn main() -> Result<()> {
     }
     tracing::info!(bind = %cli.bind, www = %cli.www.display(), upstream = %cli.upstream, "wenilla-host listening");
     axum::serve(listener, app).await.context("serving")
+}
+
+/// The `/data` router over every locale folder of the `Data` directory `data`, plain `/data/*`
+/// serving `locale` (or the folder `enUS` resolves to). A locale whose chain fails to open is
+/// left out with a warning, unless it is the default.
+fn data_router(data: &Path, locale: Option<&str>) -> Result<axum::Router> {
+    let folders = benilla_formats::data_locales(data)
+        .with_context(|| format!("listing {}", data.display()))?;
+    let default = match locale {
+        Some(wanted) => folders
+            .iter()
+            .copied()
+            .find(|f| *f == wanted)
+            .with_context(|| {
+                format!(
+                    "--locale {wanted}: the locales under {} are {folders:?}",
+                    data.display()
+                )
+            })?,
+        None => benilla_formats::resolve_data_locale(data, "enUS")
+            .with_context(|| format!("{} holds no locale folder", data.display()))?,
+    };
+    let mut served = Vec::new();
+    for (folder, chain) in folders.iter().zip(Chain::open_locales(data, &folders)) {
+        let chain = match chain {
+            Ok(chain) => chain,
+            Err(e) if *folder != default => {
+                tracing::warn!(locale = folder, error = %format!("{e:#}"), "locale left out");
+                continue;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("opening {} as {folder}", data.display()))
+            }
+        };
+        let version = wenilla_host::data::data_version_for(data, folder);
+        tracing::info!(locale = folder, version = ?version, "patch chain open");
+        served.push(wenilla_host::data::LocaleData {
+            locale: folder.to_string(),
+            chain: Arc::new(chain),
+            version,
+        });
+    }
+    tracing::info!(data = %data.display(), default, "serving every locale");
+    Ok(wenilla_host::data::router_locales(served, default))
 }
 
 /// Is the listener bound to a loopback address (the only place `/data` is safe unauthenticated)?
