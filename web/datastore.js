@@ -94,6 +94,7 @@ export function createStore(opts = {}) {
   const flights = new Map(); // key -> flight
   const missing = new Set(); // keys the host answered 404 for
   let versionPromise = null;
+  let knownVersion = null; // the host's data version once `dataVersion` has it
   let cachePromise = null;
   const learnedMap = new Map(loadLearned(storage, names.learned)); // name -> phase
   let phase = 'boot';
@@ -153,7 +154,9 @@ export function createStore(opts = {}) {
         const r = await fetchFn(`${base}/__version`);
         if (!r.ok) return null;
         return (await r.text()).trim() || null;
-      })().catch(() => null);
+      })()
+        .catch(() => null)
+        .then((v) => (knownVersion = v));
     }
     return versionPromise;
   }
@@ -197,13 +200,13 @@ export function createStore(opts = {}) {
     // The host's own routes need no version. `f.priority` is read after this wait: a reader may
     // have joined and raised it while the version was on its way.
     const query = f.key.startsWith('__') ? null : await fileQuery();
-    const bytes = await net.request(f.key, f.priority, f.ahead, query);
+    const bytes = await net.request(f.key, f.priority, f.ahead, query, f.first);
     // A Response built from bytes copies them, so they stay ours.
     if (bytes && cache) cache.put(url, new Response(bytes)).catch(() => {});
     return bytes;
   }
 
-  function flight(key, priority, ahead) {
+  function flight(key, priority, ahead, first = false) {
     let f = flights.get(key);
     if (f) {
       stats.joined += 1;
@@ -213,7 +216,7 @@ export function createStore(opts = {}) {
       }
       return f;
     }
-    f = { key, priority, ahead, keep: false, consumers: 0 };
+    f = { key, priority, ahead, first, keep: false, consumers: 0 };
     f.promise = new Promise((resolve, reject) => {
       f.resolve = resolve;
       f.reject = reject;
@@ -305,7 +308,10 @@ export function createStore(opts = {}) {
   /// Download `names` into the persistent cache without holding them in memory, a few at a time
   /// and only while nothing else wants the network, so a later `ready` reads the disk. A `tag`
   /// that finished for this data version is not walked again. Resolves to whether it ran.
-  async function fill(names, { tag, workers = 6, idleMs = 250 } = {}) {
+  /// `idle: false` does not wait for a quiet network, and `first` puts each request ahead of the
+  /// low-priority fetches already queued (a reader's high-priority read still goes before it): a
+  /// set the player may want next, ahead of one they want later.
+  async function fill(names, { tag, workers = 6, idleMs = 250, idle = true, first = false } = {}) {
     if (globalThis.navigator?.connection?.saveData) return false; // the player asked for less data
     const cache = await openCache();
     if (!cache) return false;
@@ -320,13 +326,13 @@ export function createStore(opts = {}) {
     let failed = 0;
     const worker = async () => {
       while (next < list.length) {
-        while (busy()) await new Promise((r) => setTimeout(r, idleMs));
+        while (idle && busy()) await new Promise((r) => setTimeout(r, idleMs));
         if (next >= list.length) return;
         const key = dataKey(list[next++]);
         if (mem.has(key) || missing.has(key)) continue;
         if (await cache.match(urlFor(key)).catch(() => undefined)) continue;
         try {
-          await flight(key, 'low', false).promise;
+          await flight(key, 'low', false, first).promise;
           stats.filled += 1;
         } catch (_) {
           failed += 1;
@@ -336,6 +342,21 @@ export function createStore(opts = {}) {
     await Promise.all(Array.from({ length: workers }, worker));
     if (tag && failed === 0) writeFilled(version, tag);
     return true;
+  }
+
+  /// Whether a `fill` under `tag` finished for this data version.
+  async function filled(tag) {
+    return readFilled(await dataVersion()).includes(tag);
+  }
+
+  /// The bytes of `name` already here, in memory or the persistent cache, without a request and
+  /// without counting as a reader: `null` when neither has them. Memory keeps its copy.
+  async function cached(name) {
+    const key = dataKey(name);
+    if (mem.has(key)) return take(key, true);
+    const cache = await openCache();
+    const hit = cache && (await cache.match(urlFor(key)).catch(() => undefined));
+    return hit ? new Uint8Array(await hit.arrayBuffer()) : null;
   }
 
   function readFilled(version) {
@@ -393,6 +414,8 @@ export function createStore(opts = {}) {
     load,
     prefetch,
     fill,
+    filled,
+    cached,
     has: (name) => mem.has(dataKey(name)),
     reading: () => reading,
     ready,
@@ -404,6 +427,10 @@ export function createStore(opts = {}) {
     setPhase: (p) => {
       phase = p;
     },
+    /// What a chain file's URL ends with for a reader outside the store (the client's blocking
+    /// read): `?v=<version>` once the version is known, so a CDN caches it as it does the store's
+    /// own GETs, else nothing.
+    query: () => (knownVersion ? `?v=${knownVersion}` : ''),
     stats: () => ({ ...stats, memBytes, memCount: mem.size, inflight: flights.size, ...net.state() }),
   };
 }
@@ -417,12 +444,13 @@ function createNetwork({ base, fetchFn, urlFor, stats, maxNames, batchLimits, re
   let scheduled = false;
   let batching = true; // false once the host answers that it has no batch route
 
-  function request(key, priority, ahead, query) {
+  function request(key, priority, ahead, query, first = false) {
     // The host's own routes (`__index`, …) are not chain files: always a plain GET.
     if (key.startsWith('__') || (query === null && !batching)) return single(key, priority);
     return new Promise((resolve, reject) => {
       const e = { key, priority: priority === 'low' ? 'low' : 'high', ahead, query, resolve, reject };
-      queues[e.priority].push(e);
+      if (first) queues[e.priority].unshift(e);
+      else queues[e.priority].push(e);
       queued.set(key, e);
       schedule();
     });

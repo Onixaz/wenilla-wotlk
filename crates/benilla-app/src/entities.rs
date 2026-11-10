@@ -269,6 +269,11 @@ impl Creatures {
         self.catalog.model(display_id).is_some()
     }
 
+    /// A display's model file (`CreatureModelData`'s, `.mdx` spelled), `None` without a model row.
+    pub(crate) fn model_path(&self, display_id: u32) -> Option<String> {
+        self.catalog.model(display_id).map(|m| m.model_path)
+    }
+
     /// A catalog with no cached models, for tests that only ask whether a display resolves.
     #[cfg(test)]
     pub(crate) fn from_catalog(catalog: CreatureCatalog) -> Self {

@@ -437,6 +437,25 @@ pub(super) fn forced_body_atlas(
     )
 }
 
+/// Whether [`forced_body_atlas`] would block this thread on the network: on the page, the forced
+/// composite's textures have not landed yet (fetched from here). The previews wait a frame instead,
+/// holding the look already on the stage, as the world body waits on [`body_atlas`].
+pub(super) fn forced_atlas_waits(
+    look: &CharLook,
+    key: Option<SkinKey>,
+    displays: Option<&super::super::ItemDisplays>,
+    sections: Option<&SkinSections>,
+    composites: &SkinComposites,
+) -> bool {
+    if let BodySkin::Baked(_) = &look.body {
+        return false;
+    }
+    let (Some(key), Some(sections)) = (key, sections) else {
+        return false;
+    };
+    composites.waits_on_reads(&key, || composite_plan(&key, sections, displays))
+}
+
 /// Build a character body's per-appearance materials: the body atlas ([`body_atlas`]), the hair,
 /// the cape and the extra skin, each at its batches' own blend and sidedness from `parts`. Without
 /// the tables or the light buffer, parts keep their built material.

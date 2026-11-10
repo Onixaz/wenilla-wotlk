@@ -108,6 +108,11 @@ pub(crate) struct Roster {
 }
 
 impl Roster {
+    /// Whether the account has no character: none listed yet, or a roster that came back empty.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.chars.is_empty()
+    }
+
     /// The connected realm's type, `Cfg_Configs.dbc`'s `RealmType` key.
     pub(crate) fn realm_type(&self) -> Option<u32> {
         self.realm.as_ref().map(|r| r.realm_type)

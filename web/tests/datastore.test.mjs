@@ -697,3 +697,55 @@ test('a fill finished for one locale is walked again for another', async (t) => 
   const enAgain = createStore({ fetch: h.fetch, caches: diskCache().caches, storage, version: 'v1' });
   assert.equal(await enAgain.fill(['a.blp'], { tag: 'ui', idleMs: 0 }), false, 'enUS kept its tag');
 });
+
+test('a fill first, not idle, goes ahead of queued fetches ahead and behind a reader', async () => {
+  const { caches } = diskCache();
+  const files = Object.fromEntries(['a', 'b', 'c', 'x', 'r'].map((k, i) => [k, bytes(i + 1)]));
+  const h = host(files);
+  const s = createStore({ fetch: h.fetch, caches, storage: null, version: 'v1', maxRequests: 2, maxLowRequests: 1 });
+  s.prefetch(['a', 'b', 'c']); // the world set, queued low
+  await settle();
+  assert.deepEqual(h.calls.map((c) => c.path), ['a']);
+  const filling = s.fill(['x'], { workers: 1, idle: false, first: true });
+  const read = s.load('r');
+  for (let i = 0; i < 3; i++) await settle();
+  assert.deepEqual(h.calls.map((c) => [c.path, c.priority]), [['a', 'low'], ['r', 'high']], 'the reader first');
+  for (let i = 0; i < 20 && !h.calls.some((c) => c.path === 'x'); i++) {
+    h.calls.forEach((c) => c.open());
+    await settle();
+  }
+  const order = h.calls.map((c) => c.path).filter((p) => p !== 'r');
+  assert.deepEqual(order.slice(0, 2), ['a', 'x'], 'the fill jumps b and c');
+  for (let i = 0; i < 20; i++) {
+    h.calls.forEach((c) => c.open());
+    await settle();
+  }
+  assert.deepEqual(await read, bytes(5));
+  assert.equal(await filling, true);
+});
+
+test('filled names a finished tag; cached reads the disk without a request or a reader', async () => {
+  const { disk, caches } = diskCache();
+  const h = instantHost({ 'a.m2': bytes(1, 2) });
+  const kv = new Map();
+  const storage = { getItem: (k) => kv.get(k) ?? null, setItem: (k, v) => kv.set(k, v) };
+  const s = createStore({ fetch: h.fetch, caches, storage, version: 'v1' });
+  assert.equal(await s.filled('glue'), false);
+  assert.equal(await s.fill(['a.m2'], { tag: 'glue', idle: false }), true);
+  await settle();
+  assert.equal(await s.filled('glue'), true);
+  const before = h.calls.length;
+  assert.deepEqual(await s.cached('A.M2'), bytes(1, 2));
+  assert.equal(await s.cached('b.m2'), null);
+  assert.equal(h.calls.length, before, 'no request');
+  assert.equal(s.reading(), 0);
+  assert.equal(disk.size, 1);
+});
+
+test('query names the version once it is known', async () => {
+  const h = instantHost({ 'a.blp': bytes(1) });
+  const s = createStore({ fetch: h.fetch, persist: false, storage: null });
+  assert.equal(s.query(), '');
+  await s.load('a.blp');
+  assert.equal(s.query(), '?v=v1');
+});
