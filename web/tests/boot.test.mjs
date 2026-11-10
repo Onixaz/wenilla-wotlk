@@ -228,3 +228,28 @@ test('a locale change in game is saved and offers a reload that drops ?locale=',
   assert.equal(reloadUrl('https://h.test/play?locale=enUS&x=1'), 'https://h.test/play?x=1');
   assert.equal(reloadUrl('https://h.test/?locale=esES'), 'https://h.test/');
 });
+
+test('the cover reads the game data, not done, while it is still coming after the client', async t => {
+  const gates = { '/data/__index': deferred(), '/data/__locale': deferred() };
+  const children = setup(t, async url => {
+    const u = String(url);
+    if (u.endsWith('manifest.json')) return new Response(JSON.stringify({ names: [] }));
+    if (gates[u]) return gates[u].promise;
+    if (u.startsWith('/data/')) return new Response('', { status: 404 });
+    return new Response(wasmBytes, { headers: { 'content-type': 'application/wasm', 'content-length': '8' } });
+  });
+  const turn = () => new Promise(r => setImmediate(r));
+  const started = boot(async () => ({ memory: null }));
+  for (let i = 0; i < 100 && children.get('.data')?.textContent !== 'game data — 0/2'; i++) await turn();
+  for (let i = 0; i < 100 && children.get('.stage')?.textContent !== 'Downloading game data'; i++) await turn();
+  // The client is in, the data is not: half the bar, and the line names what is still coming.
+  assert.equal(children.get('.stage').textContent, 'Downloading game data');
+  assert.equal(children.get('.bar > i').style.width, '50%');
+  gates['/data/__index'].resolve(new Response('{}'));
+  for (let i = 0; i < 100 && children.get('.data').textContent !== 'game data — 1/2'; i++) await turn();
+  assert.equal(children.get('.bar > i').style.width, '75%');
+  assert.equal(children.get('.stage').textContent, 'Downloading game data');
+  gates['/data/__locale'].resolve(new Response('enUS'));
+  await started;
+  assert.equal(children.get('.stage').textContent, 'Starting…');
+});

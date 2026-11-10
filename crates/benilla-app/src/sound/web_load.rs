@@ -168,6 +168,27 @@ pub(super) fn begin(
     }
 }
 
+/// The page's own fetch, `window.__wenilla_fetch` (`web/networker.js`), which reads bodies in a
+/// Worker: a multi-MB sound left unread while a blocking chain read holds the main thread would
+/// fill the shared HTTP/2 connection's window and starve that read. Without it, `window.fetch`.
+/// The abort signal stays on the page; an aborted load is dropped when it lands.
+fn page_fetch(
+    window: &web_sys::Window,
+    url: &str,
+    options: &web_sys::RequestInit,
+) -> js_sys::Promise {
+    use wasm_bindgen::JsCast;
+    let page = js_sys::Reflect::get(window, &"__wenilla_fetch".into())
+        .ok()
+        .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+        .and_then(|f| {
+            f.call2(&wasm_bindgen::JsValue::NULL, &url.into(), options)
+                .ok()
+        })
+        .and_then(|p| p.dyn_into::<js_sys::Promise>().ok());
+    page.unwrap_or_else(|| window.fetch_with_str_and_init(url, options))
+}
+
 /// `fetch` the bytes, then decode them — in the browser where possible, in wasm where not.
 async fn fetch_and_decode(
     url: &str,
@@ -178,7 +199,7 @@ async fn fetch_and_decode(
     let options = web_sys::RequestInit::new();
     options.set_signal(Some(signal));
     let resp: web_sys::Response =
-        wasm_bindgen_futures::JsFuture::from(window.fetch_with_str_and_init(url, &options))
+        wasm_bindgen_futures::JsFuture::from(page_fetch(&window, url, &options))
             .await
             .map_err(js_err)?
             .dyn_into()

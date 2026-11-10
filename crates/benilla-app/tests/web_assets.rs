@@ -9,7 +9,8 @@
 //! `boot()`, a black page. (Both pages import `platform.js` dynamically for exactly that reason,
 //! which softens the blow to "no full-screen button" — but the trap is one static import away.)
 //!
-//! So: every `./name.js` the pages ask for that exists in `web/` must appear in that `cp`.
+//! So: every `./name.js` the pages ask for that exists in `web/` must appear in that `cp`, and so
+//! must every one `boot.js` loads beside itself (`datastore.js`, `networker.js`).
 //! Build outputs (`wenilla.js`, from wasm-bindgen) have no source file in `web/` and are skipped.
 
 use std::collections::BTreeSet;
@@ -17,6 +18,9 @@ use std::path::{Path, PathBuf};
 
 /// The pages that host the wasm client.
 const PAGES: &[&str] = &["web/index.html"];
+
+/// The page modules that load siblings of their own (`new URL('./x.js', import.meta.url)`).
+const LOADERS: &[&str] = &["web/boot.js"];
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -55,7 +59,7 @@ fn every_page_script_that_lives_in_web_is_copied_into_dist() {
         .find(|l| l.trim_start().starts_with("cp web/"))
         .expect("web-build.sh still has the `cp web/…` line that populates web/dist");
 
-    for page in PAGES {
+    for page in PAGES.iter().chain(LOADERS) {
         for name in referenced_scripts(&read(page)) {
             // Not every import has a source file: wenilla.js is wasm-bindgen's output, written
             // straight into dist by the build itself.

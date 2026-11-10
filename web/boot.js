@@ -6,11 +6,12 @@
 // synchronous XHR chain reads in ONE rAF task, the "unresponsive tab" window) — happens before
 // the first frame the app could draw. So the page owns a DOM overlay, and it does two jobs:
 //
-//   1. SHOW what is happening: a byte-counted wasm download bar (the counting stream is
-//      re-wrapped in a Response so `WebAssembly.compileStreaming` still streams), a
-//      "game data N/M" line for the prefetch, then indeterminate "Starting…" states driven by
-//      the client's own `window.__wenilla_progress(stage)` calls (benilla-app/src/webprogress.rs)
-//      until "ready" — the first glue screen — fades the overlay out.
+//   1. SHOW what is happening: one bar for both downloads the client waits on — the byte-counted
+//      wasm (the counting stream is re-wrapped in a Response so `WebAssembly.compileStreaming`
+//      still streams) and the prefetch's files, its "game data N/M" line — then indeterminate
+//      "Starting…" states driven by the client's own `window.__wenilla_progress(stage)` calls
+//      (benilla-app/src/webprogress.rs) until "ready" — the first glue screen — fades the
+//      overlay out.
 //   2. SHRINK the unresponsive window: the overlay creates the page's data store
 //      (datastore.js, `window.__wenilla_data`) and fills it with the boot read-set — a
 //      checked-in manifest (boot-manifest.json) captured from a traced boot, plus every name a
@@ -56,6 +57,7 @@ export async function boot(init, opts = {}) {
   if (q.get('boottrace') === '1') window.__wenilla_boottrace = [];
   const skipPrefetch = q.get('boottrace') === '1' || q.get('noprefetch') === '1';
   installProgressHook(ui, skipPrefetch);
+  if (skipPrefetch) ui.setData(0, 0); // nothing to download but the client
   installLocaleHook();
 
   // The store must exist before the client starts: its synchronous reads look for it once. Its
@@ -158,12 +160,18 @@ export function missingWebGpu() {
   );
 }
 
-/// The page's data store, created once (datastore.js) on the data root `base`. Loaded by URL so
-/// the module resolves beside this one wherever the page serves it.
+/// The page's data store, created once (datastore.js) on the data root `base`. Its network, and
+/// the client's own sound fetches (`window.__wenilla_fetch`), read their bodies in a Worker
+/// (networker.js), so a blocking read cannot stall the downloads it shares a connection with.
+/// Loaded by URL so the modules resolve beside this one wherever the page serves it.
 async function dataStore(base) {
   if (!window.__wenilla_data) {
-    const { createStore } = await import(new URL('./datastore.js', import.meta.url).href);
-    window.__wenilla_data ??= createStore({ base });
+    const [{ createStore }, { createWorkerFetch }] = await Promise.all([
+      import(new URL('./datastore.js', import.meta.url).href),
+      import(new URL('./networker.js', import.meta.url).href),
+    ]);
+    window.__wenilla_fetch ??= createWorkerFetch();
+    window.__wenilla_data ??= createStore({ base, fetch: window.__wenilla_fetch });
   }
   return window.__wenilla_data;
 }
@@ -422,28 +430,52 @@ function createBootUi() {
   const dataEl = root.querySelector('.data');
   let gone = false;
   let timeout = 0;
+  let staged = false; // the client drives the line now; the downloads no longer do
+  const wasm = { got: 0, total: 0, done: false };
+  const data = { done: 0, total: 0, known: false }; // known: the prefetch has said its size
+  let shown = 0; // the bar's width in %, which never moves back
   const mb = (n) => (n / (1024 * 1024)).toFixed(0);
+  // The client starts once both downloads are in: its wasm and the boot's game data. The line
+  // names whichever is still coming and the bar is both together, so neither reads "done" while
+  // the other is still downloading.
+  const renderDownloads = () => {
+    if (gone || staged) return;
+    const dataLeft = !data.known || data.done < data.total;
+    if (!wasm.done && wasm.total <= 0) {
+      stageEl.textContent = `Downloading client — ${mb(wasm.got)} MB`;
+      barEl.classList.add('pulse');
+      return;
+    }
+    const w = wasm.done ? 1 : Math.min(wasm.got / wasm.total, 1);
+    if (!wasm.done) {
+      stageEl.textContent = `Downloading client — ${Math.min(99, Math.floor(w * 100))}% (${mb(wasm.got)} MB)`;
+    } else {
+      stageEl.textContent = dataLeft ? 'Downloading game data' : 'Downloading client — done';
+    }
+    const all = wasm.done && !dataLeft;
+    const d = !data.known ? 0 : data.total > 0 ? data.done / data.total : 1;
+    const frac = (w + d) / 2;
+    shown = all ? 100 : Math.max(shown, Math.min(99, Math.floor(frac * 100)));
+    fillEl.style.width = shown + '%';
+  };
   return {
     setWasmProgress(got, total) {
-      if (gone) return;
-      if (total > 0) {
-        const pct = Math.min(99, Math.floor((got / total) * 100));
-        const done = got >= total;
-        stageEl.textContent = done
-          ? 'Downloading client — done'
-          : `Downloading client — ${pct}% (${mb(got)} MB)`;
-        fillEl.style.width = (done ? 100 : pct) + '%';
-      } else {
-        stageEl.textContent = `Downloading client — ${mb(got)} MB`;
-        barEl.classList.add('pulse');
-      }
+      wasm.got = got;
+      wasm.total = total;
+      wasm.done = total > 0 && got >= total;
+      renderDownloads();
     },
     setData(done, total) {
       if (gone) return;
+      data.done = done;
+      data.total = total;
+      data.known = true;
       dataEl.textContent = total > 0 ? `game data — ${done}/${total}` : '';
+      renderDownloads();
     },
     setStage(text) {
       if (gone) return;
+      staged = true;
       stageEl.textContent = text;
       barEl.classList.add('pulse');
     },

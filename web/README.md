@@ -158,7 +158,11 @@ public deployment belongs behind a login (`wenilla-realm`), not this host.
   cache them, up to 24 in flight; that wants HTTP/2 or 3, since a browser runs only six HTTP/1.1
   requests to a host at once. Without a version it fetches in batches (`POST /data/__batch`: one
   request for up to 64 files, streamed file by file); `createStore({ transport: 'batch' })` or
-  `'get'` forces either way. It
+  `'get'` forces either way. Its requests, and the client's own sound fetches
+  (`window.__wenilla_fetch`), run in a Worker (`web/networker.js`) that reads every body to the
+  end: a synchronous read blocks the page's thread, and the bodies it could not drain would fill
+  the shared HTTP/2 connection's window and starve that very read, freezing the tab. A page that
+  cannot start the Worker fetches on its own thread as before. It
   holds bytes fetched ahead in a bounded memory LRU, and keeps every file it fetched in the Cache
   API under the host's `__version`, so a second visit reads the disk and a changed install starts
   clean. Each locale's root keeps its own copy (see "Locales"). The client's synchronous reads (`Chain::read`, ~60 call sites) answer from that memory
