@@ -215,7 +215,7 @@ if (document.hidden) background.start();
 //
 // Desktop notifications for the things worth leaving another tab for, built on the event
 // stream. `enable()` must run from a user gesture (browsers gate the permission prompt on one);
-// the dev page's bell button calls it. Rules are plain data the page may edit or replace.
+// a page's own button calls it (the dev page has none). Rules are plain data the page may edit or replace.
 const notify = {
   enabled: false,
   /** Show even when the tab is visible and focused. */

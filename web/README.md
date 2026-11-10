@@ -136,13 +136,12 @@ public deployment belongs behind a login (`wenilla-realm`), not this host.
   (`sound::web_backend`). The output limiter and level meters do not see the music.
 - **Sound** starts on the first click or key in the page — browsers suspend every AudioContext
   until a user gesture; `index.html` resumes it then.
-- **Full screen** — the "full screen" button on both pages (`web/platform.js`) is not just
-  `requestFullscreen`: in full screen it also takes a Keyboard Lock on `Escape`, `Tab` and
-  `KeyW`, so Esc opens the game menu instead of leaving full screen, Tab cycles targets instead
-  of walking browser focus, and Ctrl+W doesn't close the tab mid-pull. Chrome then exits on a
-  *press-and-hold* of Esc (it says so once, in its own toast). The lock follows F11 and every
-  other way in or out too — it is driven by `fullscreenchange`, not by the button. Chromium
-  only; elsewhere the button is plain full screen.
+- **Full screen** — the dev page draws no button: F11 (or the browser's own menu) is the way in.
+  In full screen the page takes a Keyboard Lock on `Escape`, `Tab` and `KeyW`
+  (`web/platform.js`), so Esc opens the game menu instead of leaving full screen, Tab cycles
+  targets instead of walking browser focus, and Ctrl+W doesn't close the tab mid-pull. Chrome
+  then exits on a *press-and-hold* of Esc (it says so once, in its own toast). The lock is driven
+  by `fullscreenchange`, so it follows every way in or out. Chromium only.
 - **Persistence** — the state folder (`config.toml`, macros, key bindings, layouts, chat
   settings, saved variables, the remembered account name) lives in the browser's `localStorage`,
   one entry per file keyed by its path (`benilla:/benilla-config/config.toml`, …). Per browser
@@ -208,7 +207,7 @@ wenilla.on('PLAYER_LEVEL_UP', (args) => …)   // any FrameXML event, by name
 wenilla.hold('MOVEFORWARD'); wenilla.release('MOVEFORWARD'); wenilla.fire('JUMP')
 await wenilla.lua("return UnitName('target'), UnitHealth('target')")   // → ['Defias Thug', 61]
 wenilla.chat('/say hello'); wenilla.chat('/target Bob')
-wenilla.gamepad.start(); wenilla.notify.enable()   // the 🔔 button does the latter
+wenilla.gamepad.start(); wenilla.notify.enable()   // the latter from a user gesture
 ```
 
 `?bridge=hud` mounts `web/examples/hud.js` (self, zone, target, the nearest units with distance
@@ -334,8 +333,8 @@ On that, `wenilla.notify` shows desktop notifications for a rule set the page ma
 `PLAYER_REGEN_DISABLED` (30 s cooldown), `QUEST_COMPLETE`, plus whispers (from `chat`) and a
 disconnect (from `state`). They show only while the tab is hidden or unfocused
 (`wenilla.notify.always = true` overrides), collapse by `tag`, focus the tab on click, and
-badge the title. `enable()` asks the browser once and has to run from a user gesture — the
-🔔 button, on both pages. Notifications need a secure context, which WebGPU already requires.
+badge the title. `enable()` asks the browser once and has to run from a user gesture (the dev
+page draws no button for it; a hosting page may). Notifications need a secure context, which WebGPU already requires.
 
 ### Policy, hosting, limits
 
@@ -345,8 +344,7 @@ already synthesize key events on the canvas and edit the saved variables in `loc
 The bridge adds convenience, not reach. Whether *automation* is welcome on a realm is the
 operator's call: a hosting page opts a session out with `bridge: '0'` in `window.__wenilla_env`
 (read once at boot, and it beats any `?bridge=` a player passes; `?bridge=0` does the same for one
-session on either page). `wenilla-realm`'s play page loads `bridge.js` like the dev page does, 🔔
-included, and sets no `bridge` key: automation is on for every player until the operator adds
+session on either page). `wenilla-realm`'s play page loads `bridge.js` like the dev page does and sets no `bridge` key: automation is on for every player until the operator adds
 `bridge: '0'` to the `__wenilla_env` object `play.html` builds.
 
 Handlers run **synchronously on the single wasm thread**: keep `onFrame` cheap (the snapshot
