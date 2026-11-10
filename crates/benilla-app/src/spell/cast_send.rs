@@ -142,6 +142,8 @@ pub(crate) struct CastLadder<'w, 's> {
     ),
     /// The critter arm of the active-spell test; absent in a harness without the spell plugin.
     pub(crate) summons: Option<Res<'w, super::SummonSlots>>,
+    /// The area leg of the player's cast.
+    pub(crate) area_gate: crate::area::CastAreaGate<'w>,
 }
 
 /// What a targeting-cursor click bound: what the location bind or the target bind fills into the
@@ -564,6 +566,7 @@ impl CastLadder<'_, '_> {
             &mut self.trade_skill_opens,
             &mut self.ground,
             &mut self.held_for_pick,
+            &self.area_gate,
         );
     }
 }
@@ -625,6 +628,7 @@ fn send_spell_cast(
     trade_skill_opens: &mut crate::ui_tradeskill::TradeSkillOpens,
     ground: &mut super::targeting::SpellTargeting,
     held_for_pick: &mut HeldForPick,
+    area_gate: &crate::area::CastAreaGate,
 ) {
     let now = Instant::now();
     let def = spells.and_then(|s| s.catalog.get(spell_id));
@@ -1001,6 +1005,28 @@ fn send_spell_cast(
             _ => Vec::new(),
         },
     };
+    // The aura-spell legs: the caster's (`0x739650`), then a bound unit's (`0x803500`).
+    if let (Some(d), Some(sp)) = (def, spells) {
+        let target_auras = match target {
+            Some(guid) if ctx.self_guid == Some(guid) => ctx.self_auras,
+            Some(_) => ctx.target_auras,
+            None => None,
+        };
+        if let Some(reason) = validator::cast_aura_refusal(d, sp, ctx.self_auras, target_auras) {
+            debug!("ui_action: cast {spell_id} refused locally — an aura spell ({reason:#x})");
+            cast_errors.push_local(spell_id, reason);
+            return;
+        }
+    }
+    // The area leg (`0x739650`), after the form and aura-state legs.
+    if let Some((reason, area)) = def.and_then(|d| area_gate.refusal(d)) {
+        debug!("ui_action: cast {spell_id} refused locally — the area leg ({reason:#x})");
+        match area {
+            Some(area) => cast_errors.push_local_arg(spell_id, reason, area),
+            None => cast_errors.push_local(spell_id, reason),
+        }
+        return;
+    }
     // The deferred no-bind refusal: every rung passed and nothing bound.
     if let Some(reason) = deferred_refusal {
         debug!("ui_action: cast {spell_id} refused locally — the cast-arm tail ({reason:#x})");
@@ -1202,6 +1228,7 @@ mod tests {
             range: cast_target::RangeInputs::default(),
             main_hand_item: None,
             self_auras: None,
+            target_auras: None,
             self_move_flags: 0,
             auto_dismount: true,
             auto_stand: true,
