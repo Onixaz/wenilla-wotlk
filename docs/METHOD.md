@@ -99,7 +99,10 @@ crate of its own or a fork, and benilla opens a piece of itself to such a crate 
   file.
 - **The land gates**: `scripts/gates.sh`, the check's chain without the data and the player
   build, for a pull request from an external contributor; CI runs it on a fork's pull request. It
-  is memoized on the tree.
+  is memoized on the tree. It adds one gate the check does not run: `wasm-clocks`
+  (`scripts/wasm-lint.sh`), clippy on wasm32 refusing std's `Instant`, `SystemTime`, `sleep` and
+  `spawn`, which build there and panic on the page. CI runs it on every pull request (`check.yml`),
+  so it needs no local run.
 - **A clean run** is the fourth gate: `scripts/smoke.sh`, a live login and logout against the
   local server. For wire work the gate is a live run with a trace (`WOW_MOVE_TRACE=<path>`,
   tags filtered), never a capture: capture mode has no network.

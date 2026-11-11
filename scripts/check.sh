@@ -216,4 +216,4 @@ if in_scope benilla-worldview; then
 fi
 
 echo "CHECK GREEN (scope: $pkgs)"
-echo "  (it covers every gate of scripts/gates.sh, the chain an external contributor's pull request runs)"
+echo "  (it covers every gate of scripts/gates.sh but wasm-clocks, which CI runs on every pull request)"

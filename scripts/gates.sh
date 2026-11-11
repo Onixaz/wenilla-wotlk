@@ -2,7 +2,7 @@
 # The gate for a pull request from an external contributor: every gate in order, stopping at the
 # first failure.
 #
-# fmt, clippy, test, doc-links, pass-span-lint, enforcer-build, enforcer-no-install.
+# fmt, clippy, test, doc-links, pass-span-lint, wasm-clocks, enforcer-build, enforcer-no-install.
 # The chain is synthetic: it reads no WoW install and no addon corpus (`WOW_DATA=` and
 # `BENILLA_ADDON_CORPUS=`, set and empty), so it runs the same on a fresh clone, a CI runner and a
 # machine with the data.
@@ -123,6 +123,11 @@ run doc-links $python scripts/doc-links.py
 # pass-span-lint: refuses a second `pass_span` on a render pass whose span is still open, a fatal
 # wgpu validation error on Vulkan and a silent no-op on Metal and DX12, which no macOS run sees.
 run pass-span-lint $python scripts/pass-span-lint.py
+
+# wasm-clocks: refuses std's `Instant`, `SystemTime`, `thread::sleep` and `thread::spawn` in what
+# the browser build compiles, which build, pass every test here and panic on the page
+# (`scripts/wasm-lint.sh`). Needs the wasm toolchain, `scripts/web-setup.sh`.
+run wasm-clocks scripts/wasm-lint.sh
 
 # enforcer-no-install: `benilla-worldview` boots the engine plugins with no server, login, UI,
 # player or client data, in a small window, and refuses any system whose parameters need a resource
