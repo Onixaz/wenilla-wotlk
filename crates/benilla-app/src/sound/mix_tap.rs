@@ -117,7 +117,8 @@ impl Effect for Tap {
 }
 
 /// The writer half: drain the ring to the WAV, patching the header sizes each flush. Ends when
-/// the producer drops with the mixer at app exit.
+/// the producer drops with the mixer at app exit. Only the native [`install_at`] starts it.
+#[cfg_attr(target_arch = "wasm32", allow(clippy::disallowed_methods))]
 fn writer(mut file: std::fs::File, mut consumer: rtrb::Consumer<f32>, sample_rate: u32) {
     if let Err(e) = file.write_all(&wav_header(sample_rate, 0)) {
         warn!("mix tap: header write failed: {e}");

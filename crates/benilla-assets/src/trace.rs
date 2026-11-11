@@ -8,7 +8,7 @@
 use std::fs::File;
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use web_time::Instant;
 
 struct Sink {
     out: File,
@@ -24,8 +24,8 @@ fn sink() -> Option<&'static Mutex<Sink>> {
             .map_err(|e| eprintln!("dbg-trace: cannot create {path}: {e}"))
             .ok()?;
         // Wall time is `t0 + t`, which aligns the traces of two processes.
-        let t0_wall = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let t0_wall = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .map_or(0.0, |d| d.as_secs_f64());
         let _ = writeln!(out, "# t0={t0_wall:.3} (unix epoch seconds at t=0)");
         Some(Mutex::new(Sink {
