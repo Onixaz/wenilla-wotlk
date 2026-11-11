@@ -113,6 +113,18 @@ impl SkinComposites {
         })
     }
 
+    /// Whether [`Self::force`] for `key` would read the network on this thread: on the page, its
+    /// textures not landed yet, which this starts. A finished or running look reads nothing.
+    pub(super) fn waits_on_reads(
+        &self,
+        key: &SkinKey,
+        plan: impl FnOnce() -> Option<CompositePlan>,
+    ) -> bool {
+        !self.done.contains(key)
+            && !self.running.contains_key(key)
+            && plan().is_some_and(|p| !benilla_formats::web::ready(&p.paths()))
+    }
+
     /// [`Self::request`] over any work, so the lane is testable without the install.
     fn request_with(&mut self, key: SkinKey, work: impl FnOnce() -> Option<Work>) -> BodyAtlas {
         if let Some(done) = self.done.fetch(&key) {

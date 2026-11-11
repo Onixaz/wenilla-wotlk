@@ -78,7 +78,8 @@ fn every_page_script_that_lives_in_web_is_copied_into_dist() {
 #[test]
 fn the_pages_agree_on_the_platform_module() {
     // platform.js is best-effort by contract (see its header): a page must import it
-    // dynamically, so a missing or broken module costs the button and never the boot.
+    // dynamically, so a missing or broken module costs the full-screen key lock and never the
+    // boot. The page draws no button; the lock follows F11's full screen.
     for page in PAGES {
         let text = read(page);
         assert!(
@@ -87,8 +88,8 @@ fn the_pages_agree_on_the_platform_module() {
              able to break the boot"
         );
         assert!(
-            text.contains("id=\"fs\""),
-            "{page} imports platform.js but has no #fs button for installFullscreenToggle"
+            text.contains("installFullscreenToggle("),
+            "{page} imports platform.js but never installs the full-screen key lock"
         );
     }
 }

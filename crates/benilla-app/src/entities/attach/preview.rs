@@ -679,9 +679,19 @@ fn assemble(spec: &PreviewSpec, ctx: &mut PreviewCtx<'_, '_>) -> Option<Assemble
             &eg,
         )
     });
+    let skin_key = super::char_skin::skin_key(&char_look, bodyslots, spec.emblem, false);
+    if super::char_skin::forced_atlas_waits(
+        &char_look,
+        skin_key,
+        ctx.displays.as_deref(),
+        ctx.sections,
+        ctx.skin_composites,
+    ) {
+        return None; // the skin's textures are still landing: retry next frame
+    }
     let body_tex = super::char_skin::forced_body_atlas(
         &char_look,
-        super::char_skin::skin_key(&char_look, bodyslots, spec.emblem, false),
+        skin_key,
         ctx.displays.as_deref(),
         ctx.sections,
         ctx.skin_composites,

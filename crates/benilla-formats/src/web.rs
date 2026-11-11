@@ -74,6 +74,12 @@ pub fn prefetch_pinned(_names: &[String]) {}
 #[cfg(not(target_arch = "wasm32"))]
 pub fn fill_in_turn(_lists: Vec<(&'static str, Vec<String>)>) {}
 
+/// Download model trees to the page's persistent cache under `tag`: each model, then what its
+/// loader reads after it ([`crate::web_deps`]), not waiting for a quiet network and, while
+/// `first` says so, ahead of the fetches ahead already queued. Nothing off the page.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn fill_trees(_models: Vec<String>, _tag: &'static str, _first: fn() -> bool) {}
+
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use wasm_bindgen::JsValue;
@@ -225,9 +231,12 @@ mod wasm {
         load: js_sys::Function,
         prefetch: js_sys::Function,
         fill: Option<js_sys::Function>,
+        filled: Option<js_sys::Function>,
+        cached: Option<js_sys::Function>,
         ready: js_sys::Function,
         landed: js_sys::Function,
         drop_ahead: js_sys::Function,
+        query: Option<js_sys::Function>,
     }
 
     thread_local! {
@@ -266,9 +275,12 @@ mod wasm {
                     load: method("load")?,
                     prefetch: method("prefetch")?,
                     fill: method("fill"),
+                    filled: method("filled"),
+                    cached: method("cached"),
                     ready: method("ready")?,
                     landed: method("landed")?,
                     drop_ahead: method("dropAhead")?,
+                    query: method("query"),
                     obj,
                 })
             })
@@ -371,6 +383,81 @@ mod wasm {
         });
     }
 
+    /// How many names one [`fill_trees`] step hands the store: the `first` flag is read again at
+    /// each step, so a roster that arrives mid-walk moves the rest behind the queue.
+    const FILL_STEP: usize = 48;
+
+    /// Await a store method's promise; `None` when the page has no such method or it threw.
+    async fn store_call(
+        pick: impl FnOnce(&Store) -> Option<&js_sys::Function>,
+        a: &JsValue,
+        b: &JsValue,
+    ) -> Option<JsValue> {
+        use wasm_bindgen::JsCast;
+        let promise = with_store(|s| pick(s)?.call2(&s.obj, a, b).ok())
+            .flatten()?
+            .dyn_into::<js_sys::Promise>()
+            .ok()?;
+        wasm_bindgen_futures::JsFuture::from(promise).await.ok()
+    }
+
+    /// `fill` without waiting for a quiet network; whether it ran (a page with no persistent cache
+    /// does not).
+    async fn fill_now(names: &[String], tag: Option<&str>, first: bool) -> bool {
+        let arr: js_sys::Array = names.iter().map(|n| JsValue::from_str(n)).collect();
+        let opts = js_sys::Object::new();
+        if let Some(tag) = tag {
+            let _ = js_sys::Reflect::set(&opts, &"tag".into(), &tag.into());
+        }
+        let _ = js_sys::Reflect::set(&opts, &"idle".into(), &JsValue::FALSE);
+        let _ = js_sys::Reflect::set(&opts, &"first".into(), &JsValue::from_bool(first));
+        store_call(|s| s.fill.as_ref(), &arr, &opts)
+            .await
+            .is_some_and(|v| v.is_truthy())
+    }
+
+    /// See the native stub's doc.
+    pub fn fill_trees(models: Vec<String>, tag: &'static str, first: fn() -> bool) {
+        use wasm_bindgen::JsCast;
+        wasm_bindgen_futures::spawn_local(async move {
+            let done = store_call(|s| s.filled.as_ref(), &tag.into(), &JsValue::UNDEFINED).await;
+            if done.is_none_or(|v| v.is_truthy()) {
+                return; // finished for this install, or a page that cannot say
+            }
+            let mut seen = std::collections::HashSet::new();
+            let models: Vec<String> = models
+                .iter()
+                .map(|n| crate::web_deps::model_name(n))
+                .filter(|n| index_has(n) != Some(false) && seen.insert(super::index_key(n)))
+                .collect();
+            for step in models.chunks(FILL_STEP) {
+                if !fill_now(step, None, first()).await {
+                    return;
+                }
+            }
+            let mut leaves = Vec::new();
+            for model in &models {
+                let bytes = store_call(|s| s.cached.as_ref(), &model.into(), &JsValue::UNDEFINED)
+                    .await
+                    .and_then(|v| v.dyn_into::<js_sys::Uint8Array>().ok());
+                let Some(bytes) = bytes else { continue };
+                let d = crate::web_deps::deps(model, &bytes.to_vec());
+                leaves.extend(
+                    d.leaves.into_iter().filter(|n| {
+                        index_has(n) != Some(false) && seen.insert(super::index_key(n))
+                    }),
+                );
+            }
+            for step in leaves.chunks(FILL_STEP) {
+                fill_now(step, None, first()).await;
+            }
+            // Every name again under the tag: each on disk is skipped, a failed one is asked once
+            // more, and the tag is kept only when all of them landed.
+            let all: Vec<String> = models.into_iter().chain(leaves).collect();
+            fill_now(&all, Some(tag), false).await;
+        });
+    }
+
     /// Every name in the chain's index, as [`super::index_key`] spells them.
     pub fn index_names() -> Vec<String> {
         let _ = index_has(""); // the index is built by its first question
@@ -417,6 +504,14 @@ mod wasm {
         };
         let d = crate::web_deps::deps(&name, &bytes);
         ready(&d.leaves.into_iter().chain(d.parents).collect::<Vec<_>>())
+    }
+
+    /// What a blocking read's URL ends with: the store's `?v=<data version>`, which the host
+    /// answers `public` so a CDN keeps it, as it keeps the store's own fetches; else nothing.
+    pub fn version_query() -> String {
+        with_store(|s| s.query.as_ref()?.call0(&s.obj).ok()?.as_string())
+            .flatten()
+            .unwrap_or_default()
     }
 
     /// Whether the chain has `name`, from the shared name index: `None` when there is no index.
@@ -490,7 +585,7 @@ mod wasm {
 
 #[cfg(target_arch = "wasm32")]
 pub use wasm::{
-    data_base, drop_ahead, exists_sync, expand, fetch_sync, fill_in_turn, host_locales, index_has,
-    index_names, landed, load, prefetch_parents, prefetch_pinned, ready, ready_tree, resident,
-    trace,
+    data_base, drop_ahead, exists_sync, expand, fetch_sync, fill_in_turn, fill_trees, host_locales,
+    index_has, index_names, landed, load, prefetch_parents, prefetch_pinned, ready, ready_tree,
+    resident, trace, version_query,
 };

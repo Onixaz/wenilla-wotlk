@@ -454,9 +454,10 @@ impl Chain {
     /// spelled by its index key so every spelling of a name is one cache entry.
     fn url_for(&self, name: &str) -> String {
         format!(
-            "{}/{}",
+            "{}/{}{}",
             self.base,
-            crate::web::encode_name(&crate::web::index_key(name))
+            crate::web::encode_name(&crate::web::index_key(name)),
+            crate::web::version_query()
         )
     }
 

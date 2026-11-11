@@ -216,6 +216,7 @@ mod video;
 mod vplates;
 mod wdb;
 mod weapon_trail;
+mod web_glue_ahead;
 mod web_ui_preload;
 mod webbridge;
 /// The web build's env-var stand-in (a browser tab has no process environment) — see the
@@ -555,6 +556,14 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
         app.add_systems(
             Update,
             web_ui_preload::fill_ui_art_once.run_if(in_state(char_select::ClientState::InWorld)),
+        );
+        app.add_systems(
+            Update,
+            (
+                web_glue_ahead::fetch_create_set_once,
+                web_glue_ahead::follow_roster,
+            )
+                .run_if(not(in_state(char_select::ClientState::InWorld))),
         );
     }
 

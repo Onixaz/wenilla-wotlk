@@ -4,15 +4,6 @@
 <style>
   html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #000; }
   #benilla { display: block; width: 100vw; height: 100vh; }
-  /* Matches the realm page's #bar corner, so the two pages behave the same. */
-  #fs { position: fixed; top: 0; right: 0; z-index: 10; padding: .3rem .6rem; color: #ddd;
-        background: rgba(0,0,0,.55); border: 0; border-bottom-left-radius: 6px; cursor: pointer;
-        font: 12px system-ui, sans-serif; text-decoration: underline; }
-  /* The notifications bell (web/bridge.js `wenilla.notify`), left of the full-screen button. */
-  #bell { position: fixed; top: 0; right: 6.2rem; z-index: 10; padding: .2rem .5rem; color: #ddd;
-          background: rgba(0,0,0,.55); border: 0; border-bottom-left-radius: 6px; cursor: pointer;
-          font: 14px system-ui, sans-serif; opacity: .7; }
-  #bell.on { opacity: 1; }
 </style>
 <script>
   // Sound: the browser suspends any AudioContext created before the first user gesture (autoplay
@@ -66,8 +57,6 @@
     };
   }
 </script>
-<button type="button" id="fs" title="Full screen. Captures Esc, Tab and Ctrl+W for the game — press and hold Esc to leave.">full screen</button>
-<button type="button" id="bell" title="Desktop notifications while this tab is in the background: level-ups, death, whispers, invites, mail, combat. Asks the browser once.">🔔</button>
 <canvas id="benilla"></canvas>
 <script>
   // Dev page: allow `?user=&pass=&char=` links to log in. A hosting page that fetched the
@@ -80,37 +69,32 @@
   import { bind } from './wasi_stubs.js';
   import { boot } from './boot.js';
   // `boot(init)` is the loading overlay + parallel data prefetch (see boot.js's header); it calls
-  // `init()` with a byte-counted Response, and `init()` instantiates the wasm module, which runs
+  // `init()` with the compiled module, and `init()` instantiates the wasm module, which runs
   // `#[wasm_bindgen(start)] start()` as part of instantiation (`wenilla/src/lib.rs`) — that's the
   // whole boot, canvas included (`boot.rs` binds to `#benilla` by id, so no query/lookup belongs
   // here). `bind(w.memory)` comes AFTER on purpose: the wasm Lua VM's WASI shims
   // (`wasi_stubs.js`'s own header) can only zero a WASI caller's out-pointers once the module's
   // linear memory exists to write into, and `init()` is what creates it.
-  // Full-screen key capture (Esc/Tab/Ctrl+W reach the game) + durable settings storage. Same
+  // Full-screen key capture (Esc/Tab/Ctrl+W reach the game, in F11's full screen; the page draws
+  // no button of its own) + durable settings storage. Same
   // module and same contract as the realm page: dynamic, unawaited, and never load-bearing —
   // see web/platform.js. The dev page has no WebGPU gate to sit behind, so on a browser that
   // prompts for persistent storage (Firefox) this is where the player would see it.
   import('./platform.js')
     .then(({ installFullscreenToggle, requestPersistentStorage }) => {
       requestPersistentStorage();
-      installFullscreenToggle(document.getElementById('fs'), {
+      installFullscreenToggle(null, {
         focusTarget: document.getElementById('benilla'),
       });
     })
     .catch((e) => console.warn('platform.js:', e));
   // The JavaScript bridge (web/bridge.js, `window.wenilla` in the console): live game state
-  // out, commands in, the hidden-tab keepalive and desktop notifications. Same posture as
+  // out, commands in, the hidden-tab keepalive and desktop notifications (`wenilla.notify.enable()`
+  // from the console; the page draws no button). Same posture as
   // platform.js — dynamic, never load-bearing. `?bridge=hud` / `?bridge=idle` mount an example
   // from web/examples/ on top; `?bridge=0` turns the bridge off for the session (webbridge.rs).
   import('./bridge.js')
-    .then(({ wenilla }) => {
-      const bell = document.getElementById('bell');
-      const offTitle = bell.title; // captured before the first toggle, so it can come back
-      bell.addEventListener('click', async () => {
-        const on = wenilla.notify.enabled ? (wenilla.notify.disable(), false) : await wenilla.notify.enable();
-        bell.classList.toggle('on', on);
-        bell.title = on ? 'Notifications on — click to turn off.' : offTitle;
-      });
+    .then(() => {
       const example = new URLSearchParams(location.search).get('bridge');
       if (example && /^[a-z]+$/.test(example) && example !== '0') {
         import(`./examples/${example}.js`).catch((e) => console.warn(`examples/${example}.js:`, e));
