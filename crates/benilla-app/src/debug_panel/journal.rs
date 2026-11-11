@@ -80,7 +80,7 @@ pub(super) fn record_casts(
     let now = time.elapsed_secs_f64();
     for ev in casts.read() {
         match ev.kind {
-            CastEventKind::Start | CastEventKind::Go | CastEventKind::Fail => {
+            CastEventKind::Start | CastEventKind::Go | CastEventKind::Fail { .. } => {
                 // A caster despawned the same frame drops.
                 let Ok(&Guid(caster)) = guids.get(ev.entity) else {
                     continue;
@@ -113,7 +113,10 @@ pub(super) fn record_casts(
             }
             // Arrivals credit the newest launched row for the spell; a ground arrival counts, as
             // a pure dest cast has no other.
-            CastEventKind::Impact { .. } | CastEventKind::GroundImpact { .. } => {
+            CastEventKind::Impact { .. }
+            | CastEventKind::GroundImpact { .. }
+            | CastEventKind::AreaImpact { .. }
+            | CastEventKind::PointImpact { .. } => {
                 if let Some(row) = journal
                     .records
                     .iter_mut()

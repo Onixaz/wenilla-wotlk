@@ -563,6 +563,9 @@
 "DBFilesClient\\MovieVariation.dbc",
 "DBFilesClient\\MovieFileData.dbc",
 "DBFilesClient\\FileData.dbc",
-"DBFilesClient\\Resistances.dbc"
+"DBFilesClient\\Resistances.dbc",
+"DBFilesClient\\AreaGroup.dbc",
+"DBFilesClient\\PowerDisplay.dbc",
+"DBFilesClient\\SpellDifficulty.dbc"
 ]
 }

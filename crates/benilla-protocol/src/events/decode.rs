@@ -131,18 +131,30 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
                 CastOutcome::Ok => None,
                 CastOutcome::Failed { arg2, .. } => arg2,
             },
+            wire_reason: match outcome {
+                CastOutcome::Ok => None,
+                CastOutcome::Failed { wire, .. } => Some(wire),
+            },
         }],
         ServerPacket::PetSpells(spells) => vec![SessionEvent::PetSpells(Box::new(spells))],
         ServerPacket::PetMode(mode) => vec![SessionEvent::PetMode(mode)],
         ServerPacket::PetActionFeedback { reason, spell } => {
             vec![SessionEvent::PetActionFeedback { reason, spell }]
         }
-        ServerPacket::PetCastFailed { spell_id, outcome } => match outcome {
+        ServerPacket::PetCastFailed {
+            cast_count,
+            spell_id,
+            outcome,
+        } => match outcome {
             CastOutcome::Ok => Vec::new(),
-            CastOutcome::Failed { reason, arg, .. } => vec![SessionEvent::PetCastFailed {
+            CastOutcome::Failed {
+                reason, arg, wire, ..
+            } => vec![SessionEvent::PetCastFailed {
+                cast_count,
                 spell_id,
                 reason,
                 arg,
+                wire_reason: wire,
             }],
         },
         ServerPacket::PetTameFailure { reason } => vec![SessionEvent::PetTameFailure { reason }],
@@ -325,12 +337,19 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
                 reflects: s.reflects,
                 target: s.targets.unit_target,
                 go_target: s.targets.go_target,
+                target_mask: s.targets.mask,
+                src: s.targets.src.map(|d| [d.x, d.y, d.z]),
                 dest: s.targets.dest.map(|d| [d.x, d.y, d.z]),
-                ammo_display_id: s.ammo_display_id,
+                ammo: s.ammo,
                 // Against the resolved caster: a GameObject's own guid in slot 1 is not an item.
                 item_caster: (s.item_or_caster != caster).then_some(s.item_or_caster),
                 trajectory: s.trajectory,
                 dest_counter: s.dest_counter,
+                points: s
+                    .points
+                    .iter()
+                    .map(|(d, t)| ([d.x, d.y, d.z], *t))
+                    .collect(),
             }];
             events.extend(runes);
             events
@@ -349,12 +368,14 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             cast_count,
             spell_id,
             reason,
+            wire_reason,
         } => vec![SessionEvent::SpellFailed {
             other,
             caster,
             cast_count,
             spell_id,
             reason,
+            wire_reason,
         }],
         ServerPacket::CancelAutoRepeat { guid } => vec![SessionEvent::CancelAutoRepeat { guid }],
         ServerPacket::SpellCooldownList {

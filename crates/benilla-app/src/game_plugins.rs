@@ -172,6 +172,7 @@ impl PluginGroup for GamePlugins {
             .add(crate::video::VideoPlugin)
             // A CVar knob too, so before CvarPlugin for the same reason.
             .add(crate::realmlist::RealmlistPlugin)
+            .add(crate::fps_limit::FpsLimitPlugin)
             .add(crate::cvars::CvarPlugin)
             .add(crate::console::ConsolePlugin)
             .add(crate::bindings::BindingsPlugin)
@@ -625,6 +626,63 @@ pub(crate) mod schedule_tests {
         );
     }
 
+    /// Every kit play's node writer runs before the dress resolve, so a CharProc 17 item swap
+    /// dresses the frame its kit plays, a missile's targeting kit too (`0x702906`).
+    #[test]
+    fn every_kit_node_writer_runs_before_the_dress_resolve() {
+        let mut app = headless_client();
+        let writers = resource_writers::<bevy::ecs::message::Messages<crate::aura_visual::AuraProc>>(
+            &mut app, Update,
+        );
+        let c = census(&mut app, Update, SyncPoints::Declared);
+        if !type_names_available(&c) {
+            eprintln!("skipped: this build carries no system names");
+            return;
+        }
+        let keys = |name: &str| -> Vec<SystemKey> {
+            c.systems
+                .iter()
+                .filter(|(_, s)| s.name.ends_with(name))
+                .map(|(k, _)| *k)
+                .collect()
+        };
+        let resolve = keys("::resolve_equipment");
+        assert_eq!(resolve.len(), 1, "one dress resolve");
+        let mut after: HashMap<SystemKey, Vec<SystemKey>> = HashMap::new();
+        for (a, b) in &c.dependencies {
+            after.entry(*a).or_default().push(*b);
+        }
+        let reaches = |from: SystemKey| {
+            let (mut seen, mut stack) = (HashSet::new(), vec![from]);
+            while let Some(k) = stack.pop() {
+                if k == resolve[0] {
+                    return true;
+                }
+                if seen.insert(k) {
+                    stack.extend(after.get(&k).into_iter().flatten().copied());
+                }
+            }
+            false
+        };
+        let names: Vec<&str> = writers
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .filter(|n| n.contains("benilla_app::"))
+            .collect();
+        assert!(
+            names.iter().any(|n| n.ends_with("::move_missiles")),
+            "the missile flight plays a targeting kit: {names:?}"
+        );
+        for name in names {
+            for key in keys(name) {
+                assert!(
+                    reaches(key),
+                    "{name} writes kit nodes after the dress resolve"
+                );
+            }
+        }
+    }
+
     /// One row of the class table: the type's name for the message, and its `TypeId`.
     type ClassRow = (&'static str, fn() -> TypeId);
 
@@ -950,15 +1008,24 @@ pub(crate) mod schedule_tests {
     ///   `play_body_procs` reads `NetEntity` against `refresh_live_display`, which only swaps a
     ///   display; and `tick_shard_emitters` reads the terrain heightfield against
     ///   `rescatter_clutter`, as `move_missiles` does.
+    /// - The missile targeting kit's whole play (#1045) adds 5 and orders 15 away: `spawn_missiles`
+    ///   and `move_missiles` stow through `SheathRequest` against `drain_death`,
+    ///   `commit_item_cast_on_pick`, `drain_go_openers` and `drain_bind_on_use_confirms`, as
+    ///   `arm_aura_state_fx` does; the aura node layer and the kit shakes now run after the visuals
+    ///   set.
     /// - `record_spells_in_transit` reads a caster's place against `publish_camera_pose` (+1): a
     ///   frame's lag does not move a landing time that matters.
     /// - `target::scan::remember_last_enemy` reads `Player` for the auto-dismount check (`0x71b0c0`)
     ///   against six writers (+6): a mover's flags a frame late only delay a sampled stamp.
     /// - The cast attempt's area leg reads `CurrentArea` against `update_current_area` from each
     ///   `CastLadder` drain (+9): a press reads the area under the player a frame late at worst.
+    /// - The display swap's carry (#1043) adds 3 net: `refresh_live_display` reads the swapped
+    ///   unit's `AnimationPlayer` for its dying anim's progress against `apply_aura_anim_rate`,
+    ///   `drive_go_anim`, `drive_booth_turn`, `pose_markers` and `sync_tiles`, which pause or pose
+    ///   clocks; it reads one torn-down unit's clip time, a frame's step either way.
     // The realm entry latch precedes UiFeed and the logout probe, ordering 54 roster/UI pairs.
     // The corpse resolver (#636) follows the transport chain inside UiFeed, ordering 63 more.
-    const UPDATE_ACTIONABLE_CEILING: usize = 3_888;
+    const UPDATE_ACTIONABLE_CEILING: usize = 3_891;
     const UPDATE_ACTIONABLE_SLACK: usize = 40;
 
     fn ratchet(what: &str, n: usize, ceiling: usize, slack: usize) {
@@ -1048,6 +1115,126 @@ pub(crate) mod schedule_tests {
             POST_UPDATE_CEILING,
             POST_UPDATE_SLACK,
         );
+    }
+
+    /// The main-world schedules an in-world frame passes through.
+    fn frame_censuses(app: &mut App) -> Vec<(&'static str, Census)> {
+        let mut out = Vec::new();
+        macro_rules! take {
+            ($($label:ident),*) => {$(
+                out.push((stringify!($label), census(app, $label, SyncPoints::Built)));
+            )*};
+        }
+        // `Update` first: its systems register the resources every census's classes read.
+        take!(Update, PostUpdate, PreUpdate, First, RunFixedMainLoop, Last);
+        out
+    }
+
+    /// Is this run condition only a coarse phase check, true on every frame of the phase it names?
+    /// A system behind nothing else still runs on every in-world frame.
+    fn is_phase_condition(name: &str) -> bool {
+        [
+            "in_state<",
+            "resource_exists<",
+            "ingame_ui_up",
+            "world_is_live",
+            "world_audio_live",
+        ]
+        .iter()
+        .any(|phase| name.contains(phase))
+    }
+
+    /// One schedule's systems as the frame floor counts them: every system, then those that run on
+    /// every in-world frame, meaning no run condition beyond a coarse phase check on it or its sets.
+    fn frame_floor(census: &Census) -> (usize, usize) {
+        let mut systems = 0;
+        let mut every_frame = 0;
+        for info in census.systems.values() {
+            if is_sync_point(&info.name) {
+                continue;
+            }
+            systems += 1;
+            if info.conditions.iter().all(|c| is_phase_condition(c)) {
+                every_frame += 1;
+            }
+        }
+        (systems, every_frame)
+    }
+
+    /// The frame floor (#543): what the main world schedules every in-world frame, per schedule.
+    /// Each system costs its dispatch and parameter fetch even with nothing to do, about a
+    /// microsecond apiece, so the count is a frame-time cost in its own right. `every_frame` is the
+    /// number that matters: a system with a real trigger in its run condition skips on quiet frames.
+    // The stock CVar frame limiter adds its change observer to `Update` (four dispatch entries
+    // in Bevy's observer graph) and its mandatory once-per-frame deadline sleeper to `Last`.
+    // Both are intentional: the observer reacts only to CVar changes, while the limiter must run
+    // every frame to enforce the reference client's sleep-based cap.
+    const FRAME_FLOOR: &[(&str, usize, usize)] = &[
+        ("Update", 745, 737),
+        ("PostUpdate", 183, 142),
+        ("PreUpdate", 60, 60),
+        ("First", 11, 8),
+        ("RunFixedMainLoop", 7, 7),
+        ("Last", 32, 27),
+    ];
+    /// How far a count may sit under its ceiling before the ceiling must come down with it.
+    const FRAME_FLOOR_SLACK: usize = 8;
+
+    /// The gate on the frame floor: a new per-frame system fails here until it has a real trigger
+    /// in its run condition (`on_message`, `resource_changed`, a set gated on one) or replaces one.
+    #[test]
+    fn the_frame_runs_no_more_systems_than_the_ceilings_say() {
+        let mut app = headless_client();
+        let censuses = frame_censuses(&mut app);
+        if !type_names_available(&censuses[0].1) {
+            eprintln!("skipped: this build carries no system names");
+            return;
+        }
+        let dump = std::env::var_os("WOW_FRAME_FLOOR_DUMP").is_some();
+        let mut failures = Vec::new();
+        for ((name, census), (ceiling_name, systems_ceiling, every_ceiling)) in
+            censuses.iter().zip(FRAME_FLOOR)
+        {
+            assert_eq!(
+                name, ceiling_name,
+                "FRAME_FLOOR lists the schedules in order"
+            );
+            let (systems, every_frame) = frame_floor(census);
+            eprintln!(
+                "{name}: {systems} systems (ceiling {systems_ceiling}), {every_frame} every frame \
+                 (ceiling {every_ceiling})"
+            );
+            if dump {
+                let mut rows: Vec<_> = census
+                    .systems
+                    .values()
+                    .filter(|s| !is_sync_point(&s.name))
+                    .map(|s| format!("  {name} {} [{}]", s.name, s.conditions.join(", ")))
+                    .collect();
+                rows.sort();
+                rows.iter().for_each(|r| eprintln!("{r}"));
+            }
+            for (what, n, ceiling) in [
+                ("systems", systems, *systems_ceiling),
+                ("every-frame systems", every_frame, *every_ceiling),
+            ] {
+                if n > ceiling {
+                    failures.push(format!(
+                        "{name} has {n} {what}; the ceiling is {ceiling}. A system that runs every \
+                         frame costs every frame whether or not it has work: give it a run \
+                         condition on what it reacts to (`on_message`, `resource_changed`, a gated \
+                         set), fold it into a system that already runs, or raise the ceiling here \
+                         with the measured reason. `WOW_FRAME_FLOOR_DUMP=1` lists them."
+                    ));
+                } else if n + FRAME_FLOOR_SLACK < ceiling {
+                    failures.push(format!(
+                        "{name} has {n} {what} and the ceiling still says {ceiling}. Lower the \
+                         ceiling to {n} so it keeps ratcheting."
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// The `ApplyDeferred` the build inserts between a system with commands and its dependents.
