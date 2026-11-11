@@ -10,7 +10,7 @@ use super::clock::main_thread_cpu_secs;
 #[derive(Resource, Default)]
 pub(crate) struct MainThreadSplit {
     at_first: Option<f64>,
-    wall_at_first: Option<std::time::Instant>,
+    wall_at_first: Option<bevy::platform::time::Instant>,
     /// Sum of per-frame main-thread CPU inside `First..Last`, seconds, and the frames summed.
     pub inside_secs: f64,
     /// Sum of the wall clock over the same span, seconds.
@@ -39,7 +39,7 @@ impl MainThreadSplit {
 
 fn stamp_first(_pin: bevy::ecs::system::NonSendMarker, mut split: ResMut<MainThreadSplit>) {
     split.at_first = main_thread_cpu_secs();
-    split.wall_at_first = Some(std::time::Instant::now());
+    split.wall_at_first = Some(bevy::platform::time::Instant::now());
 }
 
 fn stamp_last(_pin: bevy::ecs::system::NonSendMarker, mut split: ResMut<MainThreadSplit>) {

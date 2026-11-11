@@ -1,6 +1,9 @@
 //! The graphics CVar frame limiter (12340, 0x6836d0): one sleep per frame, no spin wait.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// Bevy's `Instant`, not std's: std's panics on wasm32.
+use bevy::platform::time::Instant;
 
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
@@ -96,9 +99,14 @@ fn limit_frame(
         return;
     };
     let wait = deadline.remaining(Instant::now());
+    // Deviation, on the page alone: the browser paces the frame by its own animation callback
+    // and its main thread cannot sleep (std's sleep panics on wasm32), so the cap holds nothing.
+    #[cfg(not(target_arch = "wasm32"))]
     if !wait.is_zero() {
         std::thread::sleep(wait);
     }
+    #[cfg(target_arch = "wasm32")]
+    let _ = wait;
     deadline.advance(Instant::now(), interval);
 }
 

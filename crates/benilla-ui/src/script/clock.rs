@@ -21,7 +21,7 @@ impl super::UiScript {
     pub fn set_now(&mut self, secs: f64) {
         set_field!(self, now, secs);
         let model = self.model_ref();
-        model.clock_wall.set(std::time::Instant::now());
+        model.clock_wall.set(web_time::Instant::now());
         model.clock_floor.set(0.0);
     }
 

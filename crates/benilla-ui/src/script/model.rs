@@ -1,6 +1,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+// `web-time`'s `Instant`: std's re-export on native; std's own panics on wasm32.
+use web_time::Instant;
 
 use crate::layout::{LayoutInput, LayoutSolver, Rect};
 use crate::widget::{FrameHandle, RegionHandle, WidgetArena};
