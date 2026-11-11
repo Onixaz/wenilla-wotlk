@@ -128,3 +128,24 @@ serve what they ask for.
   does not serve falls through to the next of those, not to the next folder in the table. The
   in-game `locale` setting saves that choice and offers a page reload, the web's restart
   (`crates/benilla-app/src/webprogress.rs`, `web/boot.js`).
+
+## DBC tables
+
+Of the 241 tables 12340 loads (`reference/3.3.5a-dbc.tsv`), the ones benilla does not read on
+purpose because nothing in 12340 makes them matter. Most are loaded at startup and never read
+again, so leaving them out matches 12340. Unread tables that are open work are listed with their
+issues in `NOT_READ` (`crates/benilla-formats/tests/dbc_coverage.rs`), not here.
+
+| Table | Why |
+|---|---|
+| `AttackAnimKits` | 12340 loads it and never reads it |
+| `AttackAnimTypes` | 12340 loads it and never reads it |
+| `CreatureSpellData` | 12340 loads it and never reads it |
+| `gtOCTRegenMP` | 12340 loads it as game table 8 and never evaluates that slot |
+| `ItemCondExtCosts` | 12340 loads it and never reads it |
+| `SheatheSoundLookups` | 12340 loads it and never reads it |
+| `SoundEmitters` | 12340 loads it and never reads it |
+| `SoundSamplePreferences` | 12340 loads it and never reads it |
+| `SoundWaterType` | 12340 loads it and never reads it |
+| `UISoundLookups` | 12340 loads it and never reads it |
+| `WorldSafeLocs` | read only by the admin `worldport` console command (`0x407210`), not planned (#1119); the graveyard branch of `GetMapLandmarkInfo` (`0x545a30`) never runs, since the landmark builder (`0x546310`) never sets its flag |

@@ -187,6 +187,89 @@ fn the_dest_attachment_reads_the_table_or_the_column_itself() {
     assert_eq!(raw.missile_dest_attachment(), Some(0x22), "the id itself");
 }
 
+/// A unit reads index 13 as its held weapon, falling back to table slot 4; the raw flag, the
+/// -1 and the missile's own aim do not.
+#[test]
+fn index_13_is_the_held_weapon_for_a_unit_effect() {
+    let weapon = VisualStages {
+        missile_attach: 13,
+        missile_source_attach: 13,
+        ..Default::default()
+    };
+    assert_eq!(
+        weapon.missile_source_attachment(),
+        Some(EffectAttach::HeldWeapon)
+    );
+    assert_eq!(
+        weapon.beam_impact_attachment(),
+        Some(EffectAttach::HeldWeapon)
+    );
+    assert_eq!(
+        EffectAttach::HeldWeapon.tag(),
+        0x16,
+        "slot 4, the right spell hand"
+    );
+    assert_eq!(
+        weapon.missile_dest_attachment(),
+        Some(0x16),
+        "the missile's aim reads the table"
+    );
+    let raw = VisualStages {
+        missile_source_attach: 13,
+        flags: FLAG_DEST_ATTACH_IS_ID,
+        ..Default::default()
+    };
+    assert_eq!(
+        raw.missile_source_attachment(),
+        Some(EffectAttach::Point(13))
+    );
+    let hand = VisualStages {
+        missile_source_attach: 4,
+        ..Default::default()
+    };
+    assert_eq!(
+        hand.missile_source_attachment(),
+        Some(EffectAttach::Point(0x16))
+    );
+    let none = VisualStages {
+        missile_source_attach: u32::MAX,
+        ..Default::default()
+    };
+    assert_eq!(none.missile_source_attachment(), None);
+}
+
+#[test]
+fn the_precast_missile_attachment_needs_the_flag_and_column_16() {
+    let held = |flags, source| VisualStages {
+        flags,
+        missile_source_attach: source,
+        ..Default::default()
+    };
+    assert_eq!(held(0, 3).precast_missile_attachment(), None, "no flag");
+    assert!(!held(0, 3).holds_precast_missile());
+    assert_eq!(
+        held(FLAG_PRECAST_MISSILE, u32::MAX).precast_missile_attachment(),
+        None,
+        "column 16's -1"
+    );
+    assert!(held(FLAG_PRECAST_MISSILE, u32::MAX).holds_precast_missile());
+    assert_eq!(
+        held(FLAG_PRECAST_MISSILE, 3).precast_missile_attachment(),
+        Some(0x15),
+        "an index reads the table"
+    );
+    assert_eq!(
+        held(FLAG_PRECAST_MISSILE | FLAG_DEST_ATTACH_IS_ID, 3).precast_missile_attachment(),
+        Some(3),
+        "flag 0x200 reads the id itself"
+    );
+    assert_eq!(
+        held(FLAG_PRECAST_MISSILE, 13).precast_missile_attachment(),
+        Some(MISSILE_ATTACH_TABLE[4]),
+        "index 13 tests and holds at slot 4's attachment (0x71a7f0)"
+    );
+}
+
 #[test]
 fn kit_effect_slots_pair_with_their_attach_tags() {
     let kit = VisualKit {
@@ -795,6 +878,21 @@ fn a_zero_duration_trail_proc_is_no_trail() {
         params: [16_263_465.0, 20.0, 0.0, 100.0],
     };
     assert!(proc.as_weapon_trail().is_none());
+}
+
+/// The type-17 arm reads `CharParamOne` truncated; id 0 and other types swap nothing.
+#[test]
+fn an_item_swap_proc_reads_param_one() {
+    let swap = |ty, one| CharProc {
+        ty,
+        params: [0.0, one, 0.0, 0.0],
+    };
+    assert_eq!(
+        swap(char_proc_type::ITEM_SWAP, 33292.9).as_item_swap(),
+        Some(33292)
+    );
+    assert_eq!(swap(char_proc_type::ITEM_SWAP, 0.0).as_item_swap(), None);
+    assert_eq!(swap(char_proc_type::ALPHA, 33292.0).as_item_swap(), None);
 }
 
 #[test]

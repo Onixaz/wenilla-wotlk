@@ -790,7 +790,7 @@ pub(super) fn drain_chat_input(
                             anim_id: anim as u16,
                             seq: play_seq.next(),
                             via_player: false,
-                            remap_special: true,
+                            play: Default::default(),
                         });
                     }
                 }
@@ -855,6 +855,7 @@ pub(super) fn drain_chat_input(
                             entity,
                             spell_id,
                             kind,
+                            cast_count: 0,
                             seq: play_seq.next(),
                         });
                         // A selected caster's GO hits us, so a missile flies end to end; a
@@ -868,12 +869,16 @@ pub(super) fn drain_chat_input(
                             });
                             if let Some(dest) = dest {
                                 go_targets.write(crate::creature_anim::SpellGoTargets {
+                                    list: Vec::new(),
+                                    target_mask: 0x40,
+                                    src: None,
                                     caster: entity,
                                     spell_id,
                                     hits: Vec::new(),
                                     misses: Vec::new(),
                                     dest,
-                                    ammo_display_id: None,
+                                    points: Vec::new(),
+                                    ammo: None,
                                     seq: play_seq.next(),
                                     trajectory: None,
                                     reflected: 0,
@@ -883,14 +888,21 @@ pub(super) fn drain_chat_input(
                                 });
                             } else if let Some(me) = me.filter(|&m| m != entity) {
                                 go_targets.write(crate::creature_anim::SpellGoTargets {
+                                    list: Vec::new(),
+                                    target_mask: 0x2,
+                                    src: None,
                                     caster: entity,
                                     spell_id,
                                     hits: vec![me],
                                     misses: Vec::new(),
                                     dest: None,
+                                    points: Vec::new(),
                                     // A real GO carries the caster's ammo; this flies the
                                     // Rough Arrow, display id 5996.
-                                    ammo_display_id: Some(5996),
+                                    ammo: Some(crate::creature_anim::ItemModel {
+                                        display_id: 5996,
+                                        inventory_type: 24,
+                                    }),
                                     seq: play_seq.next(),
                                     trajectory: None,
                                     reflected: 0,

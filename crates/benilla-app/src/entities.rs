@@ -76,7 +76,6 @@ pub(crate) use collision_height::CollisionHeight;
 
 /// Spell missiles: the projectile a cast with a `Spell.dbc` Speed above 0 flies at each target.
 mod missile;
-pub(crate) use missile::MissileShape;
 pub(crate) use missile::{
     aim_launch_pos, AttachPosQuery, MissileMiss, MissileSound, PendingMissiles,
 };
@@ -84,6 +83,7 @@ use missile::{
     attach_missile_models, mark_forced_missiles, move_missiles, run_missile_motion, spawn_missiles,
     MissileMotion, MotionScripts,
 };
+pub(crate) use missile::{deck_place, DeckPoint, ListedUnit, MissileShape, TargetList};
 
 /// A WMO-display GameObject's doodad props (a ship's sails), parented under it to ride a transport.
 mod wmo_props;
@@ -710,11 +710,8 @@ impl Plugin for EntitiesPlugin {
         .add_systems(
             Update,
             (
-                // Equipment resolution creates the item display entries built the same frame.
-                // The nested tuples are unordered groups: the outer tuple is at `chain()`'s
-                // 20-element ceiling.
-                (resolve_equipment, resolve_corpse_equipment),
-                // Spell effects and missiles create `SpellFx` entries too.
+                // Spell effects and missiles create `SpellFx` entries. The nested tuples are
+                // unordered groups: the outer tuple is at `chain()`'s 20-element ceiling.
                 resolve_spell_fx,
                 (
                     run_missile_motion.run_if(any_with_component::<MissileMotion>),
@@ -722,6 +719,9 @@ impl Plugin for EntitiesPlugin {
                 )
                     .chain(),
                 (spawn_missiles, mark_forced_missiles).chain(),
+                // Equipment resolution creates the item display entries built the same frame,
+                // after the missiles, whose targeting kits' item swaps it dresses that frame.
+                (resolve_equipment, resolve_corpse_equipment),
                 // The dest-anchored lane's three independent producers also create entries.
                 (
                     (record_spells_in_transit, arm_ground_effects).chain(),
@@ -831,6 +831,8 @@ impl Plugin for EntitiesPlugin {
             )
                 .chain()
                 .after(apply_unit_mat_alpha)
+                // A missile's targeting kit plays and clears its procs in the visuals set.
+                .after(EntityVisualsSet)
                 .before(crate::player::apply_self_model_fade),
         );
     }

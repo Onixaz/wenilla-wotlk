@@ -25,6 +25,8 @@ pub enum CastOutcome {
         /// The second word (`0x808200`): the count `NEED_MORE_ITEMS` asks for, the skill value
         /// `MIN_SKILL` needs.
         arg2: Option<u32>,
+        /// The reason byte as sent, which the end-cast tests raw (`0x7feeb0`).
+        wire: u8,
     },
 }
 
@@ -256,13 +258,19 @@ const SHARED_CAST_FAIL_UNKNOWN: u8 = 0x91;
 pub(super) fn read_cast_result(r: &mut &[u8]) -> io::Result<(u8, u32, CastOutcome)> {
     let cast_count = read_u8(r)?;
     let spell_id = read_u32_le(r)?;
-    let reason = wotlk_cast_fail_shared(read_u8(r)?);
+    let wire = read_u8(r)?;
+    let reason = wotlk_cast_fail_shared(wire);
     let arg = (r.len() >= 4).then(|| read_u32_le(r)).transpose()?;
     let arg2 = (r.len() >= 4).then(|| read_u32_le(r)).transpose()?;
     Ok((
         cast_count,
         spell_id,
-        CastOutcome::Failed { reason, arg, arg2 },
+        CastOutcome::Failed {
+            reason,
+            arg,
+            arg2,
+            wire,
+        },
     ))
 }
 
@@ -302,6 +310,9 @@ pub struct SpellCastTargets {
     pub unit_target: Option<u64>,
     /// The `TARGET_FLAG_GAMEOBJECT` target, such as the chest an open-lock cast opens.
     pub go_target: Option<u64>,
+    /// The source point (`TARGET_FLAG_SOURCE_LOCATION`), which a source-only missile aims at
+    /// (`0x7334e5`).
+    pub src: Option<Vector3d>,
     pub dest: Option<Vector3d>,
 }
 
@@ -321,10 +332,12 @@ fn read_spell_cast_targets(r: &mut impl Read) -> io::Result<SpellCastTargets> {
     if mask & (TARGET_FLAG_ITEM | TARGET_FLAG_TRADE_ITEM) != 0 {
         let _item_guid = read_packed_guid(r)?;
     }
-    if mask & TARGET_FLAG_SOURCE_LOCATION != 0 {
+    let src = if mask & TARGET_FLAG_SOURCE_LOCATION != 0 {
         let _transport = read_packed_guid(r)?;
-        let _src = Vector3d::read(r)?;
-    }
+        Some(Vector3d::read(r)?)
+    } else {
+        None
+    };
     let dest = if mask & TARGET_FLAG_DEST_LOCATION != 0 {
         let _transport = read_packed_guid(r)?;
         Some(Vector3d::read(r)?)
@@ -338,6 +351,7 @@ fn read_spell_cast_targets(r: &mut impl Read) -> io::Result<SpellCastTargets> {
         mask,
         unit_target,
         go_target,
+        src,
         dest,
     })
 }
@@ -350,11 +364,9 @@ const CAST_FLAG_VISUAL_CHAIN: u32 = 0x8_0000;
 const CAST_FLAG_RUNE_LIST: u32 = 0x20_0000;
 const CAST_FLAG_IMMUNITY: u32 = 0x400_0000;
 
-/// Read the ammo block: `u32 displayId`, `u32 inventoryType` (dropped).
-fn read_ammo(r: &mut impl Read) -> io::Result<u32> {
-    let display_id = read_u32_le(r)?;
-    let _inventory_type = read_u32_le(r)?;
-    Ok(display_id)
+/// Read the ammo block: `u32 displayId`, `u32 inventoryType`.
+fn read_ammo(r: &mut impl Read) -> io::Result<(u32, u32)> {
+    Ok((read_u32_le(r)?, read_u32_le(r)?))
 }
 
 /// A cast's rune block: the caster's ready-rune masks before and after the cast, and for each of
@@ -424,7 +436,7 @@ pub(super) fn read_spell_start(r: &mut impl Read) -> io::Result<SpellStart> {
         None
     };
     let ammo_display_id = if cast_flags & CAST_FLAG_AMMO != 0 {
-        Some(read_ammo(r)?)
+        Some(read_ammo(r)?.0)
     } else {
         None
     };
@@ -468,7 +480,8 @@ pub struct SpellGo {
     /// `(guid, outcome)` of each reflect miss, the reflected spell's result on the caster.
     pub reflects: Vec<(u64, u8)>,
     pub targets: SpellCastTargets,
-    pub ammo_display_id: Option<u32>,
+    /// The ammo block, `(displayId, inventoryType)`: the ammo a missile flies (`0x733820`).
+    pub ammo: Option<(u32, u32)>,
     /// The `CAST_FLAG_RUNE_LIST` block.
     pub runes: Option<CastRunes>,
     /// The `CAST_FLAG_ADJUST_MISSILE` pair, `(elevation, delay ms)`: a trajectory missile's launch
@@ -477,6 +490,8 @@ pub struct SpellGo {
     /// A dest-targeted GO's cast counter (`0x80e42a`), 0 for none; a nonzero one is recorded
     /// against the caster so its [`DestLocSpellCast`] does not play again.
     pub dest_counter: u8,
+    /// The extra target points (`0x80e44f`), each with its transport guid or 0.
+    pub points: Vec<(Vector3d, u64)>,
 }
 
 /// `SMSG_NOTIFY_DEST_LOC_SPELL_CAST` (`0x810050`): a dest-location cast whose caster this client
@@ -571,7 +586,7 @@ pub(super) fn read_spell_go(r: &mut impl Read) -> io::Result<SpellGo> {
     } else {
         None
     };
-    let ammo_display_id = if cast_flags & CAST_FLAG_AMMO != 0 {
+    let ammo = if cast_flags & CAST_FLAG_AMMO != 0 {
         Some(read_ammo(r)?)
     } else {
         None
@@ -585,11 +600,12 @@ pub(super) fn read_spell_go(r: &mut impl Read) -> io::Result<SpellGo> {
     } else {
         0
     };
+    let mut points = Vec::new();
     if targets.mask & TARGET_FLAG_EXTRA_TARGETS != 0 {
         // `u32` count of a point and a raw guid each; unbounded, so nothing is pre-allocated.
         for _ in 0..read_u32_le(r)? {
-            let _point = Vector3d::read(r)?;
-            let _guid = read_u64_le(r)?;
+            let point = Vector3d::read(r)?;
+            points.push((point, read_u64_le(r)?));
         }
     }
     Ok(SpellGo {
@@ -603,22 +619,29 @@ pub(super) fn read_spell_go(r: &mut impl Read) -> io::Result<SpellGo> {
         misses,
         reflects,
         targets,
-        ammo_display_id,
+        ammo,
         runes,
         trajectory,
         dest_counter,
+        points,
     })
 }
 
 /// Read `SMSG_SPELL_FAILURE` or `SMSG_SPELL_FAILED_OTHER` as their 12340 handlers do
 /// (`0x809c70`, `0x806ad0`): packed caster, `u8 castCount`, `u32 spell`, `u8 reason`, the reason
-/// returned in the shared numbering.
-pub(super) fn read_spell_failed(r: &mut &[u8]) -> io::Result<(u64, u8, u32, u8)> {
+/// returned in the shared numbering and as sent.
+pub(super) fn read_spell_failed(r: &mut &[u8]) -> io::Result<(u64, u8, u32, u8, u8)> {
     let caster = read_packed_guid(r)?;
     let cast_count = read_u8(r)?;
     let spell_id = read_u32_le(r)?;
-    let reason = wotlk_cast_fail_shared(read_u8(r)?);
-    Ok((caster, cast_count, spell_id, reason))
+    let wire = read_u8(r)?;
+    Ok((
+        caster,
+        cast_count,
+        spell_id,
+        wotlk_cast_fail_shared(wire),
+        wire,
+    ))
 }
 
 /// Read `SMSG_SPELL_DELAYED` (`0x801b80`): packed caster, `u32` pushback ms.
@@ -1040,11 +1063,17 @@ mod tests {
         // Count 5, Lesser Heal, wire 0x28 INTERRUPTED: shared 0x23.
         let body = [0x01, 0x10, 5, 0x02, 0x08, 0, 0, 0x28];
         let mut r = &body[..];
-        let (caster, count, spell, reason) = read_spell_failed(&mut r).unwrap();
+        let (caster, count, spell, reason, wire) = read_spell_failed(&mut r).unwrap();
         assert!(r.is_empty());
-        assert_eq!((caster, count, spell), (0x10, 5, 2050));
+        assert_eq!((caster, count, spell, wire), (0x10, 5, 2050, 0x28));
         assert_eq!(WOTLK_CAST_FAIL_KEYS[0x28], "SPELL_FAILED_INTERRUPTED");
         assert_eq!(reason, wotlk_cast_fail_shared(0x28));
+        // Wires 187 and 188 share `SPELL_FAILED_UNKNOWN`; the raw byte tells them apart.
+        for wire_in in [187u8, 188] {
+            let body = [0x01, 0x10, 5, 0x02, 0x08, 0, 0, wire_in];
+            let (.., reason, wire) = read_spell_failed(&mut &body[..]).unwrap();
+            assert_eq!((reason, wire), (0x91, wire_in));
+        }
 
         let body = [0x01, 0x10, 0xf4, 0x01, 0, 0];
         assert_eq!(read_spell_delayed(&mut &body[..]).unwrap(), (0x10, 500));
@@ -1062,23 +1091,34 @@ mod tests {
         // count 9, Raptor Strike, wire 0x0c BAD_TARGETS (AzerothCore, no target): shared 0x0a.
         let body = [9, 0x9d, 0x0b, 0, 0, 0x0c];
         let mut r = &body[..];
-        let failed = |reason, arg, arg2| CastOutcome::Failed { reason, arg, arg2 };
+        let failed = |reason, arg, arg2, wire| CastOutcome::Failed {
+            reason,
+            arg,
+            arg2,
+            wire,
+        };
         assert_eq!(
             read_cast_result(&mut r).unwrap(),
-            (9, 2973, failed(0x0a, None, None))
+            (9, 2973, failed(0x0a, None, None, 0x0c))
         );
         assert!(r.is_empty());
         // Wire 0x66 REQUIRES_SPELL_FOCUS with its focus id: shared 0x5e.
         let body = [9, 133, 0, 0, 0, 0x66, 3, 0, 0, 0];
         assert_eq!(
             read_cast_result(&mut &body[..]).unwrap(),
-            (9, 133, failed(0x5e, Some(3), None))
+            (9, 133, failed(0x5e, Some(3), None, 0x66))
         );
         // Wire 55 NEED_MORE_ITEMS for Prospecting 31252: five Copper Ore (2770), shared 0x97.
         let body = [9, 0x14, 0x7a, 0, 0, 55, 0xd2, 0x0a, 0, 0, 5, 0, 0, 0];
         assert_eq!(
             read_cast_result(&mut &body[..]).unwrap(),
-            (9, 31252, failed(0x97, Some(2770), Some(5)))
+            (9, 31252, failed(0x97, Some(2770), Some(5), 55))
+        );
+        // Wire 188, past the 12340 table: shared `SPELL_FAILED_UNKNOWN`, the byte kept as sent.
+        let body = [9, 133, 0, 0, 0, 188];
+        assert_eq!(
+            read_cast_result(&mut &body[..]).unwrap(),
+            (9, 133, failed(0x91, None, None, 188))
         );
     }
 

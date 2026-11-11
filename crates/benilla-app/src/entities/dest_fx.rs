@@ -7,6 +7,7 @@ use bevy::prelude::*;
 
 use crate::creature_anim::{SpellGoTargets, SpellKitSound, SpellVisuals};
 use crate::net::{NetEntity, ObjectStore};
+use benilla_protocol::messages::ObjectType;
 use benilla_protocol::EntityKind;
 
 use super::spell_fx::{attach_effect_visuals, ensure_model, FxMaterials, SpellFx};
@@ -45,6 +46,8 @@ pub(super) struct GroundFx {
     loop_armed: bool,
     /// One-shot self-termination deadline (`time.elapsed_secs()`), set at attach.
     expires: Option<f32>,
+    /// The unit whose effect list holds it: it loops until that unit is gone (`0x744ac0`).
+    owner: Option<Entity>,
 }
 
 impl GroundFx {
@@ -56,6 +59,7 @@ impl GroundFx {
             spawned: false,
             loop_armed: false,
             expires: None,
+            owner: None,
         }
     }
 }
@@ -91,6 +95,8 @@ pub(crate) struct GroundBurst {
     pub(crate) scale: f32,
     /// The turn it stands at, as a resist burst takes the missile's facing (`0x7031ea`).
     pub(crate) turn: Quat,
+    /// The unit a looping point play hangs on, or `None` for a one-pass burst.
+    pub(crate) held_by: Option<Entity>,
 }
 
 /// One cast flying at a point or a unit, until it would land (`0x804b20`).
@@ -124,6 +130,7 @@ pub(super) fn record_spells_in_transit(
     mut gos: MessageReader<SpellGoTargets>,
     spells: Option<Res<crate::ui_action::Spells>>,
     units: Query<&GlobalTransform>,
+    stores: Query<&crate::net::ObjectStore>,
     time: Res<Time>,
     mut list: ResMut<SpellsInTransit>,
 ) {
@@ -135,7 +142,12 @@ pub(super) fn record_spells_in_transit(
     };
     for go in gos.read() {
         let speed = spells.catalog.get(go.spell_id).map_or(0.0, |d| d.speed);
-        let Some(from) = units.get(go.caster).ok().filter(|_| speed > 0.0) else {
+        // A unit caster's alone (`0x80e780`).
+        let object = stores.get(go.caster).is_ok_and(|s| {
+            s.0.object_type()
+                .is_some_and(|t| !matches!(t, ObjectType::Unit | ObjectType::Player))
+        });
+        let Some(from) = units.get(go.caster).ok().filter(|_| speed > 0.0 && !object) else {
             continue;
         };
         let first = go.hits.first().or(go.misses.first().map(|(e, _)| e));
@@ -305,8 +317,10 @@ pub(super) fn spawn_ground_bursts(
             (Vec3::ZERO, Quat::IDENTITY),
             super::spell_fx::model_attach_local,
         );
+        let mut ground = GroundFx::new(burst.path.clone(), burst.held_by.is_some());
+        ground.owner = burst.held_by;
         commands.spawn((
-            GroundFx::new(burst.path.clone(), false),
+            ground,
             Transform::from_translation(burst.pos + shift)
                 .with_rotation(burst.turn * turn)
                 .with_scale(Vec3::splat(burst.scale)),
@@ -377,6 +391,10 @@ pub(super) fn attach_ground_fx_models(
     let Some(mut fx) = fx else { return };
     let now = time.elapsed_secs();
     for (entity, mut inst, player) in &mut instances {
+        if inst.owner.is_some_and(|o| commands.get_entity(o).is_err()) {
+            commands.entity(entity).despawn();
+            continue;
+        }
         if !inst.spawned {
             if now < inst.starts {
                 continue;
@@ -449,6 +467,109 @@ mod tests {
         assert!(!list.holds(8, 133, 900));
         assert!(!list.holds(7, 116, 900));
         assert!(!list.holds(7, 133, 901));
+    }
+
+    /// A unit's travelling GO is noted, a GameObject's never (`0x80e780`).
+    #[test]
+    fn only_a_unit_casters_go_is_in_transit() {
+        const SPELL: u32 = 133;
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<SpellsInTransit>()
+            .add_message::<SpellGoTargets>()
+            .add_systems(Update, record_spells_in_transit);
+        app.insert_resource(crate::ui_action::Spells {
+            catalog: benilla_formats::SpellCatalog::from_displays(std::collections::HashMap::from(
+                [(
+                    SPELL,
+                    benilla_formats::SpellDisplay {
+                        speed: 20.0,
+                        ..Default::default()
+                    },
+                )],
+            )),
+            ..crate::ui_action::Spells::empty_for_tests()
+        });
+        let mut caster = |mask: u32| {
+            app.world_mut()
+                .spawn((
+                    GlobalTransform::default(),
+                    ObjectStore(benilla_protocol::ObjectFields::from_pairs(&[(2, mask)])),
+                ))
+                .id()
+        };
+        let (unit, trap) = (caster(0x9), caster(0x21));
+        for (guid, caster) in [(1u64, unit), (2, trap)] {
+            app.world_mut().write_message(SpellGoTargets {
+                caster,
+                spell_id: SPELL,
+                hits: Vec::new(),
+                misses: Vec::new(),
+                list: Vec::new(),
+                target_mask: 0x40,
+                src: None,
+                dest: Some(Vec3::new(40.0, 0.0, 0.0)),
+                points: Vec::new(),
+                ammo: None,
+                seq: 1,
+                trajectory: None,
+                reflected: 0,
+                reflects: Vec::new(),
+                caster_guid: guid,
+                server_time: 900,
+            });
+        }
+        app.update();
+        let list = app.world().resource::<SpellsInTransit>();
+        assert!(list.holds(1, SPELL, 900), "the unit's");
+        assert!(!list.holds(2, SPELL, 900), "not the GameObject's");
+    }
+
+    /// A point play held by a unit loops while the unit stands and goes with it (`0x744ac0`); a
+    /// plain burst is a one-pass model with no owner.
+    #[test]
+    fn a_held_point_play_lives_until_its_unit_is_gone() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<Image>()
+            .init_asset::<Mesh>()
+            .init_asset::<benilla_assets::M2Model>()
+            .init_asset::<benilla_assets::materials::WowModelMaterial>()
+            .init_asset::<bevy::mesh::skinning::SkinnedMeshInverseBindposes>()
+            .init_resource::<SpellFx>()
+            .init_resource::<super::super::spell_fx::FxTintAnims>()
+            .init_resource::<benilla_world::doodad_anim::UvAnimMaterials>()
+            .init_resource::<benilla_world::mat_anim_table::MatAnimTable>()
+            .init_resource::<benilla_world::rig_palette::RigPalettes>()
+            .add_message::<GroundBurst>()
+            .add_systems(
+                Update,
+                (spawn_ground_bursts, attach_ground_fx_models).chain(),
+            );
+        let caster = app.world_mut().spawn_empty().id();
+        let burst = |held_by| GroundBurst {
+            path: "Spells\\Base.m2".to_string(),
+            pos: Vec3::new(24.0, 0.0, 0.0),
+            attach: None,
+            scale: 1.0,
+            turn: Quat::IDENTITY,
+            held_by,
+        };
+        app.world_mut().write_message(burst(Some(caster)));
+        app.world_mut().write_message(burst(None));
+        app.update();
+        let live = |app: &mut App| -> Vec<(bool, Option<Entity>)> {
+            let mut q = app.world_mut().query::<&GroundFx>();
+            q.iter(app.world()).map(|g| (g.looping, g.owner)).collect()
+        };
+        let mut now = live(&mut app);
+        now.sort_by_key(|(looping, _)| *looping);
+        assert_eq!(now, vec![(false, None), (true, Some(caster))]);
+        app.update();
+        assert_eq!(live(&mut app).len(), 2, "held while the caster stands");
+        app.world_mut().despawn(caster);
+        app.update();
+        assert_eq!(live(&mut app), vec![(false, None)], "gone with the caster");
     }
 
     #[test]

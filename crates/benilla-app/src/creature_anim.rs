@@ -367,6 +367,8 @@ impl AttackSeam<'_, '_> {
 #[derive(Component, Clone, Copy)]
 pub(crate) struct Casting {
     pub(crate) spell_id: u32,
+    /// The start's `castCount`, which an interrupt must match (`0x72ed80`).
+    pub(crate) cast_count: u8,
     #[allow(dead_code)]
     pub(crate) until: Option<Instant>,
 }
@@ -391,6 +393,8 @@ pub(crate) struct CastEvent {
     pub(crate) entity: Entity,
     pub(crate) spell_id: u32,
     pub(crate) kind: CastEventKind,
+    /// The packet's `castCount`; 0 where the edge has none.
+    pub(crate) cast_count: u8,
     /// `PlaySeq` stamp, carried to the kit's `EmoteAnim`.
     pub(crate) seq: u64,
 }
@@ -402,14 +406,25 @@ pub(crate) enum CastEventKind {
     Start,
     /// `SMSG_SPELL_GO`: reaps the precast, plays the cast kit.
     Go,
-    /// Died without release (`SMSG_SPELL_FAILED_OTHER`, or our failed `SMSG_CAST_RESULT`).
-    Fail,
-    /// A missile landed: `on_caster` picks the kit (`0x800d00`), `at` is its point (`0x702e5a`).
-    Impact { on_caster: bool, at: Option<Vec3> },
-    /// A projectile with no live target at arrival (a despawned target too): the kit plays on the
-    /// caster (`entity`) at `pos`, `SpellVisual` field 13, stage 3. Sent here only for a
-    /// dest-targeted GO's missile with no hit (`MissileSpawn::ground_aim`).
+    /// Died without release, through the end-cast (`0x7fecc0`) with the reason byte as sent;
+    /// `interrupt` when `SMSG_SPELL_FAILURE` names the unit's running cast (`0x72ed80`).
+    Fail { interrupt: bool, wire_reason: u8 },
+    /// A missile landed: `on_caster` picks the kit (`0x800d00`), `at` is its point (`0x702e5a`);
+    /// `caster` is the guid both of its kit plays carry (`0x702f5f`).
+    Impact {
+        on_caster: bool,
+        at: Option<Vec3>,
+        caster: Entity,
+    },
+    /// A projectile with no live target at arrival (a located cast, a target gone, an object): the
+    /// impact area kit plays through `entity`, the caster or our player, at `pos` (`0x700e20`).
     GroundImpact { pos: Vec3 },
+    /// A missile landing on its area reached this listed unit (`0x70105d`): its impact kit and,
+    /// under the hit's aura test, its state kit, both carrying `caster`, with no flinch.
+    AreaImpact { caster: Entity },
+    /// A missile landing on its area reached this extra point: the target kit plays there through
+    /// the caster (`0x701150`).
+    PointImpact { pos: Vec3 },
 }
 
 /// The anim held while a cast is in flight (`SpellVisualKit` field 2): full-body when standing
@@ -426,6 +441,8 @@ pub(crate) struct CastHold {
     pub(crate) start_anim: Option<u16>,
     /// The cast edge's `PlaySeq` stamp, which tells this hold's start latch from an earlier one's.
     pub(crate) seq: u64,
+    /// The hold kit's play flags (`0x724398`).
+    pub(crate) play: AnimPlayFlags,
 }
 
 /// A hand's fingers close (`HandsClosed`, 15) purely because a weapon occupies its attach point,
@@ -472,20 +489,140 @@ pub(crate) struct EmoteAnim {
     /// which skips an id already armed on the key bone or bone 0. A kit anim and `DoEmote`'s local
     /// play call directly and take no such test.
     pub(crate) via_player: bool,
-    /// The play seam's Special remap applies (`0x7385c0`): everything but a kit with flag `0x4` or
-    /// `0x10`, which plays its Special1H/2H as authored (`0x73b198`).
-    pub(crate) remap_special: bool,
+    /// The play flags a kit passes ([`AnimPlayFlags`]); none for every other caller.
+    pub(crate) play: AnimPlayFlags,
 }
 
-/// A state kit's `AnimID`, compared and never played: both field-4 callers pass stage 2, which the
-/// kit player diverts, and a mismatch with the armed id recomputes the base. So it only cuts:
-/// Charge's Knockdown (121) falls to Stand, since the base selector never yields its Stun (14). An
-/// in-place aura refresh emits nothing.
+/// The animation play's flags a kit passes from its own (`0x73b198`, `0x714ce0`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AnimPlayFlags(pub(crate) u8);
+
+impl AnimPlayFlags {
+    /// The id plays as authored: no Special remap, no tier resolve (`0x7385c0`).
+    pub(crate) const RAW: u8 = 0x2;
+    /// No tier resolve through the unit's anim tier (`0x7176f0`).
+    pub(crate) const NO_TIER: u8 = 0x4;
+    /// No Special remap from the held hands.
+    pub(crate) const NO_SPECIAL: u8 = 0x8;
+    /// The clip's WeaponFlags stow is skipped (`0x738180`).
+    pub(crate) const KEEP_WEAPONS: u8 = 0x20;
+    /// Not a play flag: kit flag `0x40`, which the hold's pick reads at the base anim's end
+    /// (`0x7243d4`).
+    pub(crate) const HOLD_REPICK: u8 = 0x80;
+
+    /// A kit's flags as its anim play passes them (`0x714ce0`).
+    pub(crate) fn from_kit(kit_flags: u32) -> Self {
+        use benilla_formats::kit_flag as k;
+        let bits = [
+            (k::RAW_ANIM, Self::RAW),
+            (k::NO_TIER_RESOLVE, Self::NO_TIER),
+            (k::NO_SPECIAL_REMAP, Self::NO_SPECIAL),
+            (k::KEEP_WEAPONS, Self::KEEP_WEAPONS),
+            (k::REPICK_HELD_ANIM, Self::HOLD_REPICK),
+        ];
+        Self(
+            bits.iter()
+                .filter(|(kit, _)| kit_flags & kit != 0)
+                .fold(0, |acc, (_, play)| acc | play),
+        )
+    }
+
+    /// The Special1H/2H remap from the held hands applies.
+    pub(crate) fn remap_special(self) -> bool {
+        self.0 & (Self::RAW | Self::NO_SPECIAL) == 0
+    }
+
+    /// The unit's anim tier resolves the id.
+    pub(crate) fn tier_resolve(self) -> bool {
+        self.0 & (Self::RAW | Self::NO_TIER) == 0
+    }
+
+    /// The played clip's WeaponFlags stow is skipped.
+    pub(crate) fn keep_weapons(self) -> bool {
+        self.0 & Self::KEEP_WEAPONS != 0
+    }
+
+    /// A held kit anim is played again when its clip ends.
+    pub(crate) fn hold_repick(self) -> bool {
+        self.0 & Self::HOLD_REPICK != 0
+    }
+}
+
+/// A state kit's `AnimID`: both field-4 callers pass stage 2, which the kit player diverts, and a
+/// mismatch with the armed id recomputes the base, playing the id first only when it is dead or
+/// dying (`0x73b32b`). So it mostly cuts: Charge's Knockdown (121) falls to Stand, since the base
+/// selector never yields its Stun (14). An in-place aura refresh emits nothing.
 #[derive(Message, Clone, Copy)]
 pub(crate) struct BaseAnimRecompute {
     pub(crate) entity: Entity,
     /// The right side of the reference's armed-id compare.
     pub(crate) anim_id: u16,
+    /// The kit play's flags, which a dead or dying id is played with (`0x73b33e`).
+    pub(crate) play: AnimPlayFlags,
+}
+
+/// A live kit effect's `AnimID` and the play flags its own kit flags give (`0x73e79d`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KitAnim {
+    pub(crate) anim_id: u16,
+    pub(crate) play: AnimPlayFlags,
+}
+
+impl KitAnim {
+    /// A kit's anim with its flags; `None` for a kit with no anim.
+    pub(crate) fn of(kit: &benilla_formats::VisualKit) -> Option<Self> {
+        let play = AnimPlayFlags::from_kit(kit.flags).0 & !AnimPlayFlags::HOLD_REPICK;
+        kit.anim_id.map(|anim_id| Self {
+            anim_id,
+            play: AnimPlayFlags(play),
+        })
+    }
+}
+
+/// The anims of the unit's live state kits by spell: a state kit's play adds an anim effect when
+/// no model carries the kit (`0x73b30d`); a model-borne one is the effect instances'.
+#[derive(Component, Default, Clone, Debug)]
+#[component(storage = "SparseSet")]
+pub(crate) struct StateKitAnims(pub(crate) Vec<(u32, KitAnim)>);
+
+/// What a display swap carries to the rebuilt driver (`0x73e410`): a dying anim under half played
+/// restarts, and a falling unit keeps its torso anim.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[component(storage = "SparseSet")]
+pub(crate) struct SwapReplay {
+    /// The dying anim's BehaviorID, played again from its start (`0x73e496`).
+    pub(crate) restart: Option<u16>,
+    /// The old torso anim, played again if the unit is falling (`0x73e75a`).
+    pub(crate) torso: Option<u16>,
+}
+
+/// Reads a unit's driver as its display swap tears it down, for [`SwapReplay`].
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct SwapCarry<'w, 's> {
+    units: Query<
+        'w,
+        's,
+        (
+            &'static AnimDriver,
+            &'static AnimationPlayer,
+            &'static bevy::animation::transition::AnimationTransitions,
+            &'static ModelAnimations,
+        ),
+    >,
+    data: Option<Res<'w, AnimData>>,
+}
+
+impl SwapCarry<'_, '_> {
+    /// Leave `entity` the replay its rebuilt driver plays; a unit with no driver carries none.
+    pub(crate) fn carry(&self, commands: &mut Commands, entity: Entity) {
+        let Ok((drv, player, tr, anims)) = self.units.get(entity) else {
+            return;
+        };
+        let replay = drv.swap_replay(player, tr, anims, self.data.as_deref().map(|d| &d.0));
+        if replay != SwapReplay::default() {
+            commands.entity(entity).insert(replay);
+        }
+    }
 }
 
 /// Rears a rider's mount: MountSpecial (94) on the mount child while the rider holds Mount (91);
@@ -516,7 +653,7 @@ fn flourish_to_anim(
             anim_id: select::MOUNT_SPECIAL,
             seq: play_seq.next(),
             via_player: false,
-            remap_special: true,
+            play: Default::default(),
         });
     }
 }
@@ -539,11 +676,19 @@ pub(crate) struct SpellGoTargets {
     /// Missed units with `SpellMissInfo`: no impact kit; the flight's route is
     /// `crate::entities::missile`'s.
     pub(crate) misses: Vec<(Entity, u8)>,
+    /// Every listed guid with its outcome (0 a hit) and a reflect's outcome on the caster, hits
+    /// first unless cast flag `0x400`; a list missile resolves them as it lands (`0x8001ee`).
+    pub(crate) list: Vec<(u64, u8, u8)>,
+    /// The targets' flag mask, which picks the missiles' kind (`0x7fffb0`).
+    pub(crate) target_mask: u32,
+    /// The source point, in bevy coords.
+    pub(crate) src: Option<Vec3>,
     /// A dest-targeted cast's ground point, in bevy coords.
     pub(crate) dest: Option<Vec3>,
-    /// The GO's ammo block (`castFlags & 0x20`): the ammo's `ItemDisplayInfo` id, the missile model
-    /// when the visual chain has none.
-    pub(crate) ammo_display_id: Option<u32>,
+    /// The extra target points, in bevy coords; one whose transport is not here is dropped.
+    pub(crate) points: Vec<crate::entities::DeckPoint>,
+    /// The GO's ammo block (`castFlags & 0x20`), a missile's model for column 8's 0, -4 and -5.
+    pub(crate) ammo: Option<ItemModel>,
     /// `PlaySeq` stamp, the GO's `CastEvent`'s.
     pub(crate) seq: u64,
     /// The GO's trajectory (`castFlags & 0x20000`).
@@ -557,6 +702,14 @@ pub(crate) struct SpellGoTargets {
     pub(crate) server_time: u32,
 }
 
+/// An item a missile flies as its model: its `ItemDisplayInfo` id and the `InventoryType` that
+/// picks the model's folder (`0x732100`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ItemModel {
+    pub(crate) display_id: u32,
+    pub(crate) inventory_type: u32,
+}
+
 /// A dest-location cast's visuals, from `SMSG_NOTIFY_DEST_LOC_SPELL_CAST` (`0x810050`), in bevy
 /// coords: no caster entity is needed.
 #[derive(Message, Clone, Copy, Debug, PartialEq)]
@@ -565,6 +718,8 @@ pub(crate) struct DestLocCast {
     pub(crate) src: Vec3,
     pub(crate) dest: Vec3,
     pub(crate) delay_ms: u32,
+    /// The packet's trajectory, at a missile speed above 0 (`0x802641`).
+    pub(crate) trajectory: Option<Trajectory>,
 }
 
 /// A trajectory missile's launch off its GO (`0x732ff0`): the pitch it leaves at and the time it
@@ -572,6 +727,8 @@ pub(crate) struct DestLocCast {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Trajectory {
     pub(crate) pitch: f32,
+    /// The launch speed an arc with no solution falls back to (`0x700880`), 0 for none.
+    pub(crate) speed: f32,
     /// Seconds from the GO to the landing.
     pub(crate) delay: f32,
     pub(crate) caster: u64,
@@ -637,8 +794,9 @@ use spell_visual::{
 #[cfg(test)]
 pub(crate) use spell_visual::arm_aura_state_fx as arm_aura_state_fx_for_test;
 pub(crate) use spell_visual::{
-    held_strike_sound, kit_fx_slots, ChainProcPlay, FxClass, FxStage, KitPush, MissileSpawn,
-    SpellKitFx, SpellKitShake, SpellKitSound, SpellVisuals,
+    end_cast_clears_hold, held_strike_sound, BeamKitWaits, ChainProcPlay, ChannelSpellLeft,
+    FxClass, FxStage, KitEffectClear, KitPush, MissileRelease, MissileSpawn, ReleaseKind,
+    SpellEffectClear, SpellKitFx, SpellKitShake, SpellKitSound, SpellVisuals, UnitKitLanes,
 };
 
 /// The unit's own variation stream ([`benilla_assets::AnimRng::stream`]), cut on its first frame
@@ -746,9 +904,41 @@ pub(crate) struct AnimDriver {
     special_idle: Option<u16>,
     /// The [`CastHold::seq`] whose start anim has played out, the cleared start latch.
     start_spent: Option<u64>,
+    /// Read dead or dying on the last pass (`0x71f560`), for a display swap's replay.
+    dead: bool,
 }
 
 impl AnimDriver {
+    /// The torso anim, the key bone's else bone 0's, under half played and dying on a dead unit
+    /// (`0x73e484`), and as the falling replay's id (`0x73e513`).
+    fn swap_replay(
+        &self,
+        player: &AnimationPlayer,
+        tr: &bevy::animation::transition::AnimationTransitions,
+        anims: &ModelAnimations,
+        catalog: Option<&AnimDataCatalog>,
+    ) -> SwapReplay {
+        let node = self
+            .overlay
+            .map(|o| o.node)
+            .or_else(|| tr.get_main_animation());
+        let Some(clip) = node.and_then(|n| anims.clips.iter().find(|c| c.node == n)) else {
+            return SwapReplay::default();
+        };
+        let progress = player.animation(clip.node).map_or(1.0, |a| {
+            if clip.duration > 0.0 {
+                a.seek_time().rem_euclid(clip.duration) / clip.duration
+            } else {
+                1.0
+            }
+        });
+        let restart = self.dead && select::is_dying(clip.anim_id, catalog) && progress < 0.5;
+        SwapReplay {
+            restart: restart.then(|| select::behavior_of(clip.anim_id, catalog)),
+            torso: Some(clip.anim_id),
+        }
+    }
+
     /// The requested `(base, masked overlay)` ids, for the inspector.
     pub(crate) fn playing(&self) -> (Option<u16>, Option<u16>) {
         let base = match self.mode {
@@ -834,6 +1024,7 @@ impl Default for AnimDriver {
             base_dir: None,
             special_idle: None,
             start_spent: None,
+            dead: false,
         }
     }
 }
@@ -945,8 +1136,12 @@ impl Plugin for CreatureAnimPlugin {
             .add_message::<SpellKitFx>()
             .add_message::<StateDoneKit>()
             .add_message::<MissileSpawn>()
+            .add_message::<MissileRelease>()
             .add_message::<spell_visual::DelayedAreaKit>()
             .add_message::<ChainProcPlay>()
+            .add_message::<ChannelSpellLeft>()
+            .add_message::<SpellEffectClear>()
+            .add_message::<KitEffectClear>()
             .add_message::<KitPush>()
             // The aura CharProc edges, drained by `crate::aura_visual`.
             .add_message::<crate::aura_visual::AuraProc>()
@@ -954,6 +1149,8 @@ impl Plugin for CreatureAnimPlugin {
             .add_message::<HardLanding>()
             // The pending-morph latch, the reference's per-unit `[+0xd54]`.
             .init_resource::<MorphLatch>()
+            // The kit plays waiting on a beam, held and played by the cast router.
+            .init_resource::<BeamKitWaits>()
             .add_systems(
                 Startup,
                 (

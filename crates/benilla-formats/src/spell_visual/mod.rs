@@ -63,6 +63,32 @@ pub const MISSILE_ATTACH_TABLE: [u16; 16] = [
 /// [`MISSILE_ATTACH_TABLE`] (`0x733384`).
 const FLAG_DEST_ATTACH_IS_ID: u32 = 0x200;
 
+/// `SpellVisual` flags bit: the missile's model is held on the caster from cast start (`0x7fa41d`).
+const FLAG_PRECAST_MISSILE: u32 = 0x20;
+
+/// The table index a unit reads as its held weapon (`0x71a823`).
+const HELD_WEAPON_INDEX: u32 = 13;
+
+/// An effect attachment in columns 10 and 16's encoding as a unit resolves it (`0x71a860`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectAttach {
+    /// An M2 attachment id on the unit's own model.
+    Point(u16),
+    /// Index 13: the right-hand model's attachments 4 down to 0, else [`Self::tag`] on the unit.
+    HeldWeapon,
+}
+
+impl EffectAttach {
+    /// The unit attachment tested for the effect and taken without a weapon point: index 13
+    /// reads table slot 4 (`0x71a828`).
+    pub fn tag(self) -> u16 {
+        match self {
+            Self::Point(tag) => tag,
+            Self::HeldWeapon => MISSILE_ATTACH_TABLE[4],
+        }
+    }
+}
+
 /// The data writes "no value" in an id column as 0 or as this, inconsistently; both read `None`.
 const NONE_SENTINEL: u32 = u32::MAX;
 
@@ -94,6 +120,13 @@ impl CharProc {
             packed: ftol(self.params[0]) | (ftol(self.params[3]) << 24),
             duration_ms,
         })
+    }
+
+    /// This slot as an item swap: `CharParamOne` truncated to an item id (`0x726c3c`); `None` for
+    /// another type or for id 0, which asks the item cache nothing (`0x67ca30`).
+    pub fn as_item_swap(&self) -> Option<u32> {
+        let item = self.params[1].trunc() as i32;
+        (self.ty == char_proc_type::ITEM_SWAP && item > 0).then_some(item as u32)
     }
 
     /// This slot as a beam; `None` too when `CharParamZero` truncates to 0, which names no row and
@@ -166,6 +199,10 @@ pub mod char_proc_type {
     /// 3050, Sunder's 557) it is the whole visual: they fill no effect slot.
     pub const WEAPON_TRAIL: i32 = 8;
 
+    /// Item swap: one item slot of the unit shows `CharParamOne`'s item while the effect lives,
+    /// then its own again (`0x6f8650`, `0x6f8700`). All 14 kits carrying it are state kits.
+    pub const ITEM_SWAP: i32 = 17;
+
     /// A beam, as the data keys it on channel-stage kits (Drain Life, Mind Flay). It reaches the
     /// same dispatcher case as [`CHAIN_CAST`] (`0x72697a`, byte table `0x726ccc`); behaviour keys
     /// off [`ChainProc::flag`](crate::ChainProc::flag).
@@ -202,7 +239,7 @@ pub struct VisualStages {
     /// Speed > 0, whatever this holds.
     pub missile_model: u32,
     /// Column 10: an index into [`MISSILE_ATTACH_TABLE`], or an attachment id; read it through
-    /// [`Self::missile_dest_attachment`].
+    /// [`Self::missile_dest_attachment`] or [`Self::beam_impact_attachment`].
     pub missile_attach: u32,
     /// Column 11: the `SoundEntries.dbc` loop the missile plays in flight, its volume shaped by
     /// distance, stopped when it arrives.
@@ -293,12 +330,32 @@ impl VisualStages {
         self.effect_attachment(self.missile_attach)
     }
 
-    /// The M2 attachment the missile and the beam leave from, column 16 in column 10's encoding
+    /// The attachment the missile and the beam leave from, column 16 in the unit effect encoding
     /// (`0x71a7f0`); `None` for the row's -1.
-    pub fn missile_source_attachment(&self) -> Option<u16> {
+    pub fn missile_source_attachment(&self) -> Option<EffectAttach> {
         (self.missile_source_attach != NONE_SENTINEL)
-            .then(|| self.effect_attachment(self.missile_source_attach))
+            .then(|| self.unit_effect_attachment(self.missile_source_attach))
             .flatten()
+    }
+
+    /// The attachment a [`FLAG_PRECAST_MISSILE`] row holds column 8's model at during the cast,
+    /// `None` without the flag or for column 16's -1 (`0x722950`).
+    pub fn precast_missile_attachment(&self) -> Option<u16> {
+        (self.flags & FLAG_PRECAST_MISSILE != 0)
+            .then(|| self.missile_source_attachment())
+            .flatten()
+            .map(EffectAttach::tag)
+    }
+
+    /// Whether the row holds its missile on the caster during the cast; a new hold drops the last
+    /// even where this row's own gate then fails (`0x722950`).
+    pub fn holds_precast_missile(&self) -> bool {
+        self.flags & FLAG_PRECAST_MISSILE != 0
+    }
+
+    /// The attachment a beam's hop end sits at, column 10 in the unit effect encoding (`0x7fad5c`).
+    pub fn beam_impact_attachment(&self) -> Option<EffectAttach> {
+        self.unit_effect_attachment(self.missile_attach)
     }
 
     /// The missile cast offset with y negated, as the reference applies it (`0x7fc5f0`).
@@ -319,6 +376,14 @@ impl VisualStages {
         } else {
             MISSILE_ATTACH_TABLE.get(column as usize).copied()
         }
+    }
+
+    /// A column as a unit resolves it (`0x71a860`): the raw id, index 13's held weapon, the table.
+    fn unit_effect_attachment(&self, column: u32) -> Option<EffectAttach> {
+        if self.flags & FLAG_DEST_ATTACH_IS_ID == 0 && column == HELD_WEAPON_INDEX {
+            return Some(EffectAttach::HeldWeapon);
+        }
+        self.effect_attachment(column).map(EffectAttach::Point)
     }
 }
 
