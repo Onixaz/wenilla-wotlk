@@ -310,8 +310,12 @@ export function createStore(opts = {}) {
   /// that finished for this data version is not walked again. Resolves to whether it ran.
   /// `idle: false` does not wait for a quiet network, and `first` puts each request ahead of the
   /// low-priority fetches already queued (a reader's high-priority read still goes before it): a
-  /// set the player may want next, ahead of one they want later.
-  async function fill(names, { tag, workers = 6, idleMs = 250, idle = true, first = false } = {}) {
+  /// set the player may want next, ahead of one they want later. `priority: 'high'` is a set a
+  /// screen waits on: it goes with the readers' reads.
+  async function fill(
+    names,
+    { tag, workers = 6, idleMs = 250, idle = true, first = false, priority = 'low' } = {},
+  ) {
     if (globalThis.navigator?.connection?.saveData) return false; // the player asked for less data
     const cache = await openCache();
     if (!cache) return false;
@@ -332,7 +336,7 @@ export function createStore(opts = {}) {
         if (mem.has(key) || missing.has(key)) continue;
         if (await cache.match(urlFor(key)).catch(() => undefined)) continue;
         try {
-          await flight(key, 'low', false, first).promise;
+          await flight(key, priority === 'high' ? 'high' : 'low', false, first).promise;
           stats.filled += 1;
         } catch (_) {
           failed += 1;

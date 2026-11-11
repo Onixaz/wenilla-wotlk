@@ -724,6 +724,24 @@ test('a fill first, not idle, goes ahead of queued fetches ahead and behind a re
   assert.equal(await filling, true);
 });
 
+test('a high fill goes with the readers, ahead of the queued fetches ahead', async () => {
+  const { caches } = diskCache();
+  const files = Object.fromEntries(['a', 'b', 'c', 'x', 'y'].map((k, i) => [k, bytes(i + 1)]));
+  const h = host(files);
+  const s = createStore({ fetch: h.fetch, caches, storage: null, version: 'v1', maxRequests: 3, maxLowRequests: 1 });
+  s.prefetch(['a', 'b', 'c']); // the world set, queued low: one at a time
+  await settle();
+  const filling = s.fill(['x', 'y'], { workers: 2, idle: false, priority: 'high' });
+  for (let i = 0; i < 5; i++) await settle();
+  assert.deepEqual(h.calls.map((c) => [c.path, c.priority]), [['a', 'low'], ['x', 'high'], ['y', 'high']]);
+  assert.equal(s.reading(), 0, 'a fill is no reader');
+  for (let i = 0; i < 20; i++) {
+    h.calls.forEach((c) => c.open());
+    await settle();
+  }
+  assert.equal(await filling, true);
+});
+
 test('filled names a finished tag; cached reads the disk without a request or a reader', async () => {
   const { disk, caches } = diskCache();
   const h = instantHost({ 'a.m2': bytes(1, 2) });
