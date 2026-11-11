@@ -36,6 +36,11 @@ const READY_TIMEOUT_MS = 20000;
 // next file a frame or more after the last one lands, and the screen's first reads follow the
 // long frame that built it.
 const SETTLE_MS = 1500;
+// Character Create's cover: shown only if the creation set is still downloading this long after
+// the screen opened, so a set already on disk shows no cover at all; and lifted after this long
+// whatever is left, which then loads as the player clicks.
+const CREATE_SHOW_MS = 300;
+const CREATE_TIMEOUT_MS = 90000;
 /// The player's saved locale, written when they change the `locale` setting in game.
 export const LOCALE_KEY = 'wenilla:locale';
 
@@ -273,7 +278,11 @@ function startWorldPrefetch(store) {
 /// is `world-manifest.json` (captured the same way as the boot manifest, minus the boot set) plus
 /// what earlier visits learned; whatever is still in flight when the player clicks Enter World
 /// just loads the old way.
+///
+/// `charcreate` opens Character Create's cover while the creation set downloads, for a player
+/// whose account had characters and so never fetched it ahead; `charcreate-ready` lifts it.
 function installProgressHook(ui) {
+  let create = null; // Character Create's pending or shown cover
   window.__wenilla_progress = (stage) => {
     if (stage === 'startup') ui.setStage('Loading interface…');
     else if (stage === 'charselect') {
@@ -282,6 +291,20 @@ function installProgressHook(ui) {
       cover.setStage('Loading characters…');
       cover.armTimeout(READY_TIMEOUT_MS);
       whenSettled(window.__wenilla_data).then(() => cover.hide());
+    } else if (stage === 'charcreate') {
+      if (create) return;
+      const c = (create = { cover: null });
+      c.timer = setTimeout(() => {
+        c.cover = createBootUi();
+        c.cover.setStage('Loading character creation…');
+        c.cover.armTimeout(CREATE_TIMEOUT_MS);
+      }, CREATE_SHOW_MS);
+    } else if (stage === 'charcreate-ready') {
+      const c = create;
+      create = null;
+      if (!c) return;
+      clearTimeout(c.timer);
+      if (c.cover) whenSettled(window.__wenilla_data).then(() => c.cover.hide());
     } else if (stage === 'ready') {
       ui.setStage('Preparing the screen…');
       whenSettled(window.__wenilla_data).then(() => ui.hide());

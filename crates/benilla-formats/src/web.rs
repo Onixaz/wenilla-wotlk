@@ -74,11 +74,32 @@ pub fn prefetch_pinned(_names: &[String]) {}
 #[cfg(not(target_arch = "wasm32"))]
 pub fn fill_in_turn(_lists: Vec<(&'static str, Vec<String>)>) {}
 
+/// How a [`fill_trees`] walk asks the store, read again at each step of the walk.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FillLane {
+    /// Stop at the next step; a later walk under the same tag skips what reached the disk.
+    Off,
+    /// Behind the fetches ahead already queued.
+    Behind,
+    /// Ahead of the queued fetches ahead, behind a reader's reads.
+    First,
+    /// A screen waits on the set: with the readers' reads, many at once.
+    Now,
+}
+
 /// Download model trees to the page's persistent cache under `tag`: each model, then what its
-/// loader reads after it ([`crate::web_deps`]), not waiting for a quiet network and, while
-/// `first` says so, ahead of the fetches ahead already queued. Nothing off the page.
+/// loader reads after it ([`crate::web_deps`]), not waiting for a quiet network, in the lane
+/// `lane` names at each step. `done` hears whether the whole set is on disk once the walk ends,
+/// finished or stopped. Off the page there is no walk and `done(true)` is called at once.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn fill_trees(_models: Vec<String>, _tag: &'static str, _first: fn() -> bool) {}
+pub fn fill_trees(
+    _models: Vec<String>,
+    _tag: &'static str,
+    _lane: fn() -> FillLane,
+    done: fn(bool),
+) {
+    done(true);
+}
 
 #[cfg(target_arch = "wasm32")]
 mod wasm {
@@ -383,8 +404,8 @@ mod wasm {
         });
     }
 
-    /// How many names one [`fill_trees`] step hands the store: the `first` flag is read again at
-    /// each step, so a roster that arrives mid-walk moves the rest behind the queue.
+    /// How many names one [`fill_trees`] step hands the store: the lane is read again at each
+    /// step, so a roster that arrives mid-walk, or a screen that opens, moves the rest.
     const FILL_STEP: usize = 48;
 
     /// Await a store method's promise; `None` when the page has no such method or it threw.
@@ -401,61 +422,91 @@ mod wasm {
         wasm_bindgen_futures::JsFuture::from(promise).await.ok()
     }
 
-    /// `fill` without waiting for a quiet network; whether it ran (a page with no persistent cache
-    /// does not).
-    async fn fill_now(names: &[String], tag: Option<&str>, first: bool) -> bool {
+    /// How many of a [`super::FillLane::Now`] set are asked at once: most of the store's request slots
+    /// (`maxRequests`, 24), the rest left to the screen's own reads.
+    const NOW_WORKERS: u32 = 16;
+
+    /// `fill` without waiting for a quiet network, in `lane`; whether it ran (a page with no
+    /// persistent cache does not, and neither does [`super::FillLane::Off`]).
+    async fn fill_now(names: &[String], tag: Option<&str>, lane: super::FillLane) -> bool {
+        use super::FillLane;
+        if lane == FillLane::Off {
+            return false;
+        }
         let arr: js_sys::Array = names.iter().map(|n| JsValue::from_str(n)).collect();
         let opts = js_sys::Object::new();
         if let Some(tag) = tag {
             let _ = js_sys::Reflect::set(&opts, &"tag".into(), &tag.into());
         }
-        let _ = js_sys::Reflect::set(&opts, &"idle".into(), &JsValue::FALSE);
-        let _ = js_sys::Reflect::set(&opts, &"first".into(), &JsValue::from_bool(first));
+        let set = |k: &str, v: JsValue| {
+            let _ = js_sys::Reflect::set(&opts, &k.into(), &v);
+        };
+        set("idle", JsValue::FALSE);
+        set("first", JsValue::from_bool(lane == FillLane::First));
+        if lane == FillLane::Now {
+            set("priority", "high".into());
+            set("workers", NOW_WORKERS.into());
+        }
         store_call(|s| s.fill.as_ref(), &arr, &opts)
             .await
             .is_some_and(|v| v.is_truthy())
     }
 
     /// See the native stub's doc.
-    pub fn fill_trees(models: Vec<String>, tag: &'static str, first: fn() -> bool) {
-        use wasm_bindgen::JsCast;
+    pub fn fill_trees(
+        models: Vec<String>,
+        tag: &'static str,
+        lane: fn() -> super::FillLane,
+        done: fn(bool),
+    ) {
         wasm_bindgen_futures::spawn_local(async move {
-            let done = store_call(|s| s.filled.as_ref(), &tag.into(), &JsValue::UNDEFINED).await;
-            if done.is_none_or(|v| v.is_truthy()) {
-                return; // finished for this install, or a page that cannot say
-            }
-            let mut seen = std::collections::HashSet::new();
-            let models: Vec<String> = models
-                .iter()
-                .map(|n| crate::web_deps::model_name(n))
-                .filter(|n| index_has(n) != Some(false) && seen.insert(super::index_key(n)))
-                .collect();
-            for step in models.chunks(FILL_STEP) {
-                if !fill_now(step, None, first()).await {
-                    return;
-                }
-            }
-            let mut leaves = Vec::new();
-            for model in &models {
-                let bytes = store_call(|s| s.cached.as_ref(), &model.into(), &JsValue::UNDEFINED)
-                    .await
-                    .and_then(|v| v.dyn_into::<js_sys::Uint8Array>().ok());
-                let Some(bytes) = bytes else { continue };
-                let d = crate::web_deps::deps(model, &bytes.to_vec());
-                leaves.extend(
-                    d.leaves.into_iter().filter(|n| {
-                        index_has(n) != Some(false) && seen.insert(super::index_key(n))
-                    }),
-                );
-            }
-            for step in leaves.chunks(FILL_STEP) {
-                fill_now(step, None, first()).await;
-            }
-            // Every name again under the tag: each on disk is skipped, a failed one is asked once
-            // more, and the tag is kept only when all of them landed.
-            let all: Vec<String> = models.into_iter().chain(leaves).collect();
-            fill_now(&all, Some(tag), false).await;
+            walk_trees(models, tag, lane).await;
+            let on_disk = store_call(|s| s.filled.as_ref(), &tag.into(), &JsValue::UNDEFINED).await;
+            // A page that cannot say has nothing to wait for.
+            done(on_disk.is_none_or(|v| v.is_truthy()));
         });
+    }
+
+    /// [`fill_trees`]' walk, ended early by [`super::FillLane::Off`].
+    async fn walk_trees(models: Vec<String>, tag: &'static str, lane: fn() -> super::FillLane) {
+        use wasm_bindgen::JsCast;
+        let done = store_call(|s| s.filled.as_ref(), &tag.into(), &JsValue::UNDEFINED).await;
+        if done.is_none_or(|v| v.is_truthy()) {
+            return; // finished for this install, or a page that cannot say
+        }
+        let mut seen = std::collections::HashSet::new();
+        let models: Vec<String> = models
+            .iter()
+            .map(|n| crate::web_deps::model_name(n))
+            .filter(|n| index_has(n) != Some(false) && seen.insert(super::index_key(n)))
+            .collect();
+        for step in models.chunks(FILL_STEP) {
+            if !fill_now(step, None, lane()).await {
+                return;
+            }
+        }
+        let mut leaves = Vec::new();
+        for model in &models {
+            let bytes = store_call(|s| s.cached.as_ref(), &model.into(), &JsValue::UNDEFINED)
+                .await
+                .and_then(|v| v.dyn_into::<js_sys::Uint8Array>().ok());
+            let Some(bytes) = bytes else { continue };
+            let d = crate::web_deps::deps(model, &bytes.to_vec());
+            leaves.extend(
+                d.leaves
+                    .into_iter()
+                    .filter(|n| index_has(n) != Some(false) && seen.insert(super::index_key(n))),
+            );
+        }
+        for step in leaves.chunks(FILL_STEP) {
+            if !fill_now(step, None, lane()).await {
+                return;
+            }
+        }
+        // Every name again under the tag: each on disk is skipped, a failed one is asked once
+        // more, and the tag is kept only when all of them landed.
+        let all: Vec<String> = models.into_iter().chain(leaves).collect();
+        fill_now(&all, Some(tag), lane()).await;
     }
 
     /// Every name in the chain's index, as [`super::index_key`] spells them.

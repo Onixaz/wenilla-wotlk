@@ -559,10 +559,7 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
         );
         app.add_systems(
             Update,
-            (
-                web_glue_ahead::fetch_create_set_once,
-                web_glue_ahead::follow_roster,
-            )
+            (web_glue_ahead::fetch_create_set_once, web_glue_ahead::steer)
                 .run_if(not(in_state(char_select::ClientState::InWorld))),
         );
     }

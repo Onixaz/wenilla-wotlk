@@ -22,6 +22,9 @@
 //!   [`signal_ready_once`] — because both screens' `materialize_screen` run every frame.
 //! - `"charselect"` — the character screens are entered for the first time, so the page can cover
 //!   the scene's first load as it covers the first glue screen. Sent once, ever.
+//! - `"charcreate"` — Character Create opened before its models reached the page's disk
+//!   ([`crate::web_glue_ahead`]): the page covers it while they download.
+//! - `"charcreate-ready"` — that download ended: the page lifts the cover, if it shows one.
 //!
 //! Native builds: every function is a no-op; there is no page.
 
