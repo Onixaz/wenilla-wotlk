@@ -38,7 +38,8 @@ mod net;
 // Crate-visible for the dev stall watchdog, which asks `output::device_open`.
 // On wasm32 the mixer runs on `web_backend` (`mixer::MixBackend`), so most of the
 // device layer goes unreferenced there; it stays compiled so it cannot rot behind a target gate.
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+// Its render and watch threads never start on the page, hence the thread lint's pass there.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code, clippy::disallowed_methods))]
 pub(crate) mod output;
 mod probe;
 mod reverb;

@@ -39,31 +39,25 @@ per-target split and takes upstream's macOS arm as is. Then verify:
 
 ```bash
 cargo check --workspace --all-targets
-cargo check --target wasm32-unknown-unknown -p wenilla --no-default-features --features webgpu
+scripts/wasm-lint.sh          # clippy on wasm32: refuses std's clocks, sleep and spawn
 scripts/web-build.sh          # then boot it in a WebGPU browser: login, world entry, sound, cross a zone line
 ```
 
-**The browser boot is not optional, and it is not a formality.** `std::time::Instant::now` and
-`SystemTime::now` COMPILE on wasm32 and panic when called, so a sync that adds them passes
-`cargo check --target wasm32` *and* the whole test suite and still dies at boot with
-`RuntimeError: unreachable` and a blank canvas. Nothing but a browser catches it. Upstream does
-not build wasm, so every sync tends to bring a fresh crop: the 2026-09-07 one brought seven, two
-of them on per-frame systems that aborted the client in its first seconds. Before booting, this
-sweep costs nothing and finds most of them:
+**The browser boot is not optional, and it is not a formality.** `std::time::Instant::now`,
+`SystemTime::now`, `std::thread::sleep` and `spawn` COMPILE on wasm32 and panic when called, so a
+sync that adds them passes `cargo check --target wasm32` *and* the whole test suite and still dies
+at boot with `RuntimeError: unreachable` and a blank canvas. Upstream does not build wasm, so every
+sync tends to bring a fresh crop: the 2026-09-07 one brought seven, the 2026-11-11 one three (the
+UI's `GetTime` clock among them, which would have aborted the first frame).
 
-```bash
-# every file the sync added or touched that reaches a clock through std rather than the carry
-git diff --stat main..HEAD --name-only -- '*.rs' | xargs grep -ln 'use std::time::.*Instant\|std::time::\(Instant\|SystemTime\)::now'
-```
-
-Upstream also moves code between files, and a moved `Instant` comes back as std's: the
-2026-09-24 sync found the cast state carried out of `ui_cast.rs` (ours) into `spell/inflight.rs`
-(std again). So also diff the hits against `origin/main` and read every *new* line, not only the
-files the merge conflicted on.
-
-`Duration` is fine — it is arithmetic, not a clock. `Instant` and `SystemTime` are not; they take
-`bevy::platform::time::Instant` and `web_time::SystemTime`. Watch for the brace form
-(`use std::time::{Duration, Instant}`), which a grep for the plain import misses.
+`scripts/wasm-lint.sh` catches those: clippy on wasm32 with `scripts/wasm-lint/clippy.toml`, where
+Bevy's and `web-time`'s `Instant` are their own types, so only what the page runs is refused,
+however it is spelled or wherever upstream moved it. It is the `wasm-clocks` gate of
+`scripts/gates.sh`, and `check.yml` runs it on every pull request. Resolve a hit with
+`bevy::platform::time::Instant` (`web_time::Instant` in a crate without Bevy) and
+`web_time::SystemTime`; a `sleep` or `spawn` on the page path takes a `cfg(target_arch = "wasm32")`
+twin. `Duration` is fine: it is arithmetic, not a clock. The lint does not replace the browser
+boot, which catches every other way the page can break.
 
 Open the pull request against `Arnesen/wenilla` (`gh pr create -R Arnesen/wenilla …`) with three
 sections: *what comes in*, *conflicts and how each was resolved*, *verification*. PR #12 is the

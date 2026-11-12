@@ -1,0 +1,15 @@
+# The browser build's clippy config, read only by `scripts/wasm-lint.sh` (`CLIPPY_CONF_DIR`), never
+# by the native clippy: on native `bevy::platform::time::Instant` and `web_time::Instant` are std's
+# own type, so this list would flag every correct use there. On wasm32 they are not, and what is
+# left is what compiles there and panics when called.
+disallowed-types = [
+    { path = "std::time::Instant", reason = "panics on wasm32: use bevy::platform::time::Instant (or web_time::Instant where Bevy is not a dependency)" },
+    { path = "std::time::SystemTime", reason = "panics on wasm32: use web_time::SystemTime" },
+]
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "panics on wasm32: use bevy::platform::time::Instant::now" },
+    { path = "std::time::SystemTime::now", reason = "panics on wasm32: use web_time::SystemTime::now" },
+    { path = "std::thread::sleep", reason = "panics on wasm32: the page cannot block its thread" },
+    { path = "std::thread::spawn", reason = "fails on wasm32: there are no threads" },
+    { path = "std::thread::Builder::spawn", reason = "fails on wasm32: there are no threads" },
+]

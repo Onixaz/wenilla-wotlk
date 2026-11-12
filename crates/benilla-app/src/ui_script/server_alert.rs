@@ -473,7 +473,15 @@ pub(super) fn fetch_alert(url: &str, timeouts: Timeouts) -> Option<Vec<u8>> {
     buffer.finish()
 }
 
+/// Deviation, on the page alone: no fetch. The page has neither the thread nor the raw socket the
+/// fetch runs on, so the channel closes without an alert and the login screen shows none.
+#[cfg(target_arch = "wasm32")]
+pub(super) fn spawn_fetch(_url: String) -> crossbeam_channel::Receiver<Option<Vec<u8>>> {
+    crossbeam_channel::bounded(1).1
+}
+
 /// The fetch on a thread of its own: the channel holds the alert once, or closes without one.
+#[cfg(not(target_arch = "wasm32"))]
 pub(super) fn spawn_fetch(url: String) -> crossbeam_channel::Receiver<Option<Vec<u8>>> {
     let (tx, rx) = crossbeam_channel::bounded(1);
     let started = std::thread::Builder::new()

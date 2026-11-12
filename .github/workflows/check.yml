@@ -34,8 +34,10 @@ jobs:
       # which the cache above keeps.
       - name: toolchain (scripts/web-setup.sh)
         run: scripts/web-setup.sh
-      - name: cargo check, wasm32
-        run: cargo check --target wasm32-unknown-unknown -p wenilla --no-default-features --features webgpu
+      # Clippy on wasm32 builds what `cargo check` did and also refuses std's clocks, sleep and
+      # spawn, which build there and panic on the page (gates.sh's wasm-clocks gate).
+      - name: cargo clippy, wasm32 (scripts/wasm-lint.sh)
+        run: scripts/wasm-lint.sh
   realm:
     runs-on: ubuntu-latest
     timeout-minutes: 60

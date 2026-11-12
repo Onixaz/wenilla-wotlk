@@ -46,5 +46,8 @@ jobs:
       - name: Toolchain
         run: rustup toolchain install && rustc -V
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The wasm-clocks gate's toolchain: the wasm32 target and wasi-sdk, the Lua VM's C sysroot.
+      - name: wasm toolchain (scripts/web-setup.sh)
+        run: scripts/web-setup.sh
       - name: gates
         run: xvfb-run -a scripts/gates.sh
