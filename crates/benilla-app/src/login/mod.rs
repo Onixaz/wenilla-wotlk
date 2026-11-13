@@ -376,6 +376,8 @@ fn to_select_on_auth(
     intent.park = IoPark::Active;
     intent.retry_at = None;
     if *state.get() == ClientState::Login {
+        // The page's cover goes up in this frame, the one the glue manager puts the screen up in.
+        crate::webprogress::signal_charselect_once();
         next.set(ClientState::CharSelect);
     }
 }

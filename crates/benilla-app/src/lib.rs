@@ -544,6 +544,8 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
     if cfg!(target_arch = "wasm32") {
         // The page saves a changed `locale` and offers the reload that applies it.
         app.add_systems(PostStartup, webprogress::observe_locale);
+        // Exit Game closes the tab, or leaves the page's "left the game" screen.
+        shutdown::on_app_exit(&mut app, webprogress::signal_exit.into_configs());
     }
     app.add_systems(
         OnEnter(char_select::ClientState::CharSelect),
@@ -560,7 +562,11 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
         );
         app.add_systems(
             Update,
-            (web_glue_ahead::fetch_create_set_once, web_glue_ahead::steer)
+            (
+                web_glue_ahead::fetch_create_set_once,
+                // Off the preview the click's frame fed, so the cover rises with that frame.
+                web_glue_ahead::steer.after(portrait::GluePreviewFeed),
+            )
                 .run_if(not(in_state(char_select::ClientState::InWorld))),
         );
     }

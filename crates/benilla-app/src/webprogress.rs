@@ -20,15 +20,18 @@
 //! - `"ready"`  — the first glue screen (login *or* character select: the env fast path skips
 //!   Login entirely) has spawned. The page fades its overlay here. Sent once, ever —
 //!   [`signal_ready_once`] — because both screens' `materialize_screen` run every frame.
-//! - `"charselect"` — the character screens are entered for the first time, so the page can cover
-//!   the scene's first load as it covers the first glue screen. Sent once, ever.
+//! - `"charselect"` — the character screens go up for the first time, so the page can cover the
+//!   scene's first load as it covers the first glue screen: on the world server's authentication,
+//!   in the frame the screen is put up, else on entering them. Sent once, ever.
 //! - `"charcreate"` — Character Create opened before its models reached the page's disk
 //!   ([`crate::web_glue_ahead`]): the page covers it while they download.
 //! - `"charcreate-ready"` — that download ended: the page lifts the cover, if it shows one.
+//! - `"exit"` — the client is going down (Exit Game, `QuitGame`): the page closes its tab where
+//!   the browser lets a script do that, else covers the stopped canvas with a way back in.
 //!
 //! Native builds: every function is a no-op; there is no page.
 
-use bevy::prelude::{Commands, On};
+use bevy::prelude::{AppExit, Commands, MessageReader, On};
 
 use crate::cvars::CvarChanged;
 
@@ -84,8 +87,8 @@ pub(crate) fn signal_ready_once() {
     }
 }
 
-/// The `OnEnter` system behind the `"charselect"` stage: one edge per process, since only the
-/// first visit loads the scene.
+/// The `"charselect"` stage, from the authentication edge and the `OnEnter` system: one edge per
+/// process, since only the first visit loads the scene.
 pub(crate) fn signal_charselect_once() {
     use std::sync::atomic::{AtomicBool, Ordering};
     static SENT: AtomicBool = AtomicBool::new(false);
@@ -98,4 +101,12 @@ pub(crate) fn signal_charselect_once() {
 /// app's other one-line wiring.
 pub(crate) fn signal_startup() {
     signal("startup");
+}
+
+/// The `"exit"` stage, on the exit frame alongside the savers ([`crate::shutdown::on_app_exit`]);
+/// the page acts on it once this frame's task ends, so their writes land first.
+pub(crate) fn signal_exit(mut exits: MessageReader<AppExit>) {
+    if exits.read().next().is_some() {
+        signal("exit");
+    }
 }

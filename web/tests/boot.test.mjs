@@ -4,7 +4,7 @@ import test from 'node:test';
 
 const source = (await readFile(new URL('../boot.js', import.meta.url), 'utf8'))
   .replaceAll('import.meta.url', JSON.stringify(new URL('../boot.js', import.meta.url).href));
-const { boot, chooseDataRoot, missingWebGpu, pickLocale, reloadUrl, whenSettled } = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
+const { boot, chooseDataRoot, leaveGame, missingWebGpu, pickLocale, reloadUrl, whenSettled } = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
 const wasmBytes = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]);
 const deferred = () => {
   let resolve;
@@ -249,16 +249,14 @@ test('the cover reads Downloading over the sliding bar until the client starts, 
   assert.equal(children.get('.stage').textContent, 'Starting…');
 });
 
-test('Character Create shows its cover only while the creation set is still coming in', async t => {
+test('Character Create raises its cover at once and lifts it when the creation set is in', async t => {
   const children = setup(t, async url => String(url).endsWith('manifest.json')
     ? new Response(JSON.stringify({ names: [] }))
     : String(url).startsWith('/data/') ? new Response('', { status: 404 })
     : new Response(wasmBytes, { headers: { 'content-type': 'application/wasm' } }));
   await boot(async () => ({ memory: null }));
-  let timers = [];
-  let id = 0;
-  globalThis.setTimeout = (f, ms) => (timers.push({ f, ms, id: ++id }), id);
-  globalThis.clearTimeout = n => { timers = timers.filter(x => x.id !== n); };
+  globalThis.setTimeout = () => 0;
+  globalThis.clearTimeout = () => {};
   const covers = [];
   globalThis.document.body.appendChild = el => covers.push(el);
   const create = globalThis.document.createElement;
@@ -269,23 +267,44 @@ test('Character Create shows its cover only while the creation set is still comi
     return el;
   };
   window.__wenilla_data = undefined; // nothing left to read: the screen counts as settled
-  const fire = () => { const due = timers; timers = []; due.forEach(x => x.f()); };
 
-  // Already on disk: ready lands inside the grace, no cover.
+  // In the same call, so the page draws it with the screen's first frame: no flash.
   window.__wenilla_progress('charcreate');
-  window.__wenilla_progress('charcreate-ready');
-  fire();
-  assert.equal(covers.length, 0);
-
-  // Still downloading: the cover shows, with the later covers' one title, until ready.
-  window.__wenilla_progress('charcreate');
-  assert.equal(timers[0].ms, 300);
-  fire();
   assert.equal(covers.length, 1);
   assert.equal(children.get('.stage').textContent, 'Loading character creation…');
   window.__wenilla_progress('charcreate');
-  assert.equal(timers.length, 1, 'one cover at a time (its timeout only)');
+  assert.equal(covers.length, 1, 'one cover at a time');
   window.__wenilla_progress('charcreate-ready');
   await new Promise(r => setImmediate(r));
   assert.ok(covers[0].classes.has('gone'));
+  // A ready with no cover up changes nothing.
+  window.__wenilla_progress('charcreate-ready');
+  assert.equal(covers.length, 1);
+});
+
+test('Exit Game closes the tab, and a tab the browser keeps shows the left-the-game screen', t => {
+  const children = setup(t, async () => new Response(''));
+  let timers = [];
+  globalThis.setTimeout = (f, ms) => timers.push({ f, ms });
+  const fire = () => { const due = timers; timers = []; due.forEach(x => x.f()); };
+  let closed = 0;
+  let reloaded = 0;
+  leaveGame({ win: { close: () => closed++ }, reload: () => reloaded++ });
+  assert.equal(closed, 0, 'not inside the exit frame: its saves come first');
+  fire();
+  assert.equal(closed, 1);
+  assert.equal(timers[0].ms, 300);
+  fire();
+  assert.equal(children.get('.stage').textContent, 'You have left the game.');
+  // The stub's appendChild drops the button: find it through the one created last.
+  let made;
+  const create = globalThis.document.createElement;
+  globalThis.document.createElement = () => (made = create());
+  leaveGame({ win: { close() { throw new Error('not closable'); } }, reload: () => reloaded++ });
+  fire();
+  fire();
+  assert.equal(made.textContent, 'Play again');
+  assert.equal(made.className, 'again');
+  made.onclick();
+  assert.equal(reloaded, 1);
 });
