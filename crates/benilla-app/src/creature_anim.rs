@@ -16,8 +16,8 @@ use benilla_world::schedule::WorldStage;
 /// The pure selection logic: the tables, the gait, swing and ready picks, the rate math.
 pub(crate) mod select;
 pub(crate) use select::{
-    ease_strafe_yaw, ease_swim_pitch, move_flags, strafe_body_offset, swim_body_rotation,
-    MovementState,
+    ease_strafe_yaw, ease_swim_pitch, ease_swim_roll, move_flags, smoothed_swim_rotation,
+    strafe_body_offset, swim_body_rotation, MovementState,
 };
 use select::{Mode, Special};
 
@@ -53,45 +53,71 @@ pub(crate) struct Wielded {
     /// `UNIT_FIELD_FLAGS & UNIT_FLAG_DISARMED`, replicated for every unit; the reference reads it
     /// inside the weapon getter (`[[unit+0x110]+0xa0] & 0x200000`), for creatures as for players.
     pub(crate) disarmed: bool,
+    /// `UNIT_FIELD_FLAGS_2`'s off-hand and ranged disarm bits, read by the same weapon getter.
+    pub(crate) disarm_offhand: bool,
+    pub(crate) disarm_ranged: bool,
 }
 
 /// `UNIT_FIELD_FLAGS` bit 21 (vmangos `UnitDefines.h:566`), tested inside the weapon getter, the
 /// player's and the unit's alike.
 pub(crate) const UNIT_FLAG_DISARMED: u32 = 0x0020_0000;
+/// `UNIT_FIELD_FLAGS_2` bit 7: disarm the off hand without testing for a weapon.
+pub(crate) const UNIT_FLAG2_DISARM_OFFHAND: u32 = 0x0000_0080;
+/// `UNIT_FIELD_FLAGS_2` bit 10: disarm the ranged hand.
+pub(crate) const UNIT_FLAG2_DISARM_RANGED: u32 = 0x0000_0400;
 
 /// `ItemClass` 2, weapon: the disarm ladder's whole test, so a shield is never the hand it hides.
 pub(crate) const ITEM_CLASS_WEAPON: u8 = 2;
 
-/// The one held slot the disarm hides: the main hand if it holds a weapon, else the off hand if it
-/// does (the weapon getter's held read); the ranged slot is never gated, as vmangos agrees
-/// (`Unit.h:991`). Over classes so the action bar's equipped-item test can use it on raw inventory.
-pub(crate) fn disarmed_hand(main_class: Option<u8>, off_class: Option<u8>) -> Option<usize> {
-    if main_class == Some(ITEM_CLASS_WEAPON) {
-        return Some(0);
+/// The disarm test (`0x718fc0`) for melee `hand` (0 main, 1 off) over the hands' item classes:
+/// under `UNIT_FLAG_DISARMED` the main hand if it holds a weapon, else the off hand if it does;
+/// the off hand also under `UNIT_FIELD_FLAGS_2 & 0x80` with no weapon test (`0x719038`). Hand 2
+/// is never disarmed here (`0x718fc8`); the weapon getter tests its own flag.
+pub(crate) fn hand_disarmed(
+    hand: usize,
+    disarmed: bool,
+    disarm_offhand: bool,
+    main_class: Option<u8>,
+    off_class: Option<u8>,
+) -> bool {
+    let main_weapon = main_class == Some(ITEM_CLASS_WEAPON);
+    match hand {
+        0 => disarmed && main_weapon,
+        1 => (disarmed && !main_weapon && off_class == Some(ITEM_CLASS_WEAPON)) || disarm_offhand,
+        _ => false,
     }
-    if off_class == Some(ITEM_CLASS_WEAPON) {
-        return Some(1);
-    }
-    None
 }
 
 impl Wielded {
-    /// The held slot this unit's disarm hides now, `None` while the flag is down.
-    pub(crate) fn disarmed_hand(&self) -> Option<usize> {
-        self.disarmed
-            .then(|| disarmed_hand(self.main.map(|(c, _)| c), self.off.map(|(c, _)| c)))
-            .flatten()
+    /// The held slots (main, off, ranged) the weapon getter reads as empty (`0x71f440`): the
+    /// melee hands by [`hand_disarmed`], ranged by `UNIT_FIELD_FLAGS_2 & 0x400`.
+    pub(crate) fn disarmed_hands(&self) -> [bool; 3] {
+        let hand = |h| {
+            hand_disarmed(
+                h,
+                self.disarmed,
+                self.disarm_offhand,
+                self.main.map(|(c, _)| c),
+                self.off.map(|(c, _)| c),
+            )
+        };
+        [hand(0), hand(1), self.disarm_ranged]
     }
 
     /// The main hand as the weapon getter's held read sees it, read by the swing, the Ready idle,
     /// the parry table, the sheath machine and the swing sound.
     pub(crate) fn armed_main(&self) -> Option<(u8, u8)> {
-        self.main.filter(|_| self.disarmed_hand() != Some(0))
+        self.main.filter(|_| !self.disarmed_hands()[0])
     }
 
     /// The off hand as the weapon getter's held read sees it.
     pub(crate) fn armed_off(&self) -> Option<(u8, u8)> {
-        self.off.filter(|_| self.disarmed_hand() != Some(1))
+        self.off.filter(|_| !self.disarmed_hands()[1])
+    }
+
+    /// The ranged hand as the weapon getter's held read sees it.
+    pub(crate) fn armed_ranged(&self) -> Option<(u8, u8)> {
+        self.ranged.filter(|_| !self.disarm_ranged)
     }
 }
 
@@ -362,15 +388,18 @@ impl AttackSeam<'_, '_> {
     }
 }
 
-/// Mid-cast (`SMSG_SPELL_START` to GO or failure), inserted only for a nonzero cast time and
-/// removed by the same spell id (the reference's reap is keyed by spell id).
+/// The unit's cast state (`+0xa60`): set by a start (`0x805330`), cleared by its spell and count's
+/// end (`0x7fed81`).
 #[derive(Component, Clone, Copy)]
+#[component(storage = "SparseSet")]
 pub(crate) struct Casting {
     pub(crate) spell_id: u32,
     /// The start's `castCount`, which an interrupt must match (`0x72ed80`).
     pub(crate) cast_count: u8,
     #[allow(dead_code)]
     pub(crate) until: Option<Instant>,
+    /// Its pending cast is still listed, which `IsCurrentSpell` tests (`0x805f30`).
+    pub(crate) listed: bool,
 }
 
 /// The reference's animation play order: handlers run in packet order and the later play wins
@@ -418,13 +447,21 @@ pub(crate) enum CastEventKind {
     },
     /// A projectile with no live target at arrival (a located cast, a target gone, an object): the
     /// impact area kit plays through `entity`, the caster or our player, at `pos` (`0x700e20`).
-    GroundImpact { pos: Vec3 },
+    GroundImpact {
+        pos: Vec3,
+        /// The aim's transport and the point in its frame, which the kit rides (`0x700e20`).
+        deck: Option<(Entity, Vec3)>,
+    },
     /// A missile landing on its area reached this listed unit (`0x70105d`): its impact kit and,
     /// under the hit's aura test, its state kit, both carrying `caster`, with no flinch.
     AreaImpact { caster: Entity },
     /// A missile landing on its area reached this extra point: the target kit plays there through
     /// the caster (`0x701150`).
-    PointImpact { pos: Vec3 },
+    PointImpact {
+        pos: Vec3,
+        /// The point's transport and the point in its frame, which the kit rides (`0x701150`).
+        deck: Option<(Entity, Vec3)>,
+    },
 }
 
 /// The anim held while a cast is in flight (`SpellVisualKit` field 2): full-body when standing
@@ -530,6 +567,16 @@ impl AnimPlayFlags {
     /// The Special1H/2H remap from the held hands applies.
     pub(crate) fn remap_special(self) -> bool {
         self.0 & (Self::RAW | Self::NO_SPECIAL) == 0
+    }
+
+    /// The id this play arms ahead of any resolve: Special1H/2H remapped from the held hands unless
+    /// the play skips it (`0x73870a`).
+    pub(crate) fn special(self, id: u16, wielded: Option<&Wielded>) -> u16 {
+        if !self.remap_special() {
+            return id;
+        }
+        let w = wielded.copied().unwrap_or_default();
+        select::special_anim(id, w.armed_main(), w.armed_off())
     }
 
     /// The unit's anim tier resolves the id.
@@ -681,10 +728,14 @@ pub(crate) struct SpellGoTargets {
     pub(crate) list: Vec<(u64, u8, u8)>,
     /// The targets' flag mask, which picks the missiles' kind (`0x7fffb0`).
     pub(crate) target_mask: u32,
-    /// The source point, in bevy coords.
+    /// The source point, in bevy coords: its world place at the GO.
     pub(crate) src: Option<Vec3>,
-    /// A dest-targeted cast's ground point, in bevy coords.
+    /// The source point's transport and the point in its frame.
+    pub(crate) src_deck: Option<(Entity, Vec3)>,
+    /// A dest-targeted cast's ground point, in bevy coords: its world place at the GO.
     pub(crate) dest: Option<Vec3>,
+    /// The dest point's transport and the point in its frame, which its effects ride (`0x80f031`).
+    pub(crate) dest_deck: Option<(Entity, Vec3)>,
     /// The extra target points, in bevy coords; one whose transport is not here is dropped.
     pub(crate) points: Vec<crate::entities::DeckPoint>,
     /// The GO's ammo block (`castFlags & 0x20`), a missile's model for column 8's 0, -4 and -5.
@@ -1388,21 +1439,21 @@ mod disarm_tests {
             ..worn
         };
 
-        assert_eq!(worn.disarmed_hand(), None);
+        assert_eq!(worn.disarmed_hands(), [false; 3]);
         assert_eq!(select::swing_anim_main(worn.armed_main()), 17); // Attack1H
         assert_eq!(select::swing_anim_off(worn.armed_off()), 88); // AttackOffPierce
         assert_eq!(select::ready_anim(worn.armed_main()), 26); // Ready1H
 
         // The main hand's claim skips the off-hand probe.
-        assert_eq!(disarmed.disarmed_hand(), Some(0));
+        assert_eq!(disarmed.disarmed_hands(), [true, false, false]);
         assert_eq!(disarmed.armed_main(), None);
         assert_eq!(disarmed.armed_off(), Some((2, 0xf)), "the off hand is KEPT");
         assert_eq!(select::swing_anim_main(disarmed.armed_main()), 16); // AttackUnarmed
         assert_eq!(select::swing_anim_off(disarmed.armed_off()), 88); // still the dagger
         assert_eq!(select::ready_anim(disarmed.armed_main()), 25); // ReadyUnarmed
 
-        // The ranged slot has no gate.
-        assert_eq!(disarmed.ranged, Some((2, 0x2)));
+        // The main flag leaves the ranged slot alone (`0x718fc8`).
+        assert_eq!(disarmed.armed_ranged(), Some((2, 0x2)));
         assert_eq!(select::ranged_load_anim(disarmed.ranged), 105); // LoadBow
 
         assert_eq!(disarmed.main, worn.main);
@@ -1418,7 +1469,7 @@ mod disarm_tests {
             disarmed: true,
             ..Default::default()
         };
-        assert_eq!(off_only.disarmed_hand(), Some(1));
+        assert_eq!(off_only.disarmed_hands(), [false, true, false]);
         assert_eq!(off_only.armed_off(), None);
         assert_eq!(select::swing_anim_off(off_only.armed_off()), 117);
 
@@ -1428,7 +1479,7 @@ mod disarm_tests {
             disarmed: true,
             ..Default::default()
         };
-        assert_eq!(torch.disarmed_hand(), Some(1));
+        assert_eq!(torch.disarmed_hands(), [false, true, false]);
         assert_eq!(
             torch.armed_main(),
             Some((15, 0)),
@@ -1446,18 +1497,74 @@ mod disarm_tests {
             disarmed: true,
             ..Default::default()
         };
-        assert_eq!(shielded.disarmed_hand(), None);
+        assert_eq!(shielded.disarmed_hands(), [false; 3]);
         assert_eq!(shielded.armed_off(), Some((4, 6)));
     }
 
-    /// The pure ladder over classes, as the action bar's equipped-item test reads it.
+    /// The pure ladder over classes (`0x718fc0`), as the equipped-item search reads it.
     #[test]
     fn the_ladder_over_classes() {
-        assert_eq!(disarmed_hand(Some(2), Some(2)), Some(0));
-        assert_eq!(disarmed_hand(Some(2), None), Some(0));
-        assert_eq!(disarmed_hand(None, Some(2)), Some(1));
-        assert_eq!(disarmed_hand(Some(4), Some(2)), Some(1));
-        assert_eq!(disarmed_hand(None, None), None);
-        assert_eq!(disarmed_hand(Some(4), Some(4)), None);
+        let hands = |main, off, offhand_flag| {
+            [0, 1].map(|h| hand_disarmed(h, true, offhand_flag, main, off))
+        };
+        assert_eq!(hands(Some(2), Some(2), false), [true, false]);
+        assert_eq!(hands(Some(2), None, false), [true, false]);
+        assert_eq!(hands(None, Some(2), false), [false, true]);
+        assert_eq!(hands(Some(4), Some(2), false), [false, true]);
+        assert_eq!(hands(None, None, false), [false, false]);
+        assert_eq!(hands(Some(4), Some(4), false), [false, false]);
+        assert!(
+            !hand_disarmed(2, true, true, Some(2), Some(2)),
+            "hand 2 never"
+        );
+    }
+
+    /// `UNIT_FIELD_FLAGS_2 & 0x80` takes the off hand whatever it holds (`0x719038`), alone or
+    /// beside the main flag's main hand.
+    #[test]
+    fn the_off_hand_flag_takes_the_off_hand_with_no_weapon_test() {
+        let shield = Wielded {
+            main: None,
+            off: Some((4, 6)),
+            disarm_offhand: true,
+            ..Default::default()
+        };
+        assert_eq!(shield.disarmed_hands(), [false, true, false]);
+        assert_eq!(shield.armed_off(), None);
+
+        let both = Wielded {
+            main: Some((2, 7)),
+            off: Some((2, 15)),
+            disarmed: true,
+            disarm_offhand: true,
+            ..Default::default()
+        };
+        assert_eq!(both.disarmed_hands(), [true, true, false]);
+        assert_eq!(both.armed_main(), None);
+        assert_eq!(both.armed_off(), None);
+    }
+
+    /// `UNIT_FIELD_FLAGS_2 & 0x400` takes the ranged slot alone, and beside the main flag both go.
+    #[test]
+    fn the_ranged_flag_takes_the_ranged_slot_beside_the_melee_ladder() {
+        let ranged = Wielded {
+            main: Some((2, 7)),
+            off: Some((2, 15)),
+            ranged: Some((2, 2)),
+            disarm_ranged: true,
+            ..Default::default()
+        };
+        assert_eq!(ranged.disarmed_hands(), [false, false, true]);
+        assert_eq!(ranged.armed_main(), ranged.main);
+        assert_eq!(ranged.armed_off(), ranged.off);
+        assert_eq!(ranged.armed_ranged(), None);
+
+        let all = Wielded {
+            disarmed: true,
+            ..ranged
+        };
+        assert_eq!(all.disarmed_hands(), [true, false, true]);
+        assert_eq!(all.armed_main(), None);
+        assert_eq!(all.armed_off(), all.off);
     }
 }

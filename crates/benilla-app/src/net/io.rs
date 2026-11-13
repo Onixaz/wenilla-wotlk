@@ -1198,6 +1198,7 @@ async fn stream(
                     );
                 }
                 for ev in events {
+                    super::wire_audit::inbound(&ev);
                     // The pong bypass: the reference's receive path hands `SMSG_PONG` to its pong
                     // handler inline, not onto the game thread's queue, so it is timed and consumed
                     // here.
@@ -1309,6 +1310,7 @@ pub(super) fn apply_swap(
             writer: w,
             fresh_link,
         } => {
+            super::wire_audit::reset(w.mover());
             *writer = Some(w);
             *warned = 0;
             // Sequence 1 is the new socket's first ping, so an old socket's pong cannot match.
@@ -1453,6 +1455,7 @@ pub(super) fn writer_loop(
 /// can do, apart from [`writer_loop`] so the page's per-frame pump (`crate::net`) sends the same
 /// bytes. The map is total: a new command without a send fails to compile here.
 pub(super) fn dispatch(w: &mut WorldWriter, cmd: ClientCommand) -> Result<()> {
+    super::wire_audit::outbound(&cmd, w.mover());
     match cmd {
         ClientCommand::Move {
             kind,

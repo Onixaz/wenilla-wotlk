@@ -679,7 +679,7 @@ impl WorldSession {
         let count = self.cast_counter.take();
         self.send(
             opcode::CMSG_CAST_SPELL,
-            &messages::cast_spell_at_dest(count, spell_id, dest),
+            &messages::cast_spell_at_dest(count, spell_id, dest.into()),
         )
     }
 

@@ -256,6 +256,20 @@ pub(crate) fn live_enchant(fields: &ObjectFields, slot: u8, cat: Option<&Enchant
     cat.is_some_and(|c| c.0.has_row(id)).then_some(id)
 }
 
+/// The skill and rank an item's use enchant asks (`0x706ec0`, `0x708f15`): the first of the twelve
+/// slots whose row casts a use spell, `None` when that row asks no skill.
+pub(crate) fn use_enchant_skill(
+    fields: &ObjectFields,
+    cat: Option<&Enchants>,
+) -> Option<(u32, u32)> {
+    let cat = &cat?.0;
+    let id = (0..ENCHANT_SLOTS as u8)
+        .filter_map(|slot| u32::try_from(fields.item_enchant(slot)?).ok())
+        .find(|&id| cat.use_spell(id) != 0)?;
+    let r = cat.requirement(id)?;
+    (r.skill != 0).then_some((r.skill, r.skill_rank))
+}
+
 /// A gem enchant's condition row as the VM's tooltip reads it.
 pub(crate) fn condition_view(
     c: &benilla_formats::EnchantCondition,
@@ -661,6 +675,8 @@ pub(crate) fn test_spawn_item(
 /// `EQUIPMENT_SLOT_MAINHAND` / `_OFFHAND` (vmangos `EquipmentSlots`).
 pub(crate) const EQUIPMENT_SLOT_MAINHAND: u8 = 15;
 pub(crate) const EQUIPMENT_SLOT_OFFHAND: u8 = 16;
+/// The ranged equipment slot.
+pub(crate) const EQUIPMENT_SLOT_RANGED: u8 = 17;
 
 /// One equipment slot's item class; `None` while empty or its template is in flight.
 fn equipped_class(
@@ -681,42 +697,58 @@ pub(crate) fn is_disarmed(store: &ObjectStore) -> bool {
     store.0.unit_flags() & crate::creature_anim::UNIT_FLAG_DISARMED != 0
 }
 
-/// The equipment slot this character's disarm hides ([`crate::creature_anim::disarmed_hand`] over
-/// the raw inventory), for the action bar's equipped-item requirement and the item-use refusal
-/// (the item use's rung 15). `None` while the flag is down or neither hand holds a weapon.
-pub(crate) fn disarmed_equipment_slot(
+/// The equipment slots this character's disarm hides, one bit per slot, as the equipped-item
+/// search strips them (`0x6de230`): main and off hand by [`crate::creature_anim::hand_disarmed`]
+/// over the raw inventory, ranged by `UNIT_FIELD_FLAGS_2 & 0x400`. 0 with every flag down.
+pub(crate) fn disarmed_equipment_slots(
     store: &ObjectStore,
     objects: &Objects,
     items: &Items,
     commands: &NetCommands,
-) -> Option<u8> {
-    if !is_disarmed(store) {
-        return None;
-    }
-    let main = equipped_class(store, objects, items, commands, EQUIPMENT_SLOT_MAINHAND);
-    let off = equipped_class(store, objects, items, commands, EQUIPMENT_SLOT_OFFHAND);
-    crate::creature_anim::disarmed_hand(main, off).map(|hand| EQUIPMENT_SLOT_MAINHAND + hand as u8)
+) -> u32 {
+    disarmed_slots_by(store, |slot| {
+        equipped_class(store, objects, items, commands, slot)
+    })
 }
 
-/// [`disarmed_equipment_slot`] without the ask.
-pub(crate) fn disarmed_equipment_slot_cached(
+/// [`disarmed_equipment_slots`] without the ask.
+pub(crate) fn disarmed_equipment_slots_cached(
     store: &ObjectStore,
     objects: &Objects,
     items: &Items,
-) -> Option<u8> {
-    if !is_disarmed(store) {
-        return None;
-    }
-    let class_of = |slot: u8| -> Option<u8> {
+) -> u32 {
+    disarmed_slots_by(store, |slot| {
         let guid = store.0.player_inv_slot(slot).filter(|&g| g != 0)?;
         let entry = objects.object(guid).and_then(|o| o.object_entry())?;
         Some(items.template_cached(entry)?.class as u8)
-    };
-    crate::creature_anim::disarmed_hand(
-        class_of(EQUIPMENT_SLOT_MAINHAND),
-        class_of(EQUIPMENT_SLOT_OFFHAND),
-    )
-    .map(|hand| EQUIPMENT_SLOT_MAINHAND + hand as u8)
+    })
+}
+
+/// [`disarmed_equipment_slots`] over `class_of`, which reads one slot's item class.
+fn disarmed_slots_by(store: &ObjectStore, class_of: impl Fn(u8) -> Option<u8>) -> u32 {
+    use crate::creature_anim::{UNIT_FLAG2_DISARM_OFFHAND, UNIT_FLAG2_DISARM_RANGED};
+    let flags2 = store.0.unit_flags2();
+    let disarmed = is_disarmed(store);
+    let disarm_offhand = flags2 & UNIT_FLAG2_DISARM_OFFHAND != 0;
+    let mut slots = 0;
+    if disarmed || disarm_offhand {
+        let (main, off) = (
+            class_of(EQUIPMENT_SLOT_MAINHAND),
+            class_of(EQUIPMENT_SLOT_OFFHAND),
+        );
+        for (hand, slot) in [EQUIPMENT_SLOT_MAINHAND, EQUIPMENT_SLOT_OFFHAND]
+            .into_iter()
+            .enumerate()
+        {
+            if crate::creature_anim::hand_disarmed(hand, disarmed, disarm_offhand, main, off) {
+                slots |= 1 << slot;
+            }
+        }
+    }
+    if flags2 & UNIT_FLAG2_DISARM_RANGED != 0 {
+        slots |= 1 << EQUIPMENT_SLOT_RANGED;
+    }
+    slots
 }
 
 /// A minimal valid item template named `name`; the sentinels that matter are `allowable_*` = -1
@@ -783,6 +815,9 @@ pub(crate) fn test_template(name: &str) -> ItemInfo {
         flags2: 0,
         required_disenchant_skill: -1,
         item_limit_category: 0,
+        scaling_stat_distribution: 0,
+        scaling_stat_value: 0,
+        armor_damage_modifier: 0.0,
     }
 }
 
@@ -1125,6 +1160,41 @@ mod tests {
     /// One item object with the given `ITEM_FIELD_FLAGS` and enchant slot 0.
     fn item(flags: u32, slot0: u32) -> ObjectFields {
         ObjectFields::from_pairs(&[(21, flags), (22, slot0)])
+    }
+
+    /// Against the install: a use enchant that asks a skill answers it from its slot; a negative
+    /// id, a skill enchant with no use spell and an empty item answer none. Skips without data.
+    #[test]
+    fn a_use_enchant_answers_its_skill_requirement() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let mut chain = benilla_formats::open_chain(&data).expect("open chain");
+        let cat = Enchants(
+            benilla_formats::load_enchant_catalog(&mut chain).expect("the enchant table"),
+            Default::default(),
+        );
+        let asks_skill = |id: u32| cat.0.requirement(id).is_some_and(|r| r.skill != 0);
+        let asked: Vec<u32> = (cat.0.ids())
+            .filter(|&id| cat.0.use_spell(id) != 0 && asks_skill(id))
+            .collect();
+        assert!(!asked.is_empty(), "no use enchant asks a skill");
+        for id in asked {
+            let r = cat.0.requirement(id).expect("asked");
+            assert_eq!(
+                use_enchant_skill(&item(0, id), Some(&cat)),
+                Some((r.skill, r.skill_rank)),
+                "enchant {id}"
+            );
+            assert_eq!(
+                use_enchant_skill(&item(0, id.wrapping_neg()), Some(&cat)),
+                None
+            );
+        }
+        let plain = (cat.0.ids())
+            .find(|&id| cat.0.use_spell(id) == 0 && asks_skill(id))
+            .expect("a skill enchant with no use spell");
+        assert_eq!(use_enchant_skill(&item(0, plain), Some(&cat)), None);
+        assert_eq!(use_enchant_skill(&item(0, 0), Some(&cat)), None);
+        assert_eq!(use_enchant_skill(&item(0, plain), None), None);
     }
 
     /// The Firestone shape binds and prints no line, so a predicate read off [`enchant_lines`]

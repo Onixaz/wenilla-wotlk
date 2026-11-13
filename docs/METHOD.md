@@ -98,7 +98,7 @@ crate of its own or a fork, and benilla opens a piece of itself to such a crate 
   (`BENILLA_REQUIRE_DATA=1`). Run it once per round; `tee` the output to a file and grep the
   file.
 - **The land gates**: `scripts/gates.sh`, the check's chain without the data and the player
-  build, for a pull request from an external contributor; CI runs it on a fork's pull request. It
+  build, for a pull request from an external contributor; CI runs it on every pull request. It
   is memoized on the tree. It adds one gate the check does not run: `wasm-clocks`
   (`scripts/wasm-lint.sh`), clippy on wasm32 refusing std's `Instant`, `SystemTime`, `sleep` and
   `spawn`, which build there and panic on the page. CI runs it on every pull request (`check.yml`),

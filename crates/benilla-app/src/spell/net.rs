@@ -410,6 +410,7 @@ fn on_spell_start(In(ev): In<SessionEvent>, mut l: Lifecycle, mut sc: Scene) {
             immunities,
             &mut sc.commands,
             &l.index,
+            &sc.casting,
             &mut sc.cast_events,
             &l.self_guid,
             &mut l.cast_bar,
@@ -471,6 +472,21 @@ fn on_spell_go(In(ev): In<SessionEvent>, mut l: Lifecycle, mut sc: Scene, mut ar
                 })
             })
             .collect();
+        let deck = |guid: u64| {
+            let e = *l.index.0.get(&guid)?;
+            Some((e, *sc.decks.get(e).ok()?))
+        };
+        let wire = dest;
+        let src = src.map(|(p, t)| resolve_point(p, t, deck));
+        let dest = dest.map(|(p, t)| resolve_point(p, t, deck));
+        // A source or dest on a transport not here ends the GO at its release (`0x80e647`).
+        let here = !matches!(src, Some(None)) && !matches!(dest, Some(None));
+        if benilla_assets::trace::enabled_for("dfx") {
+            benilla_assets::trace::line(
+                "dfx",
+                &format!("go spell={spell_id} wire={wire:?} dest={dest:?} here={here}"),
+            );
+        }
         let engaged = !sc.engaged_self.is_empty();
         spell_go(
             caster,
@@ -483,7 +499,7 @@ fn on_spell_go(In(ev): In<SessionEvent>, mut l: Lifecycle, mut sc: Scene, mut ar
             reflects,
             target,
             go_target,
-            (target_mask, src, dest, points),
+            (target_mask, src.flatten(), dest.flatten(), points, here),
             ammo.map(
                 |(display_id, inventory_type)| crate::creature_anim::ItemModel {
                     display_id,
@@ -1186,8 +1202,11 @@ fn cast_result(
         }
         // Only the failure of the cast the bar shows (keyed to our `Casting`) red-fades it: a
         // pre-start rejection opened no bar, and a proc's failure names another spell.
-        let fails_our_cast =
-            self_e.is_some_and(|e| casting.get(e).is_ok_and(|c| c.spell_id == spell_id));
+        let fails_our_cast = self_e.is_some_and(|e| {
+            casting
+                .get(e)
+                .is_ok_and(|c| (c.spell_id, c.cast_count) == (spell_id, cast_count))
+        });
         if *crate::net::CAST_TRACE {
             info!("cast-trace: RECV CAST_RESULT failure — spell {spell_id} reason={reason:?}; fails_bar={fails_our_cast}");
         }
@@ -1265,6 +1284,7 @@ fn spell_start(
     immunities: Option<(u32, u32)>,
     commands: &mut Commands,
     index: &GuidIndex,
+    casting: &Query<&Casting>,
     cast_events: &mut MessageWriter<CastEvent>,
     self_guid: &SelfGuid,
     cast_bar: &mut CastBarFeed,
@@ -1272,7 +1292,6 @@ fn spell_start(
     spells: Option<&crate::ui_action::Spells>,
     seq: u64,
 ) {
-    // A nonzero cast time marks the caster `Casting`; an instant gets none, its GO follows at once.
     debug!(
         "net: spell start {spell_id} by {caster:#x} ({cast_time_ms}ms, flags \
          {cast_flags:#x}, target {target:?}, ammo {ammo_display_id:?})"
@@ -1315,7 +1334,8 @@ fn spell_start(
             }
         );
     }
-    // Our own timed cast opens the bar.
+    // A hidden start (`castFlags & 1`) skips the cast state, precast and UI start (`0x80694e`).
+    let hidden = cast_flags & 0x1 != 0;
     // Every caster's start reaches the unit-cast feed, which applies the event gate.
     cast_bar.0.push(CastBarEdge::Start {
         caster,
@@ -1323,18 +1343,43 @@ fn spell_start(
         cast_count,
         cast_time_ms,
         immunities,
+        hidden,
     });
     if self_guid.0 == Some(caster) && cast_time_ms > 0 {
         // The real cast time replaces the guard's send-time deadline, ranged casts included.
         pending.refine(cast_time_ms, Instant::now());
     }
-    if let Some(&e) = index.0.get(&caster) {
-        if cast_time_ms > 0 {
-            commands.entity(e).insert(Casting {
-                spell_id,
-                cast_count,
-                until: Some(Instant::now() + Duration::from_millis(u64::from(cast_time_ms))),
-            });
+    if let Some(&e) = index.0.get(&caster).filter(|_| !hidden) {
+        let fresh = Casting {
+            spell_id,
+            cast_count,
+            until: (cast_time_ms > 0)
+                .then(|| Instant::now() + Duration::from_millis(u64::from(cast_time_ms))),
+            listed: true,
+        };
+        let shows_bar = cast_time_ms > 0
+            && spells
+                .and_then(|s| s.catalog.get(spell_id))
+                .is_none_or(|d| {
+                    crate::ui_cast::raises_events(d, self_guid.0 == Some(caster), false)
+                });
+        match casting.get(e).ok().copied() {
+            // Set when none is held (`0x8053cd`).
+            None => {
+                commands.entity(e).insert(fresh);
+            }
+            // A timed start with a shown bar replaces another spell's (`0x80544e`).
+            Some(held) if shows_bar && held.spell_id != spell_id => {
+                commands.entity(e).insert(fresh);
+            }
+            // A same-spell restart keeps the held count; its new pending cast is listed.
+            Some(held) if held.spell_id == spell_id && !held.listed => {
+                commands.entity(e).insert(Casting {
+                    listed: true,
+                    ..held
+                });
+            }
+            Some(_) => {}
         }
         // The precast edge, instants included: their GO follows at once and reaps the hold.
         cast_events.write(CastEvent {
@@ -1351,13 +1396,33 @@ fn spell_start(
 /// loot-target latch.
 const GO_TYPE_CHEST: i32 = 3;
 
-/// The targets' mask, source and dest points, and extra points.
+/// A target point's world place and, on a transport, the transport and the point in its frame.
+type PlacedPoint = (Vec3, Option<(Entity, Vec3)>);
+
+/// The targets' mask, source and dest points, extra points, and whether every transport the
+/// source and dest name is here.
 type GoPoints = (
     u32,
-    Option<[f32; 3]>,
-    Option<[f32; 3]>,
+    Option<PlacedPoint>,
+    Option<PlacedPoint>,
     Vec<crate::entities::DeckPoint>,
+    bool,
 );
+
+/// A wire point (raw WoW) placed through its transport, the world place at the GO
+/// (`0x9ab810`); `None` when the transport is not here (`0x7fd830`).
+fn resolve_point(
+    raw: [f32; 3],
+    transport: u64,
+    deck: impl Fn(u64) -> Option<(Entity, GlobalTransform)>,
+) -> Option<PlacedPoint> {
+    let at = benilla_assets::coords::wow_to_bevy(raw);
+    if transport == 0 {
+        return Some((at, None));
+    }
+    let (e, g) = deck(transport)?;
+    Some((crate::entities::deck_place(at, &g), Some((e, at))))
+}
 
 /// `SMSG_SPELL_GO`: the cast launched. The server schedules damage off `Spell.dbc` Speed; the
 /// packet carries the hit and miss lists and the ammo display id, and the flight is rebuilt from
@@ -1374,7 +1439,7 @@ fn spell_go(
     target: Option<u64>,
     go_target: Option<u64>,
     // The targets' mask with their source, dest and extra points.
-    (target_mask, src, dest, points): GoPoints,
+    (target_mask, src, dest, points, transports_here): GoPoints,
     ammo: Option<crate::creature_anim::ItemModel>,
     item_caster: Option<u64>,
     trajectory: Option<(f32, u32)>,
@@ -1417,6 +1482,30 @@ fn spell_go(
         hits.len(),
         misses.len()
     );
+    // A source or dest on a transport not here ends the GO at the pending cast's release: no
+    // feed edge, cooldown, swing, latch or visual (`0x80e647`-`0x80e686`).
+    let (cooldowns, spells, items, net_commands, pet_bar, spell_mods) = cooldown_ctx;
+    if !transports_here {
+        if self_guid.0 == Some(caster) {
+            pending.clear_if(spell_id);
+            queued_melee.clear_if(spell_id);
+        }
+        if pet_bar.has_bar() && pet_bar.spells.pet_guid == caster {
+            pet_bar.pending_cast = None;
+        }
+        // The caster's cast state stays; the next start or end clears it (`0x805330`, `0x7fecc0`).
+        if let Some(&e) = index.0.get(&caster) {
+            if let Ok(&held) = casting.get(e) {
+                if (held.spell_id, held.cast_count) == (spell_id, cast_count) {
+                    commands.entity(e).insert(Casting {
+                        listed: false,
+                        ..held
+                    });
+                }
+            }
+        }
+        return;
+    }
     // Every caster's launch reaches the unit-cast feed (`0x80e763`).
     cast_bar.0.push(CastBarEdge::Go {
         caster,
@@ -1443,7 +1532,6 @@ fn spell_go(
     if let Some(go_guid) = go_target {
         go_lid.write(crate::go_anim::GoLidOpen { go_guid, spell_id });
     }
-    let (cooldowns, spells, items, net_commands, pet_bar, spell_mods) = cooldown_ctx;
     let (auto_repeat, sheath, engaged) = attack_ctx;
     let now = Instant::now();
     let display = spells.and_then(|s| s.catalog.get(spell_id));
@@ -1466,10 +1554,11 @@ fn spell_go(
     if self_guid.0 == Some(caster) {
         // Only the cast the bar shows completes it: a proc landing mid-cast (Chilled, 6136) is our
         // own cast too, and must not finish the running bar.
-        let completes_our_cast = index
-            .0
-            .get(&caster)
-            .is_some_and(|&e| casting.get(e).is_ok_and(|c| c.spell_id == spell_id));
+        let completes_our_cast = index.0.get(&caster).is_some_and(|&e| {
+            casting
+                .get(e)
+                .is_ok_and(|c| (c.spell_id, c.cast_count) == (spell_id, cast_count))
+        });
         if *crate::net::CAST_TRACE {
             info!("cast-trace: RECV SPELL_GO — spell {spell_id} (self); completes_bar={completes_our_cast}");
         }
@@ -1584,10 +1673,12 @@ fn spell_go(
         cooldowns.collect(now);
         pet_bar.cooldowns.collect(now);
     }
-    // Keyed by spell id, like the reap `(spellId, 0)`: a proc's GO must not clear another spell's
-    // precast state.
+    // The end clears the held state of this spell and count alone (`0x7fed81`).
     if let Some(&e) = index.0.get(&caster) {
-        if casting.get(e).is_ok_and(|c| c.spell_id == spell_id) {
+        if casting
+            .get(e)
+            .is_ok_and(|c| (c.spell_id, c.cast_count) == (spell_id, cast_count))
+        {
             commands.entity(e).remove::<Casting>();
         }
         // The GO's one target list: hits then misses, swapped by flag 0x400 (`0x80ec10`,
@@ -1633,8 +1724,8 @@ fn spell_go(
             .filter_map(|&(g, code)| index.0.get(&g).map(|&e| (e, code)))
             .collect();
         // A pure dest cast (ground AoE, empty lists) rides the same message: the point is a target.
-        let dest = dest.map(benilla_assets::coords::wow_to_bevy);
-        let src = src.map(benilla_assets::coords::wow_to_bevy);
+        let (dest, dest_deck) = dest.map_or((None, None), |(p, d)| (Some(p), d));
+        let (src, src_deck) = src.map_or((None, None), |(p, d)| (Some(p), d));
         if !hits.is_empty()
             || !misses.is_empty()
             || dest.is_some()
@@ -1649,7 +1740,9 @@ fn spell_go(
                 list,
                 target_mask,
                 src,
+                src_deck,
                 dest,
+                dest_deck,
                 points,
                 ammo,
                 seq,
@@ -1693,10 +1786,11 @@ fn spell_failed_other(
     // Only the cast the bar shows turns it red "Interrupted" (keyed to `Casting`); the guard opens
     // either way.
     if self_guid.0 == Some(caster) {
-        let interrupts_our_cast = index
-            .0
-            .get(&caster)
-            .is_some_and(|&e| casting.get(e).is_ok_and(|c| c.spell_id == spell_id));
+        let interrupts_our_cast = index.0.get(&caster).is_some_and(|&e| {
+            casting
+                .get(e)
+                .is_ok_and(|c| (c.spell_id, c.cast_count) == (spell_id, cast_count))
+        });
         if *crate::net::CAST_TRACE {
             info!("cast-trace: RECV SPELL_FAILED_OTHER — spell {spell_id} (self); interrupts_bar={interrupts_our_cast}");
         }
@@ -1704,10 +1798,10 @@ fn spell_failed_other(
         // The melee-slot interrupt's other half, beside the failing CAST_RESULT.
         queued_melee.clear_if(spell_id);
     }
-    // Keyed by spell id, like the reap (the 0x2A6 handler's `(spellId, 0)`).
+    // The end clears the held state of this spell and count alone (`0x7fed81`).
     if let Some(&e) = index.0.get(&caster) {
         let running = casting.get(e).ok();
-        if running.is_some_and(|c| c.spell_id == spell_id) {
+        if running.is_some_and(|c| (c.spell_id, c.cast_count) == (spell_id, cast_count)) {
             commands.entity(e).remove::<Casting>();
         }
         // `SMSG_SPELL_FAILURE` interrupts the running cast of this spell and count (`0x72ed80`).
@@ -1959,6 +2053,28 @@ fn spell_chain_targets(
 mod tests {
     use super::*;
     use crate::spell::learn_place::Learner;
+
+    /// A point with no transport is its own world place; one on a transport here is placed
+    /// through it and keeps its local point; one on a transport not here resolves to nothing
+    /// (`0x9ab810`, `0x7fd830`).
+    #[test]
+    fn a_target_point_is_placed_through_its_transport() {
+        use std::f32::consts::FRAC_PI_2;
+        const BOAT: u64 = 0x1FC0_0000_0000_0010;
+        let deck = Entity::from_raw_u32(7).expect("valid entity id");
+        let pose = GlobalTransform::from(
+            Transform::from_xyz(100.0, 0.0, 0.0).with_rotation(Quat::from_rotation_y(FRAC_PI_2)),
+        );
+        let here = |g: u64| (g == BOAT).then_some((deck, pose));
+        let raw = [3.0, 0.0, 1.0];
+        let local = benilla_assets::coords::wow_to_bevy(raw);
+        assert_eq!(resolve_point(raw, 0, here), Some((local, None)));
+        let (world, on) = resolve_point(raw, BOAT, here).unwrap();
+        assert_eq!(on, Some((deck, local)));
+        let want = Vec3::new(100.0, 0.0, 0.0) + Quat::from_rotation_y(FRAC_PI_2) * local;
+        assert!(world.distance(want) < 1e-4, "{world} vs {want}");
+        assert_eq!(resolve_point(raw, BOAT + 1, here), None);
+    }
 
     /// Another unit's cancel ends only its ranged mode; ours clears our auto-repeat, sending
     /// nothing back.
@@ -2571,6 +2687,7 @@ mod tests {
                     spell_id: 133,
                     cast_count: 0,
                     until: None,
+                    listed: true,
                 },
                 ObjectStore::default(),
             ))
@@ -2582,7 +2699,7 @@ mod tests {
         app.world_mut().resource_mut::<SelfGuid>().0 = Some(10);
 
         // One `spell_go` call, parameterized by the completing spell id.
-        let fire_go = |app: &mut App, go_spell: u32| {
+        let fire_go = |app: &mut App, go_spell: u32, here: bool| {
             let (tx, _rx) = crossbeam_channel::unbounded();
             app.world_mut()
                 .run_system_once(
@@ -2613,7 +2730,7 @@ mod tests {
                             Vec::new(),
                             None,
                             None,
-                            (0, None, None, Vec::new()),
+                            (0, None, None, Vec::new(), here),
                             None,
                             None,
                             None,
@@ -2651,8 +2768,8 @@ mod tests {
 
         // Every GO reaches the feed, a proc's (6136) too; the feed ends only the running cast,
         // keyed by spell and castCount (`0x7fee38`).
-        fire_go(&mut app, 6136);
-        fire_go(&mut app, 133);
+        fire_go(&mut app, 6136, true);
+        fire_go(&mut app, 133, true);
         let go = |spell_id| CastBarEdge::Go {
             caster: 10,
             spell_id,
@@ -2663,6 +2780,104 @@ mod tests {
             app.world().resource::<CastBarFeed>().0,
             vec![go(6136), go(133)]
         );
+
+        // A dest on a transport not here (`0x80e647`): the pending cast is released, the cast
+        // state stays, and no feed edge.
+        app.world_mut().entity_mut(self_e).insert(Casting {
+            spell_id: 10,
+            cast_count: 0,
+            until: None,
+            listed: true,
+        });
+        app.world_mut()
+            .resource_mut::<PendingCast>()
+            .arm(10, Instant::now(), true);
+        fire_go(&mut app, 10, false);
+        assert_eq!(app.world().resource::<CastBarFeed>().0.len(), 2);
+        assert_eq!(
+            app.world()
+                .resource::<PendingCast>()
+                .committed(Instant::now()),
+            None
+        );
+        // Held, but its pending cast is no longer listed (`0x805f30`).
+        assert_eq!(
+            app.world()
+                .get::<Casting>(self_e)
+                .map(|c| (c.spell_id, c.listed)),
+            Some((10, false))
+        );
+
+        // One `spell_start` call: (count, spell, cast time).
+        let start = |app: &mut App, count: u8, spell: u32, cast_ms: u32, flags: u32| {
+            app.world_mut()
+                .run_system_once(
+                    move |mut commands: Commands,
+                          index: Res<GuidIndex>,
+                          casting: Query<&Casting>,
+                          mut cast_events: MessageWriter<CastEvent>,
+                          self_guid: Res<SelfGuid>,
+                          mut cast_bar: ResMut<CastBarFeed>,
+                          mut pending: ResMut<PendingCast>| {
+                        spell_start(
+                            10,
+                            count,
+                            spell,
+                            flags,
+                            cast_ms,
+                            None,
+                            None,
+                            None,
+                            &mut commands,
+                            &index,
+                            &casting,
+                            &mut cast_events,
+                            &self_guid,
+                            &mut cast_bar,
+                            &mut pending,
+                            None,
+                            2,
+                        );
+                    },
+                )
+                .unwrap();
+        };
+        let held = |app: &App| {
+            app.world()
+                .get::<Casting>(self_e)
+                .map(|c| (c.spell_id, c.cast_count, c.listed))
+        };
+
+        // An instant leaves another spell's held state (`0x8053cd`).
+        start(&mut app, 1, 6136, 0, 0);
+        assert_eq!(held(&app), Some((10, 0, false)));
+        // A timed start of another spell replaces it (`0x80544e`).
+        start(&mut app, 1, 133, 2500, 0);
+        assert_eq!(held(&app), Some((133, 1, true)));
+        // A same-spell restart keeps the held count.
+        start(&mut app, 2, 133, 2500, 0);
+        assert_eq!(held(&app), Some((133, 1, true)));
+        // The end of another count leaves it; its own count clears it (`0x7fed81`).
+        fire_go(&mut app, 133, true);
+        assert_eq!(held(&app), Some((133, 1, true)));
+        app.world_mut().entity_mut(self_e).insert(Casting {
+            spell_id: 133,
+            cast_count: 0,
+            until: None,
+            listed: true,
+        });
+        fire_go(&mut app, 133, true);
+        assert_eq!(held(&app), None);
+        // With none held, an instant sets it.
+        start(&mut app, 3, 6136, 0, 0);
+        assert_eq!(held(&app), Some((6136, 3, true)));
+        // A hidden start (`castFlags & 1`) leaves it, with no precast edge (`0x80694e`).
+        app.world_mut()
+            .resource_mut::<Messages<CastEvent>>()
+            .clear();
+        start(&mut app, 4, 133, 2500, 0x1);
+        assert_eq!(held(&app), Some((6136, 3, true)));
+        assert!(app.world().resource::<Messages<CastEvent>>().is_empty());
     }
 
     /// Our channel's start and its server end (`MSG_CHANNEL_UPDATE(0)`) arm and close
@@ -2823,7 +3038,7 @@ mod tests {
                         Vec::new(),
                         None,
                         None,
-                        (0, None, None, Vec::new()),
+                        (0, None, None, Vec::new(), true),
                         None,
                         item_caster.or(Some(caster)),
                         None,
@@ -3031,7 +3246,7 @@ mod tests {
                         Vec::new(),
                         None,
                         None,
-                        (0, None, None, Vec::new()),
+                        (0, None, None, Vec::new(), true),
                         None,
                         None,
                         None,
@@ -3423,7 +3638,7 @@ mod tests {
                             // A different guid from `hits[0]`, which the arm must take.
                             Some(99),
                             None,
-                            (0, None, None, Vec::new()),
+                            (0, None, None, Vec::new(), true),
                             None,
                             None,
                             None,

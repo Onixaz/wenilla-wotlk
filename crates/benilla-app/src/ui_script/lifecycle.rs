@@ -63,6 +63,7 @@ fn install_glue_vm(world: &mut World, screen: super::glue::GlueScreen) -> bool {
     let Some(mut script) = new_vm(world, UiScript::new_glue) else {
         return false;
     };
+    script.set_glue_file_reader(Box::new(super::reference_ui::read));
     seat_raster_seam_for_load(world, &mut script);
     // The CVar table before the files load: the options panels read their CVars in `OnLoad`, and
     // this VM was born before `cvars::sync_cvars`'s per-VM seed.
@@ -133,9 +134,22 @@ fn new_vm<E: std::fmt::Display>(
     seed_vm_clock(world, &mut script);
     script.set_live_clock(true);
     seed_class_names(world, &mut script);
+    seed_paperdoll_item_frame(world, &mut script);
     install_addon_asset_resolvers(world, &mut script);
     info!("ui_script: new VM, session {}", script.session());
     Some(script)
+}
+
+/// Hand the new VM `PaperDollItemFrame.dbc`'s rows, which the inventory verbs resolve a slot name
+/// through; without them `GetInventorySlotInfo` raises on every name.
+fn seed_paperdoll_item_frame(world: &mut World, script: &mut UiScript) {
+    let Some(assets) = world.get_resource::<benilla_assets::WorldAssets>() else {
+        return;
+    };
+    let Some(rows) = super::reference_ui::paperdoll_rows(&assets.chain.lock_recover()) else {
+        return;
+    };
+    script.set_paperdoll_item_frame(rows);
 }
 
 /// Hand the new VM `ChrClasses.dbc`'s names before its first file: `Constants.lua:87` calls

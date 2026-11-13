@@ -37,8 +37,6 @@ const ATTR_EX4_WEAPON_SPEED_COST: u32 = 0x0000_0400;
 const UNARMED_COST_SPEED: u32 = 2000;
 /// The item flag that keeps a broken item usable (`0x6d71ab`).
 const ITEM_FLAG_BREAK_IGNORED: u32 = 0x0000_0008;
-/// The unit's second-word flag that disarms the off hand alone (`0x719038`).
-const UNIT_FLAG2_DISARM_OFFHAND: u32 = 0x0000_0080;
 
 /// The implicit targets leg 10b forks on: 6, single enemy, asks the attack check; 21, single
 /// friend, asks the assist check.
@@ -125,6 +123,8 @@ pub(crate) struct RuneCheck<'a> {
 
 /// `POWER_RUNE`, the power type the power check sends to the rune check (`0x8017fe`).
 pub(crate) const POWER_RUNE: u32 = 5;
+/// `POWER_HEALTH`, the power type the power check compares against health (`0x8017f9`).
+const POWER_HEALTH: i32 = -2;
 
 /// The rune kinds `SpellRuneCost.dbc` charges, then death, which stands in for any (`0x5ee786`).
 const RUNE_BLOOD: u8 = 0;
@@ -304,9 +304,7 @@ pub(crate) fn equipped_item_fits_cached(
         return true;
     }
     let mut mask = hand_mask(d);
-    if let Some(hidden) = crate::items::disarmed_equipment_slot_cached(store, objects, items) {
-        mask &= !(1u32 << hidden);
-    }
+    mask &= !crate::items::disarmed_equipment_slots_cached(store, objects, items);
     equipped_slots_match(
         store,
         mask,
@@ -426,10 +424,8 @@ pub(crate) fn equipped_item_fits(
     }
     let class = d.equipped_item_class as u32;
     let mut mask = hand_mask(d);
-    // The disarm ladder strips the one hidden hand from the mask.
-    if let Some(hidden) = crate::items::disarmed_equipment_slot(store, objects, items, commands) {
-        mask &= !(1u32 << hidden);
-    }
+    // The disarm strips each hidden hand from the mask (`0x6de230`).
+    mask &= !crate::items::disarmed_equipment_slots(store, objects, items, commands);
     equipped_slots_match(store, mask, class, d.equipped_item_subclass_mask, |guid| {
         let (entry, durability, max_durability) = objects.object(guid).and_then(|o| {
             Some((
@@ -773,11 +769,9 @@ fn held_item_usable(item: &benilla_protocol::ObjectFields) -> bool {
     flags & ITEM_FLAG_DEPRECATED == 0 && (flags & ITEM_FLAG_BREAK_IGNORED != 0 || !broken)
 }
 
-/// The per-hand disarm test (`0x718fc0`): the disarm ladder, or the off hand's own flag.
+/// The per-hand disarm test (`0x718fc0`) on equipment `slot`, main or off hand.
 fn hand_disarmed(store: &ObjectStore, objects: &Objects, items: &Items, slot: u8) -> bool {
-    crate::items::disarmed_equipment_slot_cached(store, objects, items) == Some(slot)
-        || (slot == crate::items::EQUIPMENT_SLOT_OFFHAND
-            && store.0.unit_flags2() & UNIT_FLAG2_DISARM_OFFHAND != 0)
+    crate::items::disarmed_equipment_slots_cached(store, objects, items) & (1 << slot) != 0
 }
 
 /// What [`power_cost_at`] scales `d`'s percentage cost, a jump table on the power type plus 2, on
@@ -817,16 +811,19 @@ pub(crate) fn cost_reads_weapon(d: &SpellDisplay) -> bool {
     d.attributes_ex4 & ATTR_EX4_WEAPON_SPEED_COST != 0
 }
 
-/// Whether the caster can afford `d`, for leg 12 and the press-path gate: `UNIT_FIELD_POWER[type]`,
-/// or `UNIT_FIELD_HEALTH` for any negative PowerType (Bloodrage's -2), against [`power_cost`].
+/// Whether the caster can afford `d`, for leg 12 and the press-path gate (`0x8017e0`): health
+/// strictly above the cost for `POWER_HEALTH` (`0x801866`), else the cost at most the pool
+/// (`0x80181d`). Runes go to [`RuneCheck`] before this.
 pub(crate) fn can_afford(d: &SpellDisplay, store: &ObjectStore, mods: &SpellModifiers) -> bool {
-    let power_type = d.power_type as i32;
-    let avail = if power_type < 0 {
-        store.0.unit_health().unwrap_or(0)
-    } else {
-        store.0.unit_power(power_type as u8).unwrap_or(0)
-    };
-    avail >= power_cost(d, store, mods)
+    let unit = &store.0;
+    let cost = power_cost(d, store, mods);
+    let health = || unit.unit_predicted_health().unwrap_or(0);
+    match d.power_type as i32 {
+        POWER_HEALTH => cost < health(),
+        // `0x71c2e0` indexes the pools by type, so -1 lands on the health slot before power 0.
+        -1 => cost <= health(),
+        ty => cost <= unit.unit_power(ty as u8).unwrap_or(0),
+    }
 }
 
 #[cfg(test)]
@@ -1591,8 +1588,52 @@ mod tests {
         assert!(!can_afford(&bloodrage, &below_cost, &mods));
         assert_eq!(walk(&bloodrage, &below_cost), (false, true));
 
+        let equal_cost = player(&[(22, 337), (28, 4_000), (163, 1_689)]);
+        assert!(!can_afford(&bloodrage, &equal_cost, &mods));
+        assert_eq!(walk(&bloodrage, &equal_cost), (false, true));
+
         let without_gear = player(&[(22, 400), (28, 1_689), (163, 1_689)]);
         assert_eq!(power_cost(&bloodrage, &without_gear, &mods), 337);
+    }
+
+    /// The power check (`0x8017e0`): health must exceed a `POWER_HEALTH` cost, -1 reads health
+    /// through the pool index at most the cost, and a pool type is at most the cost.
+    #[test]
+    fn the_power_check_is_strict_on_health_alone() {
+        let mods = SpellModifiers::default();
+        let flat = |power_type: i32| SpellDisplay {
+            power_type: power_type as u32,
+            mana_cost: 100,
+            ..Default::default()
+        };
+        let health = |hp: u32| player(&[(22, hp), (23, 0)]);
+        assert!(can_afford(&flat(-2), &health(101), &mods));
+        assert!(!can_afford(&flat(-2), &health(100), &mods));
+        assert!(!can_afford(&flat(-2), &health(99), &mods));
+        assert!(can_afford(&flat(-1), &health(101), &mods));
+        assert!(can_afford(&flat(-1), &health(100), &mods));
+        assert!(!can_afford(&flat(-1), &health(99), &mods));
+        assert!(can_afford(&flat(0), &player(&[(22, 0), (23, 100)]), &mods));
+        assert!(!can_afford(
+            &flat(0),
+            &player(&[(22, 1_000), (23, 99)]),
+            &mods
+        ));
+    }
+
+    /// `0x71c2c0` reads the predicted health `SMSG_HEALTH_UPDATE` set over the raw field.
+    #[test]
+    fn a_health_cost_reads_the_predicted_health() {
+        let mods = SpellModifiers::default();
+        let spell = SpellDisplay {
+            power_type: POWER_HEALTH as u32,
+            mana_cost: 100,
+            ..Default::default()
+        };
+        let mut store = player(&[(22, 100)]);
+        assert!(!can_afford(&spell, &store, &mods));
+        assert!(store.0.set_predicted_health(101));
+        assert!(can_afford(&spell, &store, &mods));
     }
 
     /// The reference's jump table (indexed by the type plus 2): base health for -2, base mana,

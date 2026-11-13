@@ -161,6 +161,8 @@ pub(super) fn load_core(script: &UiScript) -> Vec<String> {
     let Some(core) = reference_ui::core() else {
         return load_core_missing(script);
     };
+    // Stock `PaperDollItemSlotButton_OnLoad` reads the slot table, which a world's VM has from birth.
+    reference_ui::seat_paperdoll_rows(script);
     let mut toc = benilla_ui::status::Status::default();
     let mut failures = core.load_files_into(script, &core.toc.files, &mut toc);
     failures.extend(close_core(script, toc));
@@ -557,18 +559,26 @@ mod tests {
             )
             .unwrap();
         let row = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        assert_eq!(
-            rows,
-            [
-                row(&["HEADER_INTERFACE"]),
-                row(&["TOGGLEBACKPACK", "B"]),
-                row(&["HEADER_MOVEMENT"]),
-                row(&["JUMP", "J"]),
-            ]
-        );
+        let mut want = vec![
+            row(&["HEADER_INTERFACE"]),
+            row(&["TOGGLEBACKPACK", "B"]),
+            row(&["HEADER_MOVEMENT"]),
+            row(&["JUMP", "J"]),
+        ];
+        // The Mac build keeps the `platform="mac"` row and its header; the PC build drops both.
+        let mac = cfg!(target_os = "macos");
+        if mac {
+            want.push(row(&["HEADER_ITUNES_REMOTE"]));
+            want.push(row(&["ITUNES_PLAYPAUSE"]));
+        }
+        assert_eq!(rows, want);
         assert!(s.execute_binding("JUMP", true).unwrap());
         assert_eq!(s.eval::<String>("return PROBED").unwrap(), "edited jump");
-        for skipped in ["TOGGLESTATS", "EMPTYROW", "NESTEDROW", "ITUNES_PLAYPAUSE"] {
+        let mut skipped = vec!["TOGGLESTATS", "EMPTYROW", "NESTEDROW"];
+        if !mac {
+            skipped.push("ITUNES_PLAYPAUSE");
+        }
+        for skipped in skipped {
             assert!(
                 !s.execute_binding(skipped, true).unwrap(),
                 "{skipped} is no command"
