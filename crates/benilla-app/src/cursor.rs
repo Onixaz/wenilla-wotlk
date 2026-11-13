@@ -339,6 +339,10 @@ mod other {
         }
     }
 
+    /// The primary window as [`drive`] reads it: its entity, its canvas selector and whether its
+    /// cursor shows.
+    type CursorWindow = (Entity, &'static Window, &'static CursorOptions);
+
     /// The in-frame cursor `gxCursor` off draws, and the transparent image the OS cursor shows
     /// meanwhile.
     #[derive(Component)]
@@ -395,7 +399,7 @@ mod other {
         mut payload_cursors: ResMut<PayloadCursorImages>,
         mut urls: ResMut<CursorUrls>,
         screen: Res<crate::loading_screen::LoadingScreen>,
-        window: Option<Single<(Entity, &Window, &CursorOptions), With<PrimaryWindow>>>,
+        window: Option<Single<CursorWindow, With<PrimaryWindow>>>,
         // The key of the cursor last handed the window: OS state, so not a
         // [`crate::ui_script::VmMemo`].
         mut last_set: Local<Option<String>>,
@@ -530,8 +534,10 @@ mod other {
         (window, canvas, urls): (Entity, Option<&str>, &CursorUrls),
         handle: Handle<Image>,
     ) {
+        // Always empty off the page.
+        let url = urls.0.get(&handle.id());
         #[cfg(target_arch = "wasm32")]
-        if let Some(url) = urls.0.get(&handle.id()) {
+        if let Some(url) = url {
             if let Some(canvas) = canvas {
                 web::show_now(canvas, url);
             }
@@ -546,7 +552,7 @@ mod other {
             return;
         }
         #[cfg(not(target_arch = "wasm32"))]
-        let _ = (canvas, urls);
+        let _ = (canvas, url);
         commands
             .entity(window)
             .insert(CursorIcon::Custom(CustomCursor::Image(CustomCursorImage {
