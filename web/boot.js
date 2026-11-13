@@ -36,11 +36,12 @@ const READY_TIMEOUT_MS = 20000;
 // next file a frame or more after the last one lands, and the screen's first reads follow the
 // long frame that built it.
 const SETTLE_MS = 1500;
-// Character Create's cover: shown only if the creation set is still downloading this long after
-// the screen opened, so a set already on disk shows no cover at all; and lifted after this long
-// whatever is left, which then loads as the player clicks.
-const CREATE_SHOW_MS = 300;
+// Character Create's cover is lifted after this long whatever is left, which then loads as the
+// player clicks.
 const CREATE_TIMEOUT_MS = 90000;
+// After Exit Game: how long the page waits for the browser to close the tab before it shows the
+// "left the game" screen instead.
+const EXIT_CLOSE_MS = 300;
 /// The player's saved locale, written when they change the `locale` setting in game.
 export const LOCALE_KEY = 'wenilla:locale';
 
@@ -279,38 +280,55 @@ function startWorldPrefetch(store) {
 /// what earlier visits learned; whatever is still in flight when the player clicks Enter World
 /// just loads the old way.
 ///
+/// `exit` (Exit Game) closes the tab, or covers the stopped canvas (`leaveGame`).
+///
 /// `charcreate` opens Character Create's cover while the creation set downloads, for a player
 /// whose account had characters and so never fetched it ahead; `charcreate-ready` lifts it.
 function installProgressHook(ui) {
-  let create = null; // Character Create's pending or shown cover
+  let create = null; // Character Create's cover while it shows
   window.__wenilla_progress = (stage) => {
     if (stage === 'startup') ui.setStage('Loading interface…');
     else if (stage === 'charselect') {
+      // Sent on the world server's authentication, the frame the character screen goes up.
       if (!ui.gone()) return; // the boot cover is still up and already waits for these reads
       const cover = createBootUi();
       cover.setStage('Loading characters…');
       cover.armTimeout(READY_TIMEOUT_MS);
       whenSettled(window.__wenilla_data).then(() => cover.hide());
     } else if (stage === 'charcreate') {
+      // Raised at once, in the task of the frame that first draws the screen, so the page
+      // composites the two together: the client only sends this for a set not yet on disk.
       if (create) return;
-      const c = (create = { cover: null });
-      c.timer = setTimeout(() => {
-        c.cover = createBootUi();
-        c.cover.setStage('Loading character creation…');
-        c.cover.armTimeout(CREATE_TIMEOUT_MS);
-      }, CREATE_SHOW_MS);
+      create = createBootUi();
+      create.setStage('Loading character creation…');
+      create.armTimeout(CREATE_TIMEOUT_MS);
     } else if (stage === 'charcreate-ready') {
-      const c = create;
+      const cover = create;
       create = null;
-      if (!c) return;
-      clearTimeout(c.timer);
-      if (c.cover) whenSettled(window.__wenilla_data).then(() => c.cover.hide());
+      if (cover) whenSettled(window.__wenilla_data).then(() => cover.hide());
+    } else if (stage === 'exit') {
+      leaveGame();
     } else if (stage === 'ready') {
       ui.setStage('Preparing the screen…');
       whenSettled(window.__wenilla_data).then(() => ui.hide());
       window.__wenilla_data?.setPhase('world');
     }
   };
+}
+
+/// The client has gone down (Exit Game). Close the tab: a browser lets a script do that for a tab a
+/// script opened (a launcher's `window.open`), and some for a tab with no history, and otherwise
+/// ignores the call. A tab still open shows the "left the game" screen over the stopped canvas,
+/// with a way back in. Waits for the exit frame's task to end first, so its saves are written.
+export function leaveGame({ win = window, reload = () => location.reload() } = {}) {
+  setTimeout(() => {
+    try {
+      win.close();
+    } catch (_) {
+      /* not closable: the screen below */
+    }
+    setTimeout(() => createBootUi().end('You have left the game.', 'Play again', reload), EXIT_CLOSE_MS);
+  }, 0);
 }
 
 /// Resolves once `store.reading()` has stayed at zero for `quietMs`.
@@ -349,6 +367,11 @@ function createBootUi() {
          holds the main thread. 233.33% of the fill's own 30% is 70% of the bar. */
       @keyframes wboot-slide { 0%, 100% { transform: translateX(0) } 50% { transform: translateX(233.33%) } }
       #wenilla-boot .err { color: #e07070; text-align: center; }
+      #wenilla-boot .again { display: block; margin: 1rem auto 0; padding: .45rem 1.4rem;
+        font: inherit; color: #ccc; background: #000; border: 1px solid #c9a227;
+        border-radius: 3px; cursor: pointer; }
+      #wenilla-boot .again:hover, #wenilla-boot .again:focus-visible { color: #fff; background: #1a1a1a;
+        outline: none; }
     </style>
     <div class="box">
       <div class="stage"></div>
@@ -370,6 +393,17 @@ function createBootUi() {
       barEl.remove();
       stageEl.className = 'err';
       stageEl.textContent = text;
+    },
+    /// The cover as an end screen: `text` over one button that runs `onClick`.
+    end(text, action, onClick) {
+      clearTimeout(timeout);
+      barEl.remove();
+      stageEl.textContent = text;
+      const button = document.createElement('button');
+      button.className = 'again';
+      button.textContent = action;
+      button.onclick = onClick;
+      root.querySelector('.box').appendChild(button);
     },
     gone: () => gone,
     armTimeout(ms) {

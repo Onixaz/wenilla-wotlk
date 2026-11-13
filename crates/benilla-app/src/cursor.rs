@@ -276,6 +276,7 @@ impl Plugin for CursorPlugin {
             );
         #[cfg(not(target_os = "macos"))]
         app.init_resource::<other::PayloadCursorImages>()
+            .init_resource::<other::CursorUrls>()
             .add_systems(Startup, other::setup.after(AssetSet::Open))
             .add_systems(
                 Update,
@@ -308,7 +309,7 @@ mod other {
     use benilla_assets::{cursor_texture, WorldAssets};
     use bevy::platform::collections::{HashMap, HashSet};
     use bevy::prelude::*;
-    use bevy::window::{CursorIcon, CustomCursor, CustomCursorImage, PrimaryWindow};
+    use bevy::window::{CursorIcon, CursorOptions, CustomCursor, CustomCursorImage, PrimaryWindow};
 
     /// Stem → decoded cursor image, preloaded at startup.
     #[derive(Resource, Default)]
@@ -317,6 +318,30 @@ mod other {
     /// Held-payload icon path → its 32×32 cursor, built on first use and cached.
     #[derive(Resource, Default)]
     pub(super) struct PayloadCursorImages(HashMap<String, Handle<Image>>);
+
+    /// Each cursor image's PNG as a URL the page has already decoded, to hand winit in its place
+    /// (`web` below). winit builds a custom image cursor on the page in four asynchronous steps the
+    /// first time it is shown (an `ImageBitmap`, a canvas, a PNG blob, an image decode), each
+    /// waiting for a free moment between frames, so the first hover over a mob or a corpse showed
+    /// the old cursor for several frames. Empty off the page.
+    #[derive(Resource, Default)]
+    pub(super) struct CursorUrls(HashMap<AssetId<Image>, String>);
+
+    impl CursorUrls {
+        /// Encode `handle`'s image and have the page decode it now; nothing off the page.
+        fn add(&mut self, handle: &Handle<Image>, images: &Assets<Image>) {
+            #[cfg(target_arch = "wasm32")]
+            if let Some(url) = images.get(handle).and_then(web::decoded_url) {
+                self.0.insert(handle.id(), url);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            let _ = (handle, images);
+        }
+    }
+
+    /// The primary window as [`drive`] reads it: its entity, its canvas selector and whether its
+    /// cursor shows.
+    type CursorWindow = (Entity, &'static Window, &'static CursorOptions);
 
     /// The in-frame cursor `gxCursor` off draws, and the transparent image the OS cursor shows
     /// meanwhile.
@@ -329,8 +354,10 @@ mod other {
         mut commands: Commands,
         world_assets: Option<ResMut<WorldAssets>>,
         mut images: ResMut<Assets<Image>>,
+        mut urls: ResMut<CursorUrls>,
     ) {
         let blank = images.add(cursor_texture(1, 1, vec![0; 4]));
+        urls.add(&blank, &images);
         commands.spawn((
             SoftwareCursor { blank },
             ImageNode::default(),
@@ -349,6 +376,7 @@ mod other {
         for stem in CURSOR_STEMS {
             match world_assets.decode_cursor(&cursor_path(stem), &mut images) {
                 Some(handle) => {
+                    urls.add(&handle, &images);
                     map.insert(stem.to_string(), handle);
                 }
                 None => warn!("cursor {stem}.blp missing/undecodable — mode falls back"),
@@ -369,8 +397,9 @@ mod other {
         mut world_assets: Option<ResMut<WorldAssets>>,
         mut images: ResMut<Assets<Image>>,
         mut payload_cursors: ResMut<PayloadCursorImages>,
+        mut urls: ResMut<CursorUrls>,
         screen: Res<crate::loading_screen::LoadingScreen>,
-        window: Option<Single<Entity, With<PrimaryWindow>>>,
+        window: Option<Single<CursorWindow, With<PrimaryWindow>>>,
         // The key of the cursor last handed the window: OS state, so not a
         // [`crate::ui_script::VmMemo`].
         mut last_set: Local<Option<String>>,
@@ -379,14 +408,20 @@ mod other {
         let Some(window) = window else {
             return;
         };
+        let (window, win, options) = *window;
+        // The page's canvas (`Window::canvas`, `#benilla`) when the cursor shows.
+        let canvas = win.canvas.as_deref().filter(|_| options.visible);
         // A hardware/software flip re-sends whatever is showing.
         let mode = if video.hw_cursor { "hw" } else { "sw" };
-        let mut show = |commands: &mut Commands, handle: Handle<Image>| match sprite.single_mut() {
-            Ok((sw, mut node)) if !video.hw_cursor => {
-                set_custom_cursor(commands, *window, sw.blank.clone());
-                node.image = handle;
+        let mut show = |commands: &mut Commands, urls: &CursorUrls, handle: Handle<Image>| {
+            let to = (window, canvas, urls);
+            match sprite.single_mut() {
+                Ok((sw, mut node)) if !video.hw_cursor => {
+                    set_custom_cursor(commands, to, sw.blank.clone());
+                    node.image = handle;
+                }
+                _ => set_custom_cursor(commands, to, handle),
             }
-            _ => set_custom_cursor(commands, *window, handle),
         };
         let held_icon = script
             .as_ref()
@@ -403,6 +438,7 @@ mod other {
                 });
                 match built {
                     Some(handle) => {
+                        urls.add(&handle, &images);
                         payload_cursors.0.insert(icon.clone(), handle);
                     }
                     None => {
@@ -412,7 +448,7 @@ mod other {
                 }
             }
             if let Some(handle) = payload_cursors.0.get(&icon) {
-                show(&mut commands, handle.clone());
+                show(&mut commands, &urls, handle.clone());
                 *last_set = Some(key);
                 return;
             }
@@ -437,6 +473,7 @@ mod other {
                 warn!("cursor {stem}.blp missing/undecodable — the cursor is blank");
                 images.add(cursor_texture(1, 1, vec![0; 4]))
             });
+            urls.add(&handle, &images);
             cursors.0.insert(stem.clone(), handle);
         }
         let handle = cursors
@@ -445,7 +482,7 @@ mod other {
             .or_else(|| cursors.0.get(stem.trim_start_matches("Unable")))
             .or_else(|| cursors.0.get("Point"));
         if let Some(handle) = handle {
-            show(&mut commands, handle.clone());
+            show(&mut commands, &urls, handle.clone());
         }
         *last_set = Some(key);
     }
@@ -489,8 +526,33 @@ mod other {
         }
     }
 
-    /// Insert a custom cursor with hotspot `(0, 0)`, the vanilla cursors' top-left tip.
-    fn set_custom_cursor(commands: &mut Commands, window: Entity, handle: Handle<Image>) {
+    /// Insert a custom cursor with hotspot `(0, 0)`, the vanilla cursors' top-left tip, on
+    /// `window`: on the page, the image's decoded URL where [`CursorUrls`] has one, also written in
+    /// this frame to `canvas` (the window's selector, `None` while the cursor is hidden).
+    fn set_custom_cursor(
+        commands: &mut Commands,
+        (window, canvas, urls): (Entity, Option<&str>, &CursorUrls),
+        handle: Handle<Image>,
+    ) {
+        // Always empty off the page.
+        let url = urls.0.get(&handle.id());
+        #[cfg(target_arch = "wasm32")]
+        if let Some(url) = url {
+            if let Some(canvas) = canvas {
+                web::show_now(canvas, url);
+            }
+            commands
+                .entity(window)
+                .insert(CursorIcon::Custom(CustomCursor::Url(
+                    bevy::window::CustomCursorUrl {
+                        url: url.clone(),
+                        hotspot: (0, 0),
+                    },
+                )));
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = (canvas, url);
         commands
             .entity(window)
             .insert(CursorIcon::Custom(CustomCursor::Image(CustomCursorImage {
@@ -501,6 +563,59 @@ mod other {
                 rect: None,
                 hotspot: (0, 0),
             })));
+    }
+
+    /// The page's cursors: PNG blob URLs decoded ahead, and the canvas's own cursor style.
+    #[cfg(target_arch = "wasm32")]
+    mod web {
+        use std::cell::RefCell;
+
+        use bevy::prelude::Image;
+        use wasm_bindgen::JsCast;
+
+        thread_local! {
+            /// The decoded images, kept so the page keeps their pixels for the cursor style.
+            static DECODED: RefCell<Vec<web_sys::HtmlImageElement>> = const { RefCell::new(Vec::new()) };
+        }
+
+        /// `image` (RGBA8) as a PNG blob URL, its decode started; `None` if any step fails.
+        pub(super) fn decoded_url(image: &Image) -> Option<String> {
+            use ::image::ImageEncoder;
+            let rgba = image.data.as_deref()?;
+            let mut png = Vec::new();
+            ::image::codecs::png::PngEncoder::new(&mut png)
+                .write_image(
+                    rgba,
+                    image.width(),
+                    image.height(),
+                    ::image::ExtendedColorType::Rgba8,
+                )
+                .ok()?;
+            let parts = js_sys::Array::of1(&js_sys::Uint8Array::from(png.as_slice()));
+            let opts = web_sys::BlobPropertyBag::new();
+            opts.set_type("image/png");
+            let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &opts).ok()?;
+            let url = web_sys::Url::create_object_url_with_blob(&blob).ok()?;
+            let img = web_sys::HtmlImageElement::new().ok()?;
+            img.set_src(&url);
+            let _ = img.decode();
+            DECODED.with_borrow_mut(|d| d.push(img));
+            Some(url)
+        }
+
+        /// Write `url`'s cursor to the `selector` canvas now, in the style winit writes once its own
+        /// copy is ready, so the cursor changes with this frame.
+        pub(super) fn show_now(selector: &str, url: &str) {
+            let canvas = web_sys::window()
+                .and_then(|w| w.document())
+                .and_then(|d| d.query_selector(selector).ok().flatten())
+                .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok());
+            if let Some(canvas) = canvas {
+                let _ = canvas
+                    .style()
+                    .set_property("cursor", &format!("url({url}) 0 0, auto"));
+            }
+        }
     }
 }
 
