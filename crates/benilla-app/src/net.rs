@@ -26,6 +26,7 @@ pub(crate) mod io;
 mod motion;
 mod objects;
 mod parked;
+pub(crate) mod wire_audit;
 pub(crate) use objects::tear_down;
 pub(crate) use parked::ParkedObjects;
 mod session;
@@ -268,6 +269,8 @@ pub(crate) struct Guid(pub(crate) u64);
 
 /// A streamed entity's kind and display id, from which [`crate::entities`] builds its visual.
 #[derive(Component, Clone, Copy)]
+// The swim stamp rides in with the entity, so setting and clearing it moves no archetype.
+#[require(motion::SwimStamp)]
 pub(crate) struct NetEntity {
     pub(crate) kind: EntityKind,
     pub(crate) display_id: Option<u32>,
@@ -1404,12 +1407,12 @@ pub(crate) enum ClientCommand {
     /// `CMSG_CAST_SPELL` with `TARGET_FLAG_DEST_LOCATION`; `dest` in WoW coordinates.
     CastSpellAtDest {
         spell_id: u32,
-        dest: [f32; 3],
+        dest: benilla_protocol::messages::TargetPoint,
     },
     /// `CMSG_CAST_SPELL` with `TARGET_FLAG_SOURCE_LOCATION` (bit 5); `src` in WoW coordinates.
     CastSpellAtSource {
         spell_id: u32,
-        src: [f32; 3],
+        src: benilla_protocol::messages::TargetPoint,
     },
     /// `CMSG_CANCEL_AURA`, by spell id, not slot; the removal returns as a `UNIT_FIELD_AURA` delta.
     CancelAura {
@@ -2870,6 +2873,9 @@ pub(crate) struct TeleportMessage {
     pub(crate) counter: u32,
     pub(crate) position: [f32; 3],
     pub(crate) orientation: f32,
+    /// `(transport guid, pose in its frame, facing in its frame)`, set when the teleport keeps us
+    /// aboard: a transport's own same-map jump moves its passengers this way.
+    pub(crate) transport: Option<(u64, [f32; 3], f32)>,
 }
 
 /// An inbound `MSG_MOVE_*` for our own mover: always server-authored (vmangos

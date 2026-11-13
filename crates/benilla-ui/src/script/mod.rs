@@ -150,6 +150,7 @@ mod glue_realm;
 mod glue_select;
 mod glue_system;
 mod mirror_timer;
+pub use client::ClientOs;
 pub use glue::{VmKind, GLUE_EVENTS};
 pub use glue_addons::GlueAddonChange;
 pub use glue_core::{
@@ -165,7 +166,7 @@ pub use glue_realm::{
     GlueRealmType, RealmSortKey,
 };
 pub use glue_select::{GlueCharacter, GlueScenePane, GlueSelectCells};
-pub use glue_system::{GlueBilling, ScanDll};
+pub use glue_system::{GlueBilling, GlueFileReader, ScanDll};
 mod gm_ticket;
 mod gossip;
 mod guild;
@@ -183,6 +184,7 @@ mod input_verbs;
 mod inspect;
 mod inventory_verbs;
 mod item_link;
+mod item_scaling;
 mod item_search;
 mod item_stats;
 mod item_summary;
@@ -198,6 +200,7 @@ mod lfg;
 mod loot;
 mod loot_roll;
 mod lua51;
+mod mac_client;
 mod macros;
 mod mail;
 mod measure;
@@ -319,8 +322,8 @@ pub use camera_view::{CameraViewRequest, CAMERA_VIEW_COUNT};
 pub use channel::{ChannelCommand, ZoneChannelRow};
 pub use channel_pane::ChannelSlotInfo;
 pub use char_stats::{
-    weapon_subclass_skill, BankBagSlots, InvSlotView, InventorySlots, UnitCombatStats,
-    BANK_BAG_SLOT_COUNT, INVENTORY_SLOT_COUNT, SKILL_DEFENSE, SKILL_UNARMED,
+    weapon_subclass_skill, BankBagSlots, InvSlotView, InventorySlots, PaperDollSlotInfo,
+    UnitCombatStats, BANK_BAG_SLOT_COUNT, INVENTORY_SLOT_COUNT, SKILL_DEFENSE, SKILL_UNARMED,
 };
 pub use chat_misc::{EmoteRequest, EmoteTarget};
 pub use chat_send::ChatSend;
@@ -407,6 +410,7 @@ pub use glyph::{
 };
 pub use inspect::{InspectView, UnitReach};
 pub use instance::InstanceLock;
+pub use item_scaling::{ScalingDistributionView, ScalingTables, ScalingValuesView};
 pub use item_stats::equip_loc_token;
 pub use item_stats::{
     item_usable, item_use_refusal, EnchantEffectView, EnchantRowView, GemView, ItemLimitView,
@@ -505,9 +509,10 @@ pub use vehicle::{
 pub use weapon_enchant::WeaponEnchant;
 pub use who_sort::{WhoSortChain, WhoSortKey};
 pub use worldmap::{
-    WorldMapCatalog, WorldMapContinentView, WorldMapDungeonView, WorldMapExploreGate, WorldMapFeed,
-    WorldMapOverlayView, WorldMapPlayer, WorldMapPoiView, WorldMapPoint, WorldMapSelection,
-    WorldMapSheet, WorldMapState, WorldMapTransformView, WorldMapZoneView,
+    WorldMapCatalog, WorldMapChunkView, WorldMapContinentView, WorldMapDungeonView,
+    WorldMapExploreGate, WorldMapFeed, WorldMapOverlayView, WorldMapPlayer, WorldMapPoiView,
+    WorldMapPoint, WorldMapSelection, WorldMapSheet, WorldMapState, WorldMapTransformView,
+    WorldMapZoneView,
 };
 pub use worldstate::WorldStateUiView;
 pub use worn_display::WornDisplay;
@@ -975,10 +980,11 @@ pub fn addon_chunk_name(folder: &str, file: &str) -> String {
 /// shares with the in-game UI's init: the system table `0xad2184` (the clock and `ConsoleExec`),
 /// the frame-script table `0xaf5848` with the widget method tables, and the sound table
 /// `0xb2d928`.
-fn install_framescript(vm: VmKind) -> mlua::Result<Lua> {
+fn install_framescript(vm: VmKind, os: ClientOs) -> mlua::Result<Lua> {
     let lua = Lua::new();
     let mut model = Model::new();
     model.vm = vm;
+    model.os = os;
     lua.set_app_data(ModelCell::new(model));
     // Before anything can fire a handler and while no app-data borrow is held, as the
     // profiler's slot requires.
@@ -1155,7 +1161,12 @@ impl UiScript {
     /// The in-game VM: FrameScript's base set and the registrars both states share
     /// ([`install_framescript`]), then the in-game surface the UI init registers.
     pub fn new() -> mlua::Result<UiScript> {
-        let lua = install_framescript(VmKind::InGame)?;
+        Self::new_on(ClientOs::NATIVE)
+    }
+
+    /// [`Self::new`] answering as `os`'s build of the client, whatever this binary runs on.
+    pub fn new_on(os: ClientOs) -> mlua::Result<UiScript> {
+        let lua = install_framescript(VmKind::InGame, os)?;
         install_in_game(&lua)?;
         Ok(Self::host(lua))
     }
@@ -1165,7 +1176,12 @@ impl UiScript {
     /// ([`glue`]), and none of the in-game surface. Of the glue registrar's own four tables the
     /// screen verbs and the realm list are built ([`glue::install`]).
     pub fn new_glue() -> mlua::Result<UiScript> {
-        let lua = install_framescript(VmKind::Glue)?;
+        Self::new_glue_on(ClientOs::NATIVE)
+    }
+
+    /// [`Self::new_glue`] answering as `os`'s build of the client.
+    pub fn new_glue_on(os: ClientOs) -> mlua::Result<UiScript> {
+        let lua = install_framescript(VmKind::Glue, os)?;
         glue::install(&lua)?;
         Ok(Self::host(lua))
     }

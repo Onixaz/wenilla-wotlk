@@ -64,6 +64,9 @@ impl<T: Copy> IdMap<T> {
 pub(crate) struct Model {
     /// Which script state this VM is: it picks the event table and the frame types.
     pub(crate) vm: super::glue::VmKind,
+    /// Which build of the client this VM answers as: `IsMacClient`, the binding files' `platform`
+    /// filter and the Mac build's own verbs follow it.
+    pub(crate) os: super::client::ClientOs,
     /// Every discovered addon in load order: the AddOn API's registry, filled at world entry.
     pub(crate) addons: Vec<super::addon::AddOnInfo>,
     /// The Lua index space into `addons`, a title-sorted, hidden-filtered list.
@@ -1014,6 +1017,8 @@ pub(crate) struct Model {
     pub(crate) random_properties: HashMap<u32, super::RandomPropertyView>,
     /// `ItemRandomSuffix.dbc`, what a negative random-property id takes.
     pub(crate) random_suffixes: HashMap<u32, super::RandomSuffixView>,
+    /// `ScalingStatDistribution` and `ScalingStatValues`, pushed whole at startup.
+    pub(crate) scaling: super::ScalingTables,
     /// `SpellItemEnchantment.dbc`, pushed whole at startup: a link names any row.
     pub(crate) enchant_rows: HashMap<u32, super::EnchantRowView>,
     /// Quest tooltips by quest id, the quests a tooltip asked for, and the tooltips waiting.
@@ -1102,6 +1107,7 @@ pub(crate) struct Model {
     /// The pet's combat stats, which the reference's pet sheet reads as `UnitStat("pet", …)`.
     pub(crate) pet_combat_stats: Option<char_stats::UnitCombatStats>,
     pub(crate) inventory_slots: char_stats::InventorySlots,
+    pub(crate) paperdoll_item_frame: Vec<char_stats::PaperDollSlotInfo>,
     /// The seven bank-bag slots, ids 68..=74, fed from the player descriptor's guids.
     pub(crate) bank_bag_slots: char_stats::BankBagSlots,
     /// `GetInventoryAlertStatus` in `0xa1ce4c` order; a change fires `UPDATE_INVENTORY_ALERTS`.
@@ -1355,6 +1361,7 @@ impl Model {
     pub(crate) fn new() -> Model {
         Model {
             vm: super::glue::VmKind::InGame,
+            os: super::client::ClientOs::NATIVE,
             addons: Vec::new(),
             addon_index: Vec::new(),
             addon_info_hidden: None,
@@ -1802,6 +1809,7 @@ impl Model {
             random_properties: HashMap::new(),
             hovered_link: None,
             random_suffixes: HashMap::new(),
+            scaling: Default::default(),
             enchant_rows: HashMap::new(),
             quest_tooltips: HashMap::new(),
             quest_tooltip_asks: HashSet::new(),
@@ -1885,6 +1893,7 @@ impl Model {
             player_combat_stats: None,
             pet_combat_stats: None,
             inventory_slots: Default::default(),
+            paperdoll_item_frame: Vec::new(),
             bank_bag_slots: Default::default(),
             inventory_alerts: [0; 12],
             inventory_repairs: Vec::new(),

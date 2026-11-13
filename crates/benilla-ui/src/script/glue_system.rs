@@ -33,9 +33,17 @@ pub struct GlueBilling {
     pub rested: u32,
 }
 
+/// Reads one of the install's files by name for the glue's verbs.
+pub type GlueFileReader = Box<dyn Fn(&str) -> Option<Vec<u8>>>;
+
+/// [`GlueFileReader`], shared so a verb can call it without holding the model.
+type SharedFileReader = std::rc::Rc<dyn Fn(&str) -> Option<Vec<u8>>>;
+
 /// The system verbs' slots in the glue model.
 #[derive(Default)]
 pub(crate) struct GlueSystem {
+    /// Reads a file by its bare name, as `GetCreditsText` reads its credits file.
+    files: Option<SharedFileReader>,
     pub(super) scan: ScanDll,
     /// `SCANDLL_ERROR` waits for the glue manager's next idle tick (`0x4dab40` at state 14 finishes
     /// the scan), never inside the `ScanDLLStart` call.
@@ -48,6 +56,11 @@ pub(crate) struct GlueSystem {
 }
 
 impl super::UiScript {
+    /// Seat the reader the glue's verbs read the install's files through.
+    pub fn set_glue_file_reader(&mut self, reader: GlueFileReader) {
+        self.model_mut().glue.system.files = Some(std::rc::Rc::from(reader));
+    }
+
     /// The Scan.dll check's state.
     pub fn glue_scan(&self) -> ScanDll {
         self.model_ref().glue.system.scan
@@ -151,6 +164,42 @@ pub(super) fn install_cvar_ranges(lua: &Lua) -> mlua::Result<()> {
 pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     let g = lua.globals();
 
+    // `GetCreditsText` (`0x4dcd60`): a number or the usage error, truncated to an integer; 1 reads
+    // `credits.html`, 2 `credits_BC.html`, anything else `credits_LK.html`, at each call. It
+    // returns one value whatever the read did (`0x4dcde5`), so a failed read answers the top of
+    // the stack, the last argument.
+    g.set(
+        "GetCreditsText",
+        lua.create_function(|lua, args: MultiValue| {
+            let first = args.front().cloned().unwrap_or(Value::Nil);
+            let Some(version) = lua.coerce_number(first).ok().flatten() else {
+                return Err(mlua::Error::runtime(
+                    "Usage: Script_GetCreditText(versionIndex)",
+                ));
+            };
+            let file = match version as i32 {
+                1 => "credits.html",
+                2 => "credits_BC.html",
+                _ => "credits_LK.html",
+            };
+            let reader = lua
+                .app_data_ref::<crate::script::ModelCell>()
+                .expect("model app_data")
+                .glue
+                .system
+                .files
+                .clone();
+            match reader.and_then(|read| read(file)) {
+                // The file is pushed as a C string, so it ends at its first NUL.
+                Some(bytes) => {
+                    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                    Ok(Value::String(lua.create_string(&bytes[..end])?))
+                }
+                None => Ok(args.back().cloned().unwrap_or(Value::Nil)),
+            }
+        })?,
+    )?;
+
     // `GetCVar` (`0x4ddd10`) and `GetCVarDefault` (`0x4dde10`): a string argument or the usage
     // error, then the registered CVar's value or default, or `Couldn't find CVar named`.
     for (name, default) in [("GetCVar", false), ("GetCVarDefault", true)] {
@@ -221,20 +270,31 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // The client's identity: `IsWindowsClient` (`0x4dce40`) 1, `IsMacClient`/`IsLinuxClient`
-    // (`0x510b90`) nil, `GetClientExpansionLevel` (`0x4dcbf0`) the installed expansion plus one,
-    // 3 for Wrath of the Lich King; `IsSystemSupported` (`0x4dd540`) the processor's SSE2 bit,
-    // which every machine benilla runs on has.
+    // The client's identity: `IsWindowsClient` (`0x4dce40`) and `IsMacClient`/`IsLinuxClient`
+    // (`0x510b90`) by the build the VM answers as, `GetClientExpansionLevel` (`0x4dcbf0`) the
+    // installed expansion plus one, 3 for Wrath of the Lich King; `IsSystemSupported`
+    // (`0x4dd540`) the processor's SSE2 bit, which every machine benilla runs on has.
+    let os = lua
+        .app_data_ref::<crate::script::ModelCell>()
+        .expect("model app_data")
+        .os;
     g.set(
         "IsWindowsClient",
-        lua.create_function(|_, _: MultiValue| Ok(1.0))?,
+        lua.create_function(move |_, _: MultiValue| {
+            Ok(match os {
+                super::ClientOs::Pc => Value::Number(1.0),
+                super::ClientOs::Mac => Value::Nil,
+            })
+        })?,
     )?;
-    for name in ["IsMacClient", "IsLinuxClient"] {
-        g.set(
-            name,
-            lua.create_function(|_, _: MultiValue| Ok(Value::Nil))?,
-        )?;
-    }
+    g.set(
+        "IsMacClient",
+        lua.create_function(move |_, _: MultiValue| Ok(os.is_mac_client()))?,
+    )?;
+    g.set(
+        "IsLinuxClient",
+        lua.create_function(|_, _: MultiValue| Ok(Value::Nil))?,
+    )?;
     g.set(
         "GetClientExpansionLevel",
         lua.create_function(|_, _: MultiValue| Ok(3.0))?,

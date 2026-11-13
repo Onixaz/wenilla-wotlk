@@ -27,13 +27,23 @@ use super::{Hovered, HoveredObject, PickOcclusion};
 /// the [`PickOccluder`] colliders (terrain, WMO faces), then the drawn doodads nearer than that
 /// ([`DoodadOccluders`]). Net entities are the object trace, not occluders, so a chest never
 /// occludes itself. The picks run unbounded and compare against it after. Aimed as the picks are:
-/// the OS pointer, else the hover probe's aim.
+/// the OS pointer, else the hover probe's aim. While a location is wanted, the ground leg also
+/// traces GameObject hulls ([`super::ObjectGround`]).
+#[allow(clippy::too_many_arguments)] // one Bevy system's full input set
 pub(super) fn update_pick_occlusion(
     camera: Query<(&Camera, &GlobalTransform), With<WorldCamera>>,
     window: Query<&Window, With<PrimaryWindow>>,
     spatial: avian3d::prelude::SpatialQuery,
     occluders: Query<(), With<PickOccluder>>,
     doodads: DoodadOccluders,
+    targeting: Option<Res<crate::spell::SpellTargeting>>,
+    parents: Query<&ChildOf>,
+    objects: Query<(
+        &Guid,
+        &NetEntity,
+        &GlobalTransform,
+        Has<crate::transport::Transport>,
+    )>,
     mut occlusion: ResMut<PickOcclusion>,
 ) {
     *occlusion = PickOcclusion::default();
@@ -69,6 +79,42 @@ pub(super) fn update_pick_occlusion(
         occlusion.distance = distance;
         occlusion.point = Some(ray.origin + *ray.direction * distance);
     }
+    if !targeting.is_some_and(|t| {
+        t.spell_for(crate::spell::targeting::TargetingWants::Location)
+            .is_some()
+    }) {
+        return;
+    }
+    // A hull's owning GameObject: the collider's own entity or a parent of it (a deck prop).
+    let owner = |mut e: Entity| {
+        for _ in 0..4 {
+            if let Ok((guid, net, tf, transport)) = objects.get(e) {
+                return matches!(net.kind, EntityKind::GameObject)
+                    .then_some((guid.0, tf, transport));
+            }
+            e = parents.get(e).ok()?.parent();
+        }
+        None
+    };
+    let Some(hit) = spatial.cast_ray_predicate(
+        ray.origin,
+        ray.direction,
+        distance.min(f32::MAX),
+        true,
+        &benilla_world::collision::WorldCollision::body_filter(),
+        &|e| !occluders.contains(e) && owner(e).is_some(),
+    ) else {
+        return;
+    };
+    let Some((guid, deck, transport)) = owner(hit.entity) else {
+        return;
+    };
+    let point = ray.origin + *ray.direction * hit.distance;
+    occlusion.object_ground = Some(super::ObjectGround {
+        point,
+        deck: (transport && super::is_ship_guid(guid))
+            .then(|| (guid, crate::entities::deck_local(point, deck))),
+    });
 }
 
 /// The model instances whose parts are `unit`'s pick geometry: the body, everything it wears, and
@@ -670,12 +716,45 @@ pub(super) fn update_hovered_object(
         );
     }
 
-    // Pass 1: the exact resident geometry, nearest wins.
-    let mut best: Option<(f32, Entity)> =
-        benilla_world::interact::cast_pick_ray(ray, pickable, &parts, false)
+    // The hit list's admission (`0x4f96c4`-`0x4f96e0`): an object its highlight test refuses
+    // (`vtbl+0xa4`, the type's `CanHighlight`) never enters either pass, so it neither takes the
+    // pick nor hides the one behind it. A store not yet streamed is admitted.
+    let admitted = |net: Entity| {
+        let Ok(store) = stores.get(net) else {
+            return true;
+        };
+        let guid = guids.get(net).ok().map(|g| g.0);
+        crate::target::cursor_mode::mouseover_eligible(
+            store.0.gameobject_type_id(),
+            store.0.gameobject_flags(),
+            store.0.gameobject_dynamic_flags(),
+            guid.and_then(|g| go_gate.templates.get(g))
+                .map(|t| t.highlight_column),
+            crate::target::cursor_mode::go_reaction(
+                go_gate.factions.as_deref(),
+                store.0.gameobject_faction(),
+                self_store,
+            ),
+            crate::target::cursor_mode::GoOverrides {
+                channel_owned: crate::target::cursor_mode::fishing_channel_owned(self_store, guid),
+            },
+        )
+    };
+
+    // Pass 1: the exact resident geometry, the nearest admitted object wins. The front hit alone
+    // first; the whole list only when the front object is refused.
+    let nearest = |all_hits| {
+        benilla_world::interact::cast_pick_ray(ray, pickable, &parts, all_hits)
             .into_iter()
-            .next()
-            .map(|(e, h)| (h.distance, e));
+            .find(|&(e, _)| admitted(resolve_net(e)))
+            .map(|(e, h)| (h.distance, e))
+    };
+    let front = benilla_world::interact::cast_pick_ray(ray, pickable, &parts, false);
+    let mut best: Option<(f32, Entity)> = match front.first() {
+        Some((e, h)) if admitted(resolve_net(*e)) => Some((h.distance, *e)),
+        Some(_) => nearest(true),
+        None => None,
+    };
 
     // Pass 2, only when nothing hit anywhere, units included (one resolve in the reference): the
     // geometry pushed 1 model unit along its normals, a halo of about a yard that makes a wispy
@@ -690,6 +769,9 @@ pub(super) fn update_hovered_object(
         let mut best2: Option<(f32, u32, Entity)> = None;
         for (part, hit) in benilla_world::interact::cast_pick_ray_inflated(ray, pickable, &parts) {
             let net = resolve_net(part);
+            if !admitted(net) {
+                continue;
+            }
             let prio = if *last_pick == Some(net) {
                 u32::MAX // the sticky-hover cache outranks everything
             } else {
@@ -933,7 +1015,7 @@ mod tests {
         world.insert_resource(PickOcclusion {
             distance: f32::INFINITY,
             point: None,
-            ray: None,
+            ..Default::default()
         });
         world.init_resource::<crate::vplates::PlateHover>();
         world.init_resource::<Hovered>();

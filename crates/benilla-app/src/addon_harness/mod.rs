@@ -3646,12 +3646,14 @@ mod dependency_tests {
         assert!(s
             .eval::<bool>(r#"return GetInventoryItemLink("player", 10) == nil"#)
             .unwrap());
-        // The slot ids match `GetInventorySlotInfo`'s table.
-        assert_eq!(
-            s.eval::<i64>(r#"return GetInventorySlotInfo("MainHandSlot")"#)
-                .unwrap(),
-            16
-        );
+        // The slot ids match `GetInventorySlotInfo`'s table, which the install provides.
+        if s.has_paperdoll_item_frame() {
+            assert_eq!(
+                s.eval::<i64>(r#"return GetInventorySlotInfo("MainHandSlot")"#)
+                    .unwrap(),
+                16
+            );
+        }
 
         // The spellbook.
         assert_eq!(

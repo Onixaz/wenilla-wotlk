@@ -26,7 +26,7 @@ use benilla_world::collision::refit_changed_collider_aabbs;
 use bevy::prelude::*;
 
 use crate::go_templates::GameObjectTemplates;
-use crate::net::Guid;
+use crate::net::{Guid, ObjectStore};
 use benilla_assets::{LockRecover, WorldAssets};
 use benilla_world::ride_frame::RideFrame;
 use benilla_world::vis_chain::VisChainOnly;
@@ -207,12 +207,12 @@ impl Transport {
     }
 }
 
-/// `TaxiPathNode.dbc` with the per-path timetables built from it (`None` in `built` is a failed
-/// build, not retried), and the `TransportAnimation.dbc` lift keyframes, both shared by path.
+/// `TaxiPathNode.dbc` with the timetables built from it, keyed by `(taxiPathId, server period)`
+/// (`None` is a failed build, not retried), and the `TransportAnimation.dbc` lift keyframes.
 #[derive(Resource, Default)]
 struct Timetables {
     nodes: Option<TaxiPathNodes>,
-    built: HashMap<u32, Option<Arc<TransportTimetable>>>,
+    built: HashMap<(u32, u32), Option<Arc<TransportTimetable>>>,
     elevators: Option<ElevatorPaths>,
     lifts: HashMap<u32, Arc<Vec<ElevatorKeyframe>>>,
 }
@@ -250,7 +250,7 @@ fn arm_transports(
     templates: Res<GameObjectTemplates>,
     // A re-created lift is already armed but carries a fresh seed, so it re-enters to consume it.
     pending: Query<
-        (Entity, &Guid, Option<&ElevatorSeed>),
+        (Entity, &Guid, Option<&ElevatorSeed>, Option<&ObjectStore>),
         (
             With<TransportAnchor>,
             Or<(Without<Transport>, With<ElevatorSeed>)>,
@@ -260,7 +260,7 @@ fn arm_transports(
     if pending.is_empty() {
         return;
     }
-    for (entity, guid, seed) in &pending {
+    for (entity, guid, seed, store) in &pending {
         // The lift arm.
         if let Some(seed) = seed {
             let Timetables {
@@ -324,15 +324,18 @@ fn arm_transports(
         let Some(nodes) = nodes.as_ref() else {
             continue; // no client data: stays frozen
         };
+        // The cycle is the server's `GAMEOBJECT_LEVEL`, not the period the path builds to
+        // (`0x711c97`): the anchor is uptime-scale, so any difference grows every cycle.
+        let period_ms = store.map_or(0, |s| s.0.gameobject_level());
         let timetable = built
-            .entry(mo.taxi_path_id)
+            .entry((mo.taxi_path_id, period_ms))
             .or_insert_with(|| {
                 let t = nodes.path(mo.taxi_path_id).and_then(|path| {
-                    // The build pins its period to the reference's own bookkeeping.
-                    let t = TransportTimetable::build(path, mo.move_speed, mo.accel_rate)?;
+                    let built = TransportTimetable::build(path, mo.move_speed, mo.accel_rate)?;
+                    let t = built.with_period(period_ms);
                     info!(
-                        "transport: path {} timetable built — period {} ms",
-                        mo.taxi_path_id, t.period_ms
+                        "transport: path {} timetable built — period {} ms (path builds {} ms)",
+                        mo.taxi_path_id, t.period_ms, built.period_ms
                     );
                     Some(t)
                 });
@@ -580,14 +583,27 @@ fn compose_riders(
     boats: Query<&Transform, (With<Transport>, Without<TransportRider>)>,
     mut riders: Query<
         (
+            Entity,
             &TransportRider,
             &mut Transform,
             Option<&mut crate::net::RemoteMotion>,
         ),
         Without<Transport>,
     >,
+    mut named: Local<std::collections::HashSet<Entity>>,
 ) {
-    for (rider, mut transform, motion) in &mut riders {
+    let tracing = benilla_assets::trace::enabled_for("rider");
+    for (entity, rider, mut transform, motion) in &mut riders {
+        // One line per rider, joining the anim trace's entity to its deck.
+        if tracing && named.insert(entity) {
+            benilla_assets::trace::line(
+                "rider",
+                &format!(
+                    "{entity} on {:#x} local={:?}",
+                    rider.transport_guid, rider.local_pos
+                ),
+            );
+        }
         let Some(&boat_entity) = guid_index.0.get(&rider.transport_guid) else {
             continue;
         };
@@ -619,14 +635,40 @@ pub(crate) struct DeckPassenger {
 
 /// Compose each deck passenger's world pose through its transport's this-frame pose, as
 /// [`compose_riders`] does a unit's; one whose transport is not streamed keeps its create pose, as
-/// the reference's attach falls back to it (`0x4f4230`).
+/// the reference's attach falls back to it (`0x4f4230`). Then each riding point effect
+/// ([`place_deck_effects`]): one system, as both only follow a deck's this-frame pose.
+#[allow(clippy::type_complexity)]
 fn compose_deck_passengers(
+    mut commands: Commands,
     guid_index: Res<crate::net::GuidIndex>,
-    boats: Query<&Transform, (With<Transport>, Without<DeckPassenger>)>,
-    mut passengers: Query<(&DeckPassenger, &mut Transform), Without<Transport>>,
+    mut sets: ParamSet<(
+        (
+            Query<&Transform, (With<Transport>, Without<DeckPassenger>)>,
+            Query<(&DeckPassenger, &mut Transform), Without<Transport>>,
+        ),
+        (
+            Query<(Entity, &DeckEffect, &mut Transform)>,
+            Query<&Transform, Without<DeckEffect>>,
+            Query<()>,
+        ),
+    )>,
+) {
+    {
+        let (boats, mut passengers) = sets.p0();
+        place_deck_passengers(&guid_index, &boats, &mut passengers);
+    }
+    let (mut effects, decks, units) = sets.p1();
+    place_deck_effects(&mut commands, &mut effects, &decks, &units);
+}
+
+#[allow(clippy::type_complexity)]
+fn place_deck_passengers(
+    guid_index: &crate::net::GuidIndex,
+    boats: &Query<&Transform, (With<Transport>, Without<DeckPassenger>)>,
+    passengers: &mut Query<(&DeckPassenger, &mut Transform), Without<Transport>>,
 ) {
     let tracing = benilla_assets::trace::enabled_for("deck");
-    for (p, mut transform) in &mut passengers {
+    for (p, mut transform) in passengers.iter_mut() {
         let Some(boat) = guid_index
             .0
             .get(&p.transport_guid)
@@ -713,6 +755,69 @@ pub(crate) fn ground_deck_riders(
     }
 }
 
+/// A point a unit's kit plays at on a transport: the transport, the point in its frame and the
+/// unit, through which the reference re-places the effect (`0x6fa0b6`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DeckRide {
+    pub(crate) deck: Entity,
+    /// Bevy coords, in the deck's frame.
+    pub(crate) local: Vec3,
+    pub(crate) source: Entity,
+}
+
+/// A point effect riding its transport, at its point through the deck plus `shift`, its
+/// attach row's offset.
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
+#[component(storage = "SparseSet")]
+pub(crate) struct DeckEffect {
+    pub(crate) ride: DeckRide,
+    pub(crate) shift: Vec3,
+}
+
+/// Re-place each [`DeckEffect`] through its transport's this-frame pose, while its playing unit
+/// exists (`0x6fa0d0`-`0x6fa0f0`). With the transport gone it keeps its last world place and
+/// rides no more (`0x6f77a5`); with the unit gone it is never re-placed again.
+fn place_deck_effects(
+    commands: &mut Commands,
+    effects: &mut Query<(Entity, &DeckEffect, &mut Transform)>,
+    decks: &Query<&Transform, Without<DeckEffect>>,
+    units: &Query<()>,
+) {
+    for (entity, fx, mut transform) in effects.iter_mut() {
+        let deck = decks
+            .get(fx.ride.deck)
+            .ok()
+            .filter(|_| units.contains(fx.ride.source));
+        let Some(deck) = deck else {
+            commands.entity(entity).remove::<DeckEffect>();
+            continue;
+        };
+        let at = deck.translation + deck.rotation * fx.ride.local + fx.shift;
+        if benilla_assets::trace::enabled_for("dfx") {
+            let (w, d) = (
+                benilla_assets::coords::bevy_to_wow(at),
+                benilla_assets::coords::bevy_to_wow(deck.translation),
+            );
+            benilla_assets::trace::line(
+                "dfx",
+                &format!(
+                    "{entity} at=[{:.2},{:.2},{:.2}] deck=[{:.2},{:.2},{:.2}] moved={:.3}",
+                    w[0],
+                    w[1],
+                    w[2],
+                    d[0],
+                    d[1],
+                    d[2],
+                    transform.translation.distance(at)
+                ),
+            );
+        }
+        if transform.translation != at {
+            transform.translation = at;
+        }
+    }
+}
+
 /// Publish the ride frame onto every model standing on a transport, the reference's move-base
 /// install (`[model+0x17c]`), the frame a rider's world-space effects are stored in
 /// ([`benilla_world::ride_frame`]). The body we steer takes the mover's platform attach, an
@@ -762,6 +867,66 @@ fn stamp_ride_frames(
 mod tests {
     use super::*;
     use benilla_formats::ElevatorKeyframe;
+    use std::f32::consts::FRAC_PI_2;
+
+    /// A point effect follows its moving transport each frame, plus its attach offset; with the
+    /// transport gone it keeps its last place and rides no more; with its unit gone it is never
+    /// re-placed; an effect on no transport is never touched (`0x6fa0b6`, `0x6f77a5`).
+    #[test]
+    fn a_point_effect_rides_its_transport_while_it_and_its_unit_last() {
+        let mut app = App::new();
+        app.init_resource::<crate::net::GuidIndex>()
+            .add_systems(Update, compose_deck_passengers);
+        let world = app.world_mut();
+        let deck = world.spawn(Transform::from_xyz(10.0, 0.0, 0.0)).id();
+        let other = world.spawn(Transform::from_xyz(-10.0, 0.0, 0.0)).id();
+        let caster = world.spawn_empty().id();
+        let local = Vec3::new(1.0, 0.0, 0.0);
+        let shift = Vec3::new(0.0, 2.0, 0.0);
+        let effect = |deck| DeckEffect {
+            ride: DeckRide {
+                deck,
+                local,
+                source: caster,
+            },
+            shift,
+        };
+        let riding = world
+            .spawn((effect(deck), Transform::from_xyz(11.0, 2.0, 0.0)))
+            .id();
+        let orphan = world
+            .spawn((effect(other), Transform::from_xyz(-9.0, 2.0, 0.0)))
+            .id();
+        let still = world.spawn(Transform::from_xyz(5.0, 5.0, 5.0)).id();
+        app.update();
+        let at = |app: &App, e| app.world().get::<Transform>(e).unwrap().translation;
+        // The deck turns a quarter and moves on: the point turns with it.
+        *app.world_mut().get_mut::<Transform>(deck).unwrap() =
+            Transform::from_xyz(20.0, 0.0, 0.0).with_rotation(Quat::from_rotation_y(FRAC_PI_2));
+        app.world_mut().despawn(other);
+        app.update();
+        let want = Vec3::new(20.0, 0.0, 0.0) + Quat::from_rotation_y(FRAC_PI_2) * local + shift;
+        assert!(
+            at(&app, riding).distance(want) < 1e-5,
+            "{}",
+            at(&app, riding)
+        );
+        assert_eq!(
+            at(&app, orphan),
+            Vec3::new(-9.0, 2.0, 0.0),
+            "last place kept"
+        );
+        assert!(app.world().get::<DeckEffect>(orphan).is_none());
+        assert_eq!(at(&app, still), Vec3::splat(5.0));
+        app.world_mut().despawn(caster);
+        *app.world_mut().get_mut::<Transform>(deck).unwrap() = Transform::from_xyz(40.0, 0.0, 0.0);
+        app.update();
+        assert!(
+            at(&app, riding).distance(want) < 1e-5,
+            "frozen with its unit gone"
+        );
+        assert!(app.world().get::<DeckEffect>(riding).is_none());
+    }
 
     /// The Ratchet–Booty Bay ferry's real timetable (taxi path 241): the builder can truncate a
     /// short synthetic cycle so the far continent's legs are never reached.

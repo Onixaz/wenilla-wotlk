@@ -79,6 +79,10 @@ mod glyphs;
 pub use glyphs::{load_glyph_catalog, GlyphCatalog, GlyphProperty, GlyphSlot};
 mod gem_properties;
 mod item_limit_category;
+mod scaling_stats;
+pub use scaling_stats::{
+    load_scaling_stats, ScalingStatCatalog, ScalingStatDistribution, SCALING_VALUE_COLUMNS,
+};
 mod spell_difficulty;
 pub use spell_difficulty::{load_spell_difficulties, SpellDifficultyCatalog};
 mod spell_rune_cost;
@@ -149,6 +153,10 @@ mod stable_slot_prices;
 pub use stable_slot_prices::{load_stable_slot_prices, StableSlotPrices};
 mod page_text_material;
 pub use page_text_material::{load_page_text_material_catalog, PageTextMaterialCatalog};
+mod paperdoll_item_frame;
+pub use paperdoll_item_frame::{
+    load_paperdoll_item_frame, PaperDollItemFrameCatalog, PaperDollItemFrameRow,
+};
 mod packages;
 pub use packages::{load_packages, PackageRow};
 mod stationery;
@@ -368,7 +376,10 @@ pub use world_map_transforms::{
     load_world_map_transform_catalog, WorldMapTransform, WorldMapTransformCatalog,
 };
 mod dungeon_map;
-pub use dungeon_map::{load_dungeon_map_catalog, DungeonMap, DungeonMapCatalog};
+pub use dungeon_map::{
+    load_dungeon_map_catalog, load_dungeon_map_chunks, DungeonMap, DungeonMapCatalog,
+    DungeonMapChunk,
+};
 mod dungeon_encounter;
 pub use dungeon_encounter::{load_dungeon_encounters, DungeonEncounter};
 mod lfg_dungeons;

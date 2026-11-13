@@ -349,6 +349,8 @@ pub(crate) struct Player {
     /// `pos` and the facing still describe the last one. Set when the mover guid changes, cleared
     /// at the take-control edge.
     pub(crate) reseat: bool,
+    /// Our own body's flight while we drive another unit, given back with the reins.
+    pub(super) own_flying: Option<bool>,
     /// Mode grants and forced speeds for the mover, held until the driven body is that unit: their
     /// acks carry its pose, which is still the last body's across a hand-over.
     pub(super) held_modes: Vec<crate::net::MoveModeMessage>,
@@ -501,6 +503,10 @@ pub(crate) struct Player {
     pub(super) model_yaw: f32,
     /// The rendered swim/fly body pitch, eased ([`crate::creature_anim::ease_swim_pitch`]).
     pub(super) swim_body_pitch: f32,
+    /// The rendered fly body roll, eased ([`crate::creature_anim::ease_swim_roll`]).
+    pub(super) swim_body_roll: f32,
+    /// Last frame's rendered yaw, the swim matrix's `m_smoothFacing` (`0x719b80`).
+    pub(super) swim_smooth_facing: f32,
     /// A server spline drives the body (`SMSG_MONSTER_MOVE` for our guid: a charge, a taxi):
     /// input, physics and the movement stream yield, and its end sends `CMSG_MOVE_SPLINE_DONE`.
     pub(super) server_riding: bool,
@@ -668,6 +674,12 @@ impl Player {
     /// `UnitOnTaxi`, which reads [`crate::player::UNIT_FLAG_TAXI_FLIGHT`].
     pub(crate) fn server_riding(&self) -> bool {
         self.server_riding
+    }
+
+    /// Whether input moves the driven body now: ours to move, not rooted and no server spline on
+    /// it, for instruments.
+    pub(crate) fn steerable(&self) -> bool {
+        self.active && !self.control_lost && !self.modes.rooted && !self.server_riding
     }
 }
 

@@ -129,6 +129,13 @@ pub struct ItemInfo {
     pub required_disenchant_skill: i32,
     /// The `ItemLimitCategory.dbc` row whose carry limit the item shares, 0 none (`ItemRec+0x1ec`).
     pub item_limit_category: u32,
+    /// `ScalingStatDistribution.dbc` id (`ItemRec+0xb8`), the stats a scaling item spreads.
+    pub scaling_stat_distribution: u32,
+    /// The scaling mask (`ItemRec+0xbc`): nonzero makes the item scale; its bits pick the budget,
+    /// armor and damage columns of `ScalingStatValues.dbc`.
+    pub scaling_stat_value: u32,
+    /// `ArmorDamageModifier` (`ItemRec+0x1e4`), a float; above 0 the armor line reads green.
+    pub armor_damage_modifier: f32,
 }
 
 impl ItemInfo {
@@ -281,7 +288,8 @@ fn read_spell_blocks(r: &mut &[u8]) -> io::Result<SpellBlocks> {
 /// adds `SoundOverrideSubclass` after the subclass, `Flags2` after the flags, a `StatsCount` ahead
 /// of a stat run that long, `ScalingStatDistribution` and `ScalingStatValue` after it,
 /// `RandomSuffix` after the random property and a 14-word trailer after the bag family, and it
-/// carries 2 damage blocks, not 5. The added fields have no shared place and are read past.
+/// carries 2 damage blocks, not 5. The added fields other than the two scaling ones have no shared
+/// place and are read past.
 /// Decode an `SMSG_ITEM_QUERY_SINGLE_RESPONSE` body kept by the item cache: the entry, and the
 /// template or `None` for the server's unknown entry.
 pub fn decode_item_query_response(mut body: &[u8]) -> io::Result<(u32, Option<ItemInfo>)> {
@@ -350,8 +358,8 @@ pub(super) fn read_item_query_response_wotlk(r: &mut &[u8]) -> io::Result<(u32, 
             stats.push((stat_type, stat_value));
         }
     }
-    let _scaling_stat_distribution = read_u32_le(r)?;
-    let _scaling_stat_value = read_u32_le(r)?;
+    let scaling_stat_distribution = read_u32_le(r)?;
+    let scaling_stat_value = read_u32_le(r)?;
 
     // 2 Damage { min f32, max f32, type u32 }; block 0 also fills dmg_* unfiltered.
     let dmg_min = read_f32_le(r)?;
@@ -412,7 +420,7 @@ pub(super) fn read_item_query_response_wotlk(r: &mut &[u8]) -> io::Result<(u32, 
     let socket_bonus = read_u32_le(r)?;
     let gem_properties = read_u32_le(r)?;
     let required_disenchant_skill = read_i32_le(r)?;
-    let _armor_damage_modifier = read_u32_le(r)?;
+    let armor_damage_modifier = read_f32_le(r)?;
     let _duration = read_u32_le(r)?;
     let item_limit_category = read_u32_le(r)?;
     let _holiday = read_u32_le(r)?;
@@ -479,6 +487,9 @@ pub(super) fn read_item_query_response_wotlk(r: &mut &[u8]) -> io::Result<(u32, 
             flags2,
             required_disenchant_skill,
             item_limit_category,
+            scaling_stat_distribution,
+            scaling_stat_value,
+            armor_damage_modifier,
         }),
     ))
 }
@@ -525,15 +536,15 @@ pub enum UseItemTarget {
     /// only from an item cast (`Spell.cpp:7892`). The mask is `0x0800` alone; the reference's
     /// target binding never writes `TARGET_FLAG_LOCKED`.
     Object(u64),
-    /// `TARGET_FLAG_DEST_LOCATION` and three `f32` coords: a thrown item, dynamite or a grenade.
-    Dest([f32; 3]),
+    /// `TARGET_FLAG_DEST_LOCATION` and its point: a thrown item, dynamite or a grenade.
+    Dest(super::spells::TargetPoint),
     /// `TARGET_FLAG_ITEM` and a packed guid: a poison, oil or stone applied to a clicked item.
     Item(u64),
     /// `TARGET_FLAG_TRADE_ITEM` and the not-traded slot in the guid's place.
     TradeItem,
-    /// `TARGET_FLAG_SOURCE_LOCATION` and three `f32` coords (the location binding); only items
+    /// `TARGET_FLAG_SOURCE_LOCATION` and its point (the location binding); only items
     /// carrying spell 265, such as Martin Fury, use it. vmangos reads it before the dest.
-    Source([f32; 3]),
+    Source(super::spells::TargetPoint),
     /// A corpse bit and the corpse's packed guid: Goblin Jumper Cables' Defibrillate
     /// (`Targets 0x8000`) on a released player's corpse.
     Corpse(super::spells::CorpseTarget, u64),
@@ -829,7 +840,7 @@ mod tests {
 
     #[test]
     fn use_item_dest_body_golden() {
-        let body = use_body(UseItemTarget::Dest([1.0, -2.5, 3.0]));
+        let body = use_body(UseItemTarget::Dest([1.0, -2.5, 3.0].into()));
         assert_eq!(body[..19], USE_HEAD);
         assert_eq!(
             body[19..],
