@@ -138,6 +138,13 @@ cpal = { version = "0.17", features = ["wasm-bindgen"] }
 web-sys = { version = "0.3", features = [
     "AbortController",
     "AbortSignal",
+    "Blob",
+    "BlobPropertyBag",
+    "CssStyleDeclaration",
+    "Document",
+    "HtmlElement",
+    "HtmlImageElement",
+    "Url",
     "RequestInit",
     "Window",
     "Location",

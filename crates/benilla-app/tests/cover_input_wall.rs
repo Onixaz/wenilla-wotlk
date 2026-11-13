@@ -91,6 +91,7 @@ const VERDICTS: &[(&str, Verdict)] = &[
     ("CursorIcon", Plumbing),
     ("CustomCursor", Plumbing),
     ("CustomCursorImage", Plumbing),
+    ("CustomCursorUrl", Plumbing),
     ("InputPlugin", Plumbing),
     ("WinitPlugin", Plumbing),
     // The event loop's pacing (`WOW_PROBE_CONTINUOUS`); nothing arrives through it.
