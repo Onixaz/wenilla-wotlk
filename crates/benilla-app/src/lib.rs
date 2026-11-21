@@ -53,6 +53,8 @@ mod crash;
 mod creature_anim;
 mod creature_type;
 mod cursor;
+#[cfg(any(target_arch = "wasm32", test))]
+mod cursor_edge;
 mod cvars;
 mod death;
 #[cfg(feature = "dev")]

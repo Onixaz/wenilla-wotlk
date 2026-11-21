@@ -339,6 +339,21 @@ mod other {
         }
     }
 
+    /// The pointer and the window's size, in logical px, where the cursor is cropped at the
+    /// window's edge: on the page with `gxCursor` on, else `None`.
+    type Edge = Option<((f32, f32), (f32, f32))>;
+
+    /// The crop `edge` gives a 32×32 cursor, the cache key's part of it.
+    fn edge_key(edge: Edge) -> Option<(u32, u32)> {
+        #[cfg(target_arch = "wasm32")]
+        return edge.and_then(|(p, w)| crate::cursor_edge::edge_crop(Some(p), w, (32, 32)));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = edge;
+            None
+        }
+    }
+
     /// The primary window as [`drive`] reads it: its entity, its canvas selector and whether its
     /// cursor shows.
     type CursorWindow = (Entity, &'static Window, &'static CursorOptions);
@@ -411,16 +426,28 @@ mod other {
         let (window, win, options) = *window;
         // The page's canvas (`Window::canvas`, `#benilla`) when the cursor shows.
         let canvas = win.canvas.as_deref().filter(|_| options.visible);
-        // A hardware/software flip re-sends whatever is showing.
+        // On the page, the hardware cursor's pointer and window, to crop it at the edge.
+        let edge: Edge = (cfg!(target_arch = "wasm32") && video.hw_cursor)
+            .then(|| win.cursor_position())
+            .flatten()
+            .map(|p| ((p.x, p.y), (win.width(), win.height())));
+        // A hardware/software flip, or a new crop, re-sends whatever is showing.
         let mode = if video.hw_cursor { "hw" } else { "sw" };
-        let mut show = |commands: &mut Commands, urls: &CursorUrls, handle: Handle<Image>| {
+        let mode = match edge_key(edge) {
+            Some((w, h)) => format!("{mode}@{w}x{h}"),
+            None => mode.to_string(),
+        };
+        let mut show = |commands: &mut Commands,
+                        urls: &CursorUrls,
+                        images: &Assets<Image>,
+                        handle: Handle<Image>| {
             let to = (window, canvas, urls);
             match sprite.single_mut() {
                 Ok((sw, mut node)) if !video.hw_cursor => {
-                    set_custom_cursor(commands, to, sw.blank.clone());
+                    set_custom_cursor(commands, to, images, sw.blank.clone(), None);
                     node.image = handle;
                 }
-                _ => set_custom_cursor(commands, to, handle),
+                _ => set_custom_cursor(commands, to, images, handle, edge),
             }
         };
         let held_icon = script
@@ -448,7 +475,7 @@ mod other {
                 }
             }
             if let Some(handle) = payload_cursors.0.get(&icon) {
-                show(&mut commands, &urls, handle.clone());
+                show(&mut commands, &urls, &images, handle.clone());
                 *last_set = Some(key);
                 return;
             }
@@ -482,7 +509,7 @@ mod other {
             .or_else(|| cursors.0.get(stem.trim_start_matches("Unable")))
             .or_else(|| cursors.0.get("Point"));
         if let Some(handle) = handle {
-            show(&mut commands, &urls, handle.clone());
+            show(&mut commands, &urls, &images, handle.clone());
         }
         *last_set = Some(key);
     }
@@ -527,17 +554,30 @@ mod other {
     }
 
     /// Insert a custom cursor with hotspot `(0, 0)`, the vanilla cursors' top-left tip, on
-    /// `window`: on the page, the image's decoded URL where [`CursorUrls`] has one, also written in
-    /// this frame to `canvas` (the window's selector, `None` while the cursor is hidden).
+    /// `window`: on the page, the image's decoded URL where [`CursorUrls`] has one, cropped to the
+    /// part inside the window at `edge`, also written in this frame to `canvas` (the window's
+    /// selector, `None` while the cursor is hidden).
     fn set_custom_cursor(
         commands: &mut Commands,
         (window, canvas, urls): (Entity, Option<&str>, &CursorUrls),
+        images: &Assets<Image>,
         handle: Handle<Image>,
+        edge: Edge,
     ) {
         // Always empty off the page.
         let url = urls.0.get(&handle.id());
         #[cfg(target_arch = "wasm32")]
-        if let Some(url) = url {
+        let cropped = edge.and_then(|(pointer, size)| {
+            let image = images.get(&handle)?;
+            let (w, h) = crate::cursor_edge::edge_crop(
+                Some(pointer),
+                size,
+                (image.width(), image.height()),
+            )?;
+            web::cropped_url(handle.id(), image, w, h)
+        });
+        #[cfg(target_arch = "wasm32")]
+        if let Some(url) = cropped.as_ref().or(url) {
             if let Some(canvas) = canvas {
                 web::show_now(canvas, url);
             }
@@ -552,7 +592,7 @@ mod other {
             return;
         }
         #[cfg(not(target_arch = "wasm32"))]
-        let _ = (canvas, url);
+        let _ = (canvas, url, images, edge);
         commands
             .entity(window)
             .insert(CursorIcon::Custom(CustomCursor::Image(CustomCursorImage {
@@ -569,27 +609,30 @@ mod other {
     #[cfg(target_arch = "wasm32")]
     mod web {
         use std::cell::RefCell;
+        use std::collections::HashMap;
 
-        use bevy::prelude::Image;
+        use bevy::prelude::{AssetId, Image};
         use wasm_bindgen::JsCast;
+
+        /// The most cropped cursors kept; past it the cache is dropped and rebuilt as the pointer
+        /// moves, as a crop costs one 32×32 PNG.
+        const CROPPED_MAX: usize = 512;
 
         thread_local! {
             /// The decoded images, kept so the page keeps their pixels for the cursor style.
             static DECODED: RefCell<Vec<web_sys::HtmlImageElement>> = const { RefCell::new(Vec::new()) };
+            /// Image, crop width and height → its cropped URL and decoded image.
+            static CROPPED: RefCell<HashMap<(AssetId<Image>, u32, u32), (String, web_sys::HtmlImageElement)>> =
+                RefCell::new(HashMap::new());
         }
 
-        /// `image` (RGBA8) as a PNG blob URL, its decode started; `None` if any step fails.
-        pub(super) fn decoded_url(image: &Image) -> Option<String> {
+        /// `w`×`h` RGBA8 pixels as a PNG blob URL and its image, its decode started; `None` if any
+        /// step fails.
+        fn png_url(rgba: &[u8], w: u32, h: u32) -> Option<(String, web_sys::HtmlImageElement)> {
             use ::image::ImageEncoder;
-            let rgba = image.data.as_deref()?;
             let mut png = Vec::new();
             ::image::codecs::png::PngEncoder::new(&mut png)
-                .write_image(
-                    rgba,
-                    image.width(),
-                    image.height(),
-                    ::image::ExtendedColorType::Rgba8,
-                )
+                .write_image(rgba, w, h, ::image::ExtendedColorType::Rgba8)
                 .ok()?;
             let parts = js_sys::Array::of1(&js_sys::Uint8Array::from(png.as_slice()));
             let opts = web_sys::BlobPropertyBag::new();
@@ -599,8 +642,43 @@ mod other {
             let img = web_sys::HtmlImageElement::new().ok()?;
             img.set_src(&url);
             let _ = img.decode();
+            Some((url, img))
+        }
+
+        /// `image` (RGBA8) as a PNG blob URL, its decode started; `None` if any step fails.
+        pub(super) fn decoded_url(image: &Image) -> Option<String> {
+            let (url, img) = png_url(image.data.as_deref()?, image.width(), image.height())?;
             DECODED.with_borrow_mut(|d| d.push(img));
             Some(url)
+        }
+
+        /// The top-left `w`×`h` of `image` (RGBA8, `id`) as a decoded PNG blob URL, built once.
+        pub(super) fn cropped_url(
+            id: AssetId<Image>,
+            image: &Image,
+            w: u32,
+            h: u32,
+        ) -> Option<String> {
+            CROPPED.with_borrow_mut(|cropped| {
+                if let Some((url, _)) = cropped.get(&(id, w, h)) {
+                    return Some(url.clone());
+                }
+                let rgba = image.data.as_deref()?;
+                let stride = image.width() as usize * 4;
+                let row = w as usize * 4;
+                let pixels: Vec<u8> = (0..h as usize)
+                    .flat_map(|y| &rgba[y * stride..y * stride + row])
+                    .copied()
+                    .collect();
+                let (url, img) = png_url(&pixels, w, h)?;
+                if cropped.len() >= CROPPED_MAX {
+                    for (url, _) in cropped.drain().map(|(_, v)| v) {
+                        let _ = web_sys::Url::revoke_object_url(&url);
+                    }
+                }
+                cropped.insert((id, w, h), (url.clone(), img));
+                Some(url)
+            })
         }
 
         /// Write `url`'s cursor to the `selector` canvas now, in the style winit writes once its own
